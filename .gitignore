@@ -1,0 +1,38 @@
+# knot-next
+
+# Build artifacts
+/bin/
+/dist/
+*.exe
+
+# Go
+*.test
+*.out
+*.prof
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local development
+/reference/
+*.local
+
+# Runtime
+*.pid
+*.sock
+runtime.json
+
+# Logs
+*.log
+
+# Test coverage
+coverage.txt
+coverage.html
