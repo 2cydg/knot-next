@@ -76,6 +76,19 @@ type resource struct {
 	cache            *remoteDirCache
 }
 
+// backendView is captured under Service.mu and remains immutable during I/O.
+// Closing the session closes the same client, but cannot change this view's backend.
+type backendView struct {
+	ID     string
+	Root   string
+	client *pkgsftp.Client
+	cache  *remoteDirCache
+}
+
+func (r *resource) backendLocked() *backendView {
+	return &backendView{ID: r.ID, Root: r.Root, client: r.client, cache: r.cache}
+}
+
 type pendingChallenge struct {
 	Challenge Challenge
 	response  chan ChallengeResponse
@@ -84,6 +97,12 @@ type pendingChallenge struct {
 type transferState struct {
 	Transfer
 	cancel context.CancelFunc
+}
+
+// transferWork is a private copy used only by a single worker goroutine.
+// It does not contain cancel or shared locks.
+type transferWork struct {
+	Transfer
 }
 
 func NewService(root string) *Service {
@@ -894,6 +913,9 @@ func (s *Service) closeSessionLocked(res *resource, state string, cause string, 
 		res.followCancel()
 		res.followCancel = nil
 	}
+	// Signal transfer cancellation before closing the transport: pending I/O may
+	// return immediately with a connection error once the client is closed.
+	s.cancelSessionTransfersLocked(res.ID)
 	if res.client != nil {
 		_ = res.client.Close()
 		res.client = nil
@@ -902,7 +924,6 @@ func (s *Service) closeSessionLocked(res *resource, state string, cause string, 
 		s.pool.DecRef(res.poolKeys...)
 		res.poolKeys = nil
 	}
-	s.cancelSessionTransfersLocked(res.ID)
 	res.State = state
 	res.DisconnectCause = cause
 	res.UpdatedAt = now
@@ -959,20 +980,40 @@ func (s *Service) Subscribe(id string) (<-chan Event, func(), Session, error) {
 }
 
 func (s *Service) SubscribeTransfers(sessionID string) (<-chan TransferEvent, func(), error) {
+	ch, cancel, _, err := s.SubscribeTransfersWithSnapshot(sessionID)
+	return ch, cancel, err
+}
+
+func (s *Service) SubscribeTransfersWithSnapshot(sessionID string) (<-chan TransferEvent, func(), []Transfer, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	res, ok := s.sessions[sessionID]
 	if !ok {
-		return nil, nil, ErrNotFound
+		return nil, nil, nil, ErrNotFound
 	}
 	if res.State == "closed" || res.State == "failed" || res.State == "disconnected" {
-		return nil, nil, fmt.Errorf("%w: sftp session is not open", ErrConflict)
+		return nil, nil, nil, fmt.Errorf("%w: sftp session is not open", ErrConflict)
 	}
+
+	// Register subscriber
 	ch := make(chan TransferEvent, maxTransferSubs)
 	if s.transferSubs[sessionID] == nil {
 		s.transferSubs[sessionID] = map[chan TransferEvent]struct{}{}
 	}
 	s.transferSubs[sessionID][ch] = struct{}{}
+
+	// Build snapshot of current transfers for this session
+	snapshot := make([]Transfer, 0)
+	for _, transfer := range s.transfers {
+		if transfer.SessionID == sessionID {
+			snapshot = append(snapshot, transfer.snapshot())
+		}
+	}
+	// Sort by start time, same as ListTransfers
+	sort.Slice(snapshot, func(i, j int) bool {
+		return snapshot[i].StartedAt.Before(snapshot[j].StartedAt)
+	})
+
 	cancel := func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -983,7 +1024,7 @@ func (s *Service) SubscribeTransfers(sessionID string) (<-chan TransferEvent, fu
 			}
 		}
 	}
-	return ch, cancel, nil
+	return ch, cancel, snapshot, nil
 }
 
 func (s *Service) SessionCount() int {
@@ -1207,24 +1248,38 @@ func (s *Service) Upload(id string, req TransferRequest) (Transfer, error) {
 	if strings.TrimSpace(req.Source) == "" || strings.TrimSpace(req.Target) == "" {
 		return Transfer{}, fmt.Errorf("%w: source and target are required", ErrValidation)
 	}
-	return s.startTransfer(id, "upload", req.Source, req.Target, nil, func(ctx context.Context, res *resource, transfer *transferState) (string, error) {
-		if res.client != nil {
-			return s.runUploadRemote(ctx, res, transfer, req)
-		}
-		return s.runUploadLocal(ctx, res, transfer, req)
+	return s.startTransfer(id, "upload", req.Source, req.Target, nil, func(ctx context.Context, res *backendView, work *transferWork) (string, error) {
+		return s.runUpload(ctx, res, work, req)
 	})
+}
+
+func (s *Service) runUpload(ctx context.Context, res *backendView, work *transferWork, req TransferRequest) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if res.client != nil {
+		return s.runUploadRemote(ctx, res, work, req)
+	}
+	return s.runUploadLocal(ctx, res, work, req)
 }
 
 func (s *Service) Download(id string, req TransferRequest) (Transfer, error) {
 	if strings.TrimSpace(req.Source) == "" || strings.TrimSpace(req.Target) == "" {
 		return Transfer{}, fmt.Errorf("%w: source and target are required", ErrValidation)
 	}
-	return s.startTransfer(id, "download", req.Source, req.Target, nil, func(ctx context.Context, res *resource, transfer *transferState) (string, error) {
-		if res.client != nil {
-			return s.runDownloadRemote(ctx, res, transfer, req)
-		}
-		return s.runDownloadLocal(ctx, res, transfer, req)
+	return s.startTransfer(id, "download", req.Source, req.Target, nil, func(ctx context.Context, res *backendView, work *transferWork) (string, error) {
+		return s.runDownload(ctx, res, work, req)
 	})
+}
+
+func (s *Service) runDownload(ctx context.Context, res *backendView, work *transferWork, req TransferRequest) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if res.client != nil {
+		return s.runDownloadRemote(ctx, res, work, req)
+	}
+	return s.runDownloadLocal(ctx, res, work, req)
 }
 
 func (s *Service) BatchUpload(id string, req BatchTransferRequest) (Transfer, error) {
@@ -1235,8 +1290,8 @@ func (s *Service) BatchUpload(id string, req BatchTransferRequest) (Transfer, er
 	for _, source := range req.Sources {
 		items = append(items, TransferItem{Source: source, Target: req.Target, State: "queued"})
 	}
-	return s.startTransfer(id, "upload", "", req.Target, items, func(ctx context.Context, res *resource, transfer *transferState) (string, error) {
-		return s.runBatchUpload(ctx, res, transfer, req)
+	return s.startTransfer(id, "upload", "", req.Target, items, func(ctx context.Context, res *backendView, work *transferWork) (string, error) {
+		return s.runBatchUpload(ctx, res, work, req)
 	})
 }
 
@@ -1248,12 +1303,12 @@ func (s *Service) BatchDownload(id string, req BatchTransferRequest) (Transfer, 
 	for _, source := range req.Sources {
 		items = append(items, TransferItem{Source: source, Target: req.Target, State: "queued"})
 	}
-	return s.startTransfer(id, "download", "", req.Target, items, func(ctx context.Context, res *resource, transfer *transferState) (string, error) {
-		return s.runBatchDownload(ctx, res, transfer, req)
+	return s.startTransfer(id, "download", "", req.Target, items, func(ctx context.Context, res *backendView, work *transferWork) (string, error) {
+		return s.runBatchDownload(ctx, res, work, req)
 	})
 }
 
-func (s *Service) startTransfer(sessionID string, direction string, source string, target string, items []TransferItem, worker func(context.Context, *resource, *transferState) (string, error)) (Transfer, error) {
+func (s *Service) startTransfer(sessionID string, direction string, source string, target string, items []TransferItem, worker func(context.Context, *backendView, *transferWork) (string, error)) (Transfer, error) {
 	s.mu.Lock()
 	res, ok := s.sessions[sessionID]
 	if !ok {
@@ -1285,35 +1340,38 @@ func (s *Service) startTransfer(sessionID string, direction string, source strin
 	s.nextID++
 	s.transfers[transfer.ID] = transfer
 	s.publishTransferLocked(transfer, "sftp.transfer.queued", now)
+
+	// Take snapshot before releasing lock and starting worker
+	snapshot := transfer.snapshot()
 	s.mu.Unlock()
 
 	go s.executeTransfer(ctx, transfer.ID, worker)
-	return transfer.snapshot(), nil
+	return snapshot, nil
 }
 
-func (s *Service) executeTransfer(ctx context.Context, transferID string, worker func(context.Context, *resource, *transferState) (string, error)) {
-	res, transfer, ok := s.markTransferRunning(transferID)
+func (s *Service) executeTransfer(ctx context.Context, transferID string, worker func(context.Context, *backendView, *transferWork) (string, error)) {
+	res, work, ok := s.markTransferRunning(ctx, transferID)
 	if !ok {
 		return
 	}
-	finalState, err := worker(ctx, res, transfer)
+	finalState, err := worker(ctx, res, work)
 	switch {
-	case errors.Is(err, context.Canceled):
-		s.finishTransfer(transferID, "canceled", "")
+	case errors.Is(err, context.Canceled) || (err != nil && ctx.Err() != nil):
+		s.finishTransferFromWorker(transferID, work, "canceled", "")
 	case err != nil:
 		if finalState == "" {
 			finalState = "failed"
 		}
-		s.finishTransfer(transferID, finalState, err.Error())
+		s.finishTransferFromWorker(transferID, work, finalState, err.Error())
 	default:
 		if finalState == "" {
 			finalState = "completed"
 		}
-		s.finishTransfer(transferID, finalState, "")
+		s.finishTransferFromWorker(transferID, work, finalState, "")
 	}
 }
 
-func (s *Service) markTransferRunning(transferID string) (*resource, *transferState, bool) {
+func (s *Service) markTransferRunning(ctx context.Context, transferID string) (*backendView, *transferWork, bool) {
 	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1321,14 +1379,27 @@ func (s *Service) markTransferRunning(transferID string) (*resource, *transferSt
 	if !ok {
 		return nil, nil, false
 	}
+	// Reject already terminal transfers
+	if isTerminalState(transfer.State) {
+		return nil, nil, false
+	}
 	res, ok := s.sessions[transfer.SessionID]
-	if !ok {
+	if ctx.Err() != nil || !ok || res.State != "open" {
+		for i := range transfer.Items {
+			if !isTerminalState(transfer.Items[i].State) {
+				transfer.Items[i].State = "canceled"
+			}
+		}
+		s.finishTransferLocked(transfer, "canceled", "", now)
 		return nil, nil, false
 	}
 	transfer.State = "running"
 	transfer.StartedAt = now
 	s.publishTransferLocked(transfer, "sftp.transfer.started", now)
-	return res, transfer, true
+
+	// Clone Items as well as the scalar fields before handing ownership to the worker.
+	work := &transferWork{Transfer: transfer.snapshot()}
+	return res.backendLocked(), work, true
 }
 
 func (s *Service) finishTransfer(id string, state string, message string) {
@@ -1339,22 +1410,74 @@ func (s *Service) finishTransfer(id string, state string, message string) {
 	if !ok {
 		return
 	}
+	// Terminal state protection: once in a terminal state, do not overwrite
+	if isTerminalState(transfer.State) {
+		return
+	}
+	s.finishTransferLocked(transfer, state, message, now)
+}
+
+// Caller holds Service.mu; final progress must already be merged.
+func (s *Service) finishTransferLocked(transfer *transferState, state, message string, now time.Time) {
 	transfer.State = state
 	transfer.Error = message
 	transfer.CompletedAt = now
 	s.publishTransferLocked(transfer, "sftp.transfer."+state, now)
 }
 
-func (s *Service) updateTransferProgress(transfer *transferState) {
+func isTerminalState(state string) bool {
+	switch state {
+	case "completed", "failed", "partial_failed", "canceled":
+		return true
+	default:
+		return false
+	}
+}
+
+// applyWorkerProgressLocked merges progress fields from worker's private copy
+// into the shared transfer state. Caller must hold s.mu.
+// Does not overwrite State, Error, or CompletedAt.
+func (s *Service) applyWorkerProgressLocked(dst *transferState, src Transfer) {
+	dst.BytesTotal = src.BytesTotal
+	dst.BytesCopied = src.BytesCopied
+	dst.FilesTotal = src.FilesTotal
+	dst.FilesDone = src.FilesDone
+	dst.CurrentPath = src.CurrentPath
+	dst.Items = cloneTransferItems(src.Items)
+}
+
+// publishWorkerProgress publishes progress from worker's private copy to shared state.
+// Called by the same worker that owns the transferWork.
+func (s *Service) publishWorkerProgress(work *transferWork) {
 	now := time.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	current, ok := s.transfers[transfer.ID]
+	current, ok := s.transfers[work.ID]
+	if !ok || isTerminalState(current.State) {
+		return
+	}
+	s.applyWorkerProgressLocked(current, work.Transfer)
+	s.publishTransferLocked(current, "sftp.transfer.progress", now)
+}
+
+// finishTransferFromWorker submits final progress and terminal state in one atomic operation.
+// This ensures GET, snapshot, and events see consistent final values.
+func (s *Service) finishTransferFromWorker(id string, work *transferWork, state string, message string) {
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	transfer, ok := s.transfers[id]
 	if !ok {
 		return
 	}
-	current.Transfer = transfer.Transfer
-	s.publishTransferLocked(current, "sftp.transfer.progress", now)
+	// Terminal state protection: once in a terminal state, do not overwrite
+	if isTerminalState(transfer.State) {
+		return
+	}
+	// Merge final progress
+	s.applyWorkerProgressLocked(transfer, work.Transfer)
+	// Set terminal state
+	s.finishTransferLocked(transfer, state, message, now)
 }
 
 func (s *Service) ListTransfers(sessionID string) ([]Transfer, error) {
@@ -1395,7 +1518,9 @@ func (s *Service) CancelTransfer(sessionID string, transferID string) (Transfer,
 	snapshot := transfer.snapshot()
 	cancel := transfer.cancel
 	s.mu.RUnlock()
-	cancel()
+	if !isTerminalState(snapshot.State) {
+		cancel()
+	}
 	return snapshot, nil
 }
 
@@ -1407,9 +1532,17 @@ func (s *Service) GlobMatches(id string, pattern string, includeDirs bool, useCa
 	if err != nil {
 		return nil, err
 	}
+	return s.globMatches(res, pattern, includeDirs, useCache)
+}
+
+func (s *Service) globMatches(res *backendView, pattern string, includeDirs bool, useCache bool) ([]Entry, error) {
+	if strings.TrimSpace(pattern) == "" {
+		return nil, fmt.Errorf("%w: pattern is required", ErrValidation)
+	}
 	dir := path.Dir(pattern)
 	base := path.Base(pattern)
 	var infos []os.FileInfo
+	var err error
 	if res.client != nil {
 		if useCache && res.cache != nil {
 			infos, err = res.cache.ReadDir(dir)
@@ -1420,7 +1553,7 @@ func (s *Service) GlobMatches(id string, pattern string, includeDirs bool, useCa
 			return nil, err
 		}
 	} else {
-		localDir, _, err := s.resolve(id, dir)
+		localDir, err := (localPathResolver{root: res.Root}).resolve(dir)
 		if err != nil {
 			return nil, err
 		}
@@ -1456,58 +1589,70 @@ func (s *Service) GlobMatches(id string, pattern string, includeDirs bool, useCa
 	return matches, nil
 }
 
-func (s *Service) runUploadLocal(ctx context.Context, res *resource, transfer *transferState, req TransferRequest) (string, error) {
+func (s *Service) runUploadLocal(ctx context.Context, res *backendView, work *transferWork, req TransferRequest) (string, error) {
 	plan, err := planUploadLocal(req.Source, req.Target, req.Recursive, localPathResolver{root: res.Root})
 	if err != nil {
 		return "", err
 	}
-	s.seedPlanProgress(transfer, plan)
-	return s.executeLocalUploadPlan(ctx, res, transfer, plan, req.Overwrite)
+	s.seedPlanProgress(work, plan)
+	return s.executeLocalUploadPlan(ctx, res, work, plan, req.Overwrite)
 }
 
-func (s *Service) runUploadRemote(ctx context.Context, res *resource, transfer *transferState, req TransferRequest) (string, error) {
+func (s *Service) runUploadRemote(ctx context.Context, res *backendView, work *transferWork, req TransferRequest) (string, error) {
 	plan, err := planUploadLocal(req.Source, req.Target, req.Recursive, res.client)
 	if err != nil {
 		return "", err
 	}
-	s.seedPlanProgress(transfer, plan)
-	return s.executeRemoteUploadPlan(ctx, res, transfer, plan, req.Overwrite)
+	s.seedPlanProgress(work, plan)
+	return s.executeRemoteUploadPlan(ctx, res, work, plan, req.Overwrite)
 }
 
-func (s *Service) runDownloadLocal(ctx context.Context, res *resource, transfer *transferState, req TransferRequest) (string, error) {
+func (s *Service) runDownloadLocal(ctx context.Context, res *backendView, work *transferWork, req TransferRequest) (string, error) {
 	plan, err := s.planDownloadLocal(res, req.Source, req.Target, req.Recursive)
 	if err != nil {
 		return "", err
 	}
-	s.seedPlanProgress(transfer, plan)
-	return s.executeLocalDownloadPlan(ctx, transfer, plan, req.Overwrite)
+	s.seedPlanProgress(work, plan)
+	return s.executeLocalDownloadPlan(ctx, work, plan, req.Overwrite)
 }
 
-func (s *Service) runDownloadRemote(ctx context.Context, res *resource, transfer *transferState, req TransferRequest) (string, error) {
+func (s *Service) runDownloadRemote(ctx context.Context, res *backendView, work *transferWork, req TransferRequest) (string, error) {
 	plan, err := s.planDownloadRemote(res, req.Source, req.Target, req.Recursive)
 	if err != nil {
 		return "", err
 	}
-	s.seedPlanProgress(transfer, plan)
-	return s.executeRemoteDownloadPlan(ctx, res, transfer, plan, req.Overwrite)
+	s.seedPlanProgress(work, plan)
+	return s.executeRemoteDownloadPlan(ctx, res, work, plan, req.Overwrite)
 }
 
-func (s *Service) runBatchUpload(ctx context.Context, res *resource, transfer *transferState, req BatchTransferRequest) (string, error) {
-	return s.runBatch(ctx, transfer, transfer.Direction, len(req.Sources), func(index int) error {
+func (s *Service) runBatchUpload(ctx context.Context, res *backendView, work *transferWork, req BatchTransferRequest) (string, error) {
+	return s.runBatch(ctx, work, work.Direction, len(req.Sources), func(index int) error {
 		source := req.Sources[index]
 		itemReq := TransferRequest{Source: source, Target: req.Target, Overwrite: req.Overwrite, Recursive: req.Recursive}
 		if res.client != nil {
-			return s.runBatchUploadItemRemote(ctx, res, transfer, index, itemReq)
+			return s.runBatchUploadItemRemote(ctx, res, work, index, itemReq)
 		}
-		return s.runBatchUploadItemLocal(ctx, res, transfer, index, itemReq)
+		return s.runBatchUploadItemLocal(ctx, res, work, index, itemReq)
 	})
 }
 
-func (s *Service) runBatchDownload(ctx context.Context, res *resource, transfer *transferState, req BatchTransferRequest) (string, error) {
+func (s *Service) runBatchDownload(ctx context.Context, res *backendView, work *transferWork, req BatchTransferRequest) (string, error) {
 	expanded := make([][]Entry, len(req.Sources))
 	for i, pattern := range req.Sources {
-		matches, err := s.GlobMatches(res.ID, pattern, req.IncludeDirs, true)
+		if err := ctx.Err(); err != nil {
+			for j := range work.Items {
+				s.markTransferItemCanceled(work, j)
+			}
+			return "", err
+		}
+		matches, err := s.globMatches(res, pattern, req.IncludeDirs, true)
 		if err != nil {
+			if ctx.Err() != nil {
+				for j := range work.Items {
+					s.markTransferItemCanceled(work, j)
+				}
+				return "", ctx.Err()
+			}
 			if !errors.Is(err, os.ErrNotExist) {
 				return "failed", err
 			}
@@ -1515,7 +1660,7 @@ func (s *Service) runBatchDownload(ctx context.Context, res *resource, transfer 
 		}
 		expanded[i] = matches
 	}
-	return s.runBatch(ctx, transfer, transfer.Direction, len(req.Sources), func(index int) error {
+	return s.runBatch(ctx, work, work.Direction, len(req.Sources), func(index int) error {
 		matches := expanded[index]
 		if len(matches) == 0 {
 			return os.ErrNotExist
@@ -1528,9 +1673,9 @@ func (s *Service) runBatchDownload(ctx context.Context, res *resource, transfer 
 			}
 			itemReq := TransferRequest{Source: match.Path, Target: target, Overwrite: req.Overwrite, Recursive: req.Recursive}
 			if res.client != nil {
-				itemErr = s.runBatchDownloadItemRemote(ctx, res, transfer, index, itemReq)
+				itemErr = s.runBatchDownloadItemRemote(ctx, res, work, index, itemReq)
 			} else {
-				itemErr = s.runBatchDownloadItemLocal(ctx, res, transfer, index, itemReq)
+				itemErr = s.runBatchDownloadItemLocal(ctx, res, work, index, itemReq)
 			}
 			if itemErr != nil {
 				return itemErr
@@ -1540,20 +1685,34 @@ func (s *Service) runBatchDownload(ctx context.Context, res *resource, transfer 
 	})
 }
 
-func (s *Service) runBatch(ctx context.Context, transfer *transferState, direction string, total int, runItem func(int) error) (string, error) {
+func (s *Service) runBatch(ctx context.Context, work *transferWork, direction string, total int, runItem func(int) error) (string, error) {
 	failures := 0
 	for i := 0; i < total; i++ {
+		// Check context before each item
 		select {
 		case <-ctx.Done():
+			// Mark all remaining items as canceled
+			for j := i; j < total; j++ {
+				s.markTransferItemCanceled(work, j)
+			}
 			return "", ctx.Err()
 		default:
 		}
 		if err := runItem(i); err != nil {
+			// Distinguish cancellation from regular failure
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				s.markTransferItemCanceled(work, i)
+				// Mark remaining items as canceled
+				for j := i + 1; j < total; j++ {
+					s.markTransferItemCanceled(work, j)
+				}
+				return "", context.Canceled
+			}
 			failures++
-			s.markTransferItemError(transfer, i, err)
+			s.markTransferItemError(work, i, err)
 			continue
 		}
-		s.markTransferItemCompleted(transfer, i)
+		s.markTransferItemCompleted(work, i)
 	}
 	switch {
 	case failures == 0:
@@ -1565,80 +1724,90 @@ func (s *Service) runBatch(ctx context.Context, transfer *transferState, directi
 	}
 }
 
-func (s *Service) runBatchUploadItemLocal(ctx context.Context, res *resource, transfer *transferState, index int, req TransferRequest) error {
+func (s *Service) runBatchUploadItemLocal(ctx context.Context, res *backendView, work *transferWork, index int, req TransferRequest) error {
 	plan, err := planUploadLocal(req.Source, req.Target, req.Recursive, localPathResolver{root: res.Root})
 	if err != nil {
 		return err
 	}
-	s.seedBatchItemPlan(transfer, index, plan)
-	_, err = s.executeLocalUploadPlan(ctx, res, transfer, plan, req.Overwrite)
+	s.seedBatchItemPlan(work, index, plan)
+	_, err = s.executeLocalUploadPlan(ctx, res, work, plan, req.Overwrite)
 	return err
 }
 
-func (s *Service) runBatchUploadItemRemote(ctx context.Context, res *resource, transfer *transferState, index int, req TransferRequest) error {
+func (s *Service) runBatchUploadItemRemote(ctx context.Context, res *backendView, work *transferWork, index int, req TransferRequest) error {
 	plan, err := planUploadLocal(req.Source, req.Target, req.Recursive, res.client)
 	if err != nil {
 		return err
 	}
-	s.seedBatchItemPlan(transfer, index, plan)
-	_, err = s.executeRemoteUploadPlan(ctx, res, transfer, plan, req.Overwrite)
+	s.seedBatchItemPlan(work, index, plan)
+	_, err = s.executeRemoteUploadPlan(ctx, res, work, plan, req.Overwrite)
 	return err
 }
 
-func (s *Service) runBatchDownloadItemLocal(ctx context.Context, res *resource, transfer *transferState, index int, req TransferRequest) error {
+func (s *Service) runBatchDownloadItemLocal(ctx context.Context, res *backendView, work *transferWork, index int, req TransferRequest) error {
 	plan, err := s.planDownloadLocal(res, req.Source, req.Target, req.Recursive)
 	if err != nil {
 		return err
 	}
-	s.seedBatchItemPlan(transfer, index, plan)
-	_, err = s.executeLocalDownloadPlan(ctx, transfer, plan, req.Overwrite)
+	s.seedBatchItemPlan(work, index, plan)
+	_, err = s.executeLocalDownloadPlan(ctx, work, plan, req.Overwrite)
 	return err
 }
 
-func (s *Service) runBatchDownloadItemRemote(ctx context.Context, res *resource, transfer *transferState, index int, req TransferRequest) error {
+func (s *Service) runBatchDownloadItemRemote(ctx context.Context, res *backendView, work *transferWork, index int, req TransferRequest) error {
 	plan, err := s.planDownloadRemote(res, req.Source, req.Target, req.Recursive)
 	if err != nil {
 		return err
 	}
-	s.seedBatchItemPlan(transfer, index, plan)
-	_, err = s.executeRemoteDownloadPlan(ctx, res, transfer, plan, req.Overwrite)
+	s.seedBatchItemPlan(work, index, plan)
+	_, err = s.executeRemoteDownloadPlan(ctx, res, work, plan, req.Overwrite)
 	return err
 }
 
-func (s *Service) seedPlanProgress(transfer *transferState, plan transferPlan) {
-	transfer.BytesTotal += plan.bytesTotal
-	transfer.FilesTotal += plan.filesTotal
-	s.updateTransferProgress(transfer)
+func (s *Service) seedPlanProgress(work *transferWork, plan transferPlan) {
+	work.BytesTotal += plan.bytesTotal
+	work.FilesTotal += plan.filesTotal
+	s.publishWorkerProgress(work)
 }
 
-func (s *Service) seedBatchItemPlan(transfer *transferState, index int, plan transferPlan) {
-	transfer.BytesTotal += plan.bytesTotal
-	transfer.FilesTotal += plan.filesTotal
-	if index >= 0 && index < len(transfer.Items) {
-		transfer.Items[index].BytesTotal += plan.bytesTotal
-		transfer.Items[index].FilesTotal += plan.filesTotal
-		transfer.Items[index].State = "running"
+func (s *Service) seedBatchItemPlan(work *transferWork, index int, plan transferPlan) {
+	work.BytesTotal += plan.bytesTotal
+	work.FilesTotal += plan.filesTotal
+	if index >= 0 && index < len(work.Items) {
+		work.Items[index].BytesTotal += plan.bytesTotal
+		work.Items[index].FilesTotal += plan.filesTotal
+		work.Items[index].State = "running"
 	}
-	s.updateTransferProgress(transfer)
+	s.publishWorkerProgress(work)
 }
 
-func (s *Service) markTransferItemError(transfer *transferState, index int, err error) {
-	if index >= 0 && index < len(transfer.Items) {
-		transfer.Items[index].State = "failed"
-		transfer.Items[index].Error = err.Error()
+func (s *Service) markTransferItemError(work *transferWork, index int, err error) {
+	if index >= 0 && index < len(work.Items) {
+		work.Items[index].State = "failed"
+		work.Items[index].Error = err.Error()
 	}
-	s.updateTransferProgress(transfer)
+	s.publishWorkerProgress(work)
 }
 
-func (s *Service) markTransferItemCompleted(transfer *transferState, index int) {
-	if index >= 0 && index < len(transfer.Items) {
-		transfer.Items[index].State = "completed"
+func (s *Service) markTransferItemCompleted(work *transferWork, index int) {
+	if index >= 0 && index < len(work.Items) {
+		work.Items[index].State = "completed"
 	}
-	s.updateTransferProgress(transfer)
+	s.publishWorkerProgress(work)
 }
 
-func (s *Service) executeLocalUploadPlan(ctx context.Context, res *resource, transfer *transferState, plan transferPlan, overwrite bool) (string, error) {
+func (s *Service) markTransferItemCanceled(work *transferWork, index int) {
+	if index >= 0 && index < len(work.Items) {
+		work.Items[index].State = "canceled"
+	}
+	s.publishWorkerProgress(work)
+}
+
+func (s *Service) executeLocalUploadPlan(ctx context.Context, res *backendView, work *transferWork, plan transferPlan, overwrite bool) (string, error) {
 	for _, dir := range plan.dirs {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		localTarget, err := localPathResolver{root: res.Root}.resolve(dir.target)
 		if err != nil {
 			return "", err
@@ -1687,21 +1856,24 @@ func (s *Service) executeLocalUploadPlan(ctx context.Context, res *resource, tra
 			}
 			return "", err
 		}
-		if err := s.copyWithProgress(ctx, transfer, file.target, src, dst, file.size, 0); err != nil {
+		if err := s.copyWithProgress(ctx, work, file.target, src, dst, file.size, 0); err != nil {
 			_ = src.Close()
 			_ = dst.Close()
 			return "", err
 		}
 		_ = src.Close()
 		_ = dst.Close()
-		transfer.FilesDone++
-		s.updateTransferProgress(transfer)
+		work.FilesDone++
+		s.publishWorkerProgress(work)
 	}
 	return "completed", nil
 }
 
-func (s *Service) executeRemoteUploadPlan(ctx context.Context, res *resource, transfer *transferState, plan transferPlan, overwrite bool) (string, error) {
+func (s *Service) executeRemoteUploadPlan(ctx context.Context, res *backendView, work *transferWork, plan transferPlan, overwrite bool) (string, error) {
 	for _, dir := range plan.dirs {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if err := res.client.MkdirAll(dir.target); err != nil {
 			return "", err
 		}
@@ -1740,24 +1912,27 @@ func (s *Service) executeRemoteUploadPlan(ctx context.Context, res *resource, tr
 			}
 			return "", err
 		}
-		if err := s.copyWithProgress(ctx, transfer, file.target, src, dst, file.size, 0); err != nil {
+		if err := s.copyWithProgress(ctx, work, file.target, src, dst, file.size, 0); err != nil {
 			_ = src.Close()
 			_ = dst.Close()
 			return "", err
 		}
 		_ = src.Close()
 		_ = dst.Close()
-		transfer.FilesDone++
-		s.updateTransferProgress(transfer)
+		work.FilesDone++
+		s.publishWorkerProgress(work)
 	}
 	if res.cache != nil {
-		res.cache.Invalidate(path.Dir(transfer.Target), transfer.Target)
+		res.cache.Invalidate(path.Dir(work.Target), work.Target)
 	}
 	return "completed", nil
 }
 
-func (s *Service) executeLocalDownloadPlan(ctx context.Context, transfer *transferState, plan transferPlan, overwrite bool) (string, error) {
+func (s *Service) executeLocalDownloadPlan(ctx context.Context, work *transferWork, plan transferPlan, overwrite bool) (string, error) {
 	for _, dir := range plan.dirs {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		mode := dir.mode.Perm()
 		if mode == 0 {
 			mode = 0o755
@@ -1793,21 +1968,24 @@ func (s *Service) executeLocalDownloadPlan(ctx context.Context, transfer *transf
 			}
 			return "", err
 		}
-		if err := s.copyWithProgress(ctx, transfer, file.source, src, dst, file.size, file.mode); err != nil {
+		if err := s.copyWithProgress(ctx, work, file.source, src, dst, file.size, file.mode); err != nil {
 			_ = src.Close()
 			_ = dst.Close()
 			return "", err
 		}
 		_ = src.Close()
 		_ = dst.Close()
-		transfer.FilesDone++
-		s.updateTransferProgress(transfer)
+		work.FilesDone++
+		s.publishWorkerProgress(work)
 	}
 	return "completed", nil
 }
 
-func (s *Service) executeRemoteDownloadPlan(ctx context.Context, res *resource, transfer *transferState, plan transferPlan, overwrite bool) (string, error) {
+func (s *Service) executeRemoteDownloadPlan(ctx context.Context, res *backendView, work *transferWork, plan transferPlan, overwrite bool) (string, error) {
 	for _, dir := range plan.dirs {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		mode := dir.mode.Perm()
 		if mode == 0 {
 			mode = 0o755
@@ -1844,23 +2022,23 @@ func (s *Service) executeRemoteDownloadPlan(ctx context.Context, res *resource, 
 			}
 			return "", err
 		}
-		if err := s.copyWithProgress(ctx, transfer, file.source, src, dst, file.size, file.mode); err != nil {
+		if err := s.copyWithProgress(ctx, work, file.source, src, dst, file.size, file.mode); err != nil {
 			_ = src.Close()
 			_ = dst.Close()
 			return "", err
 		}
 		_ = src.Close()
 		_ = dst.Close()
-		transfer.FilesDone++
-		s.updateTransferProgress(transfer)
+		work.FilesDone++
+		s.publishWorkerProgress(work)
 	}
 	return "completed", nil
 }
 
-func (s *Service) copyWithProgress(ctx context.Context, transfer *transferState, currentPath string, src io.Reader, dst io.Writer, total int64, mode os.FileMode) error {
+func (s *Service) copyWithProgress(ctx context.Context, work *transferWork, currentPath string, src io.Reader, dst io.Writer, total int64, mode os.FileMode) error {
 	buf := make([]byte, 32*1024)
 	last := time.Time{}
-	transfer.CurrentPath = currentPath
+	work.CurrentPath = currentPath
 	for {
 		select {
 		case <-ctx.Done():
@@ -1871,14 +2049,14 @@ func (s *Service) copyWithProgress(ctx context.Context, transfer *transferState,
 		if nr > 0 {
 			nw, ew := dst.Write(buf[:nr])
 			if nw > 0 {
-				transfer.BytesCopied += int64(nw)
+				work.BytesCopied += int64(nw)
 				if mode != 0 {
 					_ = os.Chmod(currentPath, mode.Perm())
 				}
 				now := time.Now().UTC()
-				if last.IsZero() || now.Sub(last) >= progressEmitEvery || transfer.BytesCopied >= total {
+				if last.IsZero() || now.Sub(last) >= progressEmitEvery || work.BytesCopied >= total {
 					last = now
-					s.updateTransferProgress(transfer)
+					s.publishWorkerProgress(work)
 				}
 			}
 			if ew != nil {
@@ -1954,8 +2132,9 @@ func buildUploadDirPlan(localDir string, remoteDir string) (transferPlan, error)
 	return plan, err
 }
 
-func (s *Service) planDownloadLocal(res *resource, remotePath string, localTarget string, recursive bool) (transferPlan, error) {
-	localSource, clean, err := s.resolve(res.ID, remotePath)
+func (s *Service) planDownloadLocal(res *backendView, remotePath string, localTarget string, recursive bool) (transferPlan, error) {
+	clean := cleanRemote(remotePath)
+	localSource, err := (localPathResolver{root: res.Root}).resolve(clean)
 	if err != nil {
 		return transferPlan{}, err
 	}
@@ -1993,7 +2172,7 @@ func (s *Service) planDownloadLocal(res *resource, remotePath string, localTarge
 	}, nil
 }
 
-func (s *Service) planDownloadRemote(res *resource, remotePath string, localTarget string, recursive bool) (transferPlan, error) {
+func (s *Service) planDownloadRemote(res *backendView, remotePath string, localTarget string, recursive bool) (transferPlan, error) {
 	localTarget, err := expandLocalHome(localTarget)
 	if err != nil {
 		return transferPlan{}, err
@@ -2108,7 +2287,7 @@ func resolveLocalDownloadRoot(remotePath string, localTarget string, recursive b
 	return target, false, err
 }
 
-func (s *Service) requireOpenSession(id string, remotePath string) (*resource, string, error) {
+func (s *Service) requireOpenSession(id string, remotePath string) (*backendView, string, error) {
 	s.mu.RLock()
 	res, ok := s.sessions[id]
 	if !ok {
@@ -2120,8 +2299,9 @@ func (s *Service) requireOpenSession(id string, remotePath string) (*resource, s
 		return nil, "", fmt.Errorf("%w: sftp session is not open", ErrConflict)
 	}
 	clean := cleanRemote(remotePath)
+	view := res.backendLocked()
 	s.mu.RUnlock()
-	return res, clean, nil
+	return view, clean, nil
 }
 
 func (s *Service) resolve(id string, remotePath string) (string, string, error) {

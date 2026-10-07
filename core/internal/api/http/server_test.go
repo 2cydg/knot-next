@@ -1518,6 +1518,7 @@ func newStatefulTestServer(t *testing.T) *Server {
 	provider := crypto.NewStaticProvider([]byte("test-key"))
 	configService := config.NewService(layout, provider)
 	sharedPool := sshpool.NewPool()
+	t.Cleanup(func() { sharedPool.CloseAll() })
 	coreService := core.New(core.DefaultVersion, startedAt)
 	coreService.UseConfig(configService)
 	coreService.UseSecret(secret.NewService(configService, provider))
@@ -1573,9 +1574,13 @@ func strconvQuote(value string) string {
 
 func openTestWebSocket(t *testing.T, ts *httptest.Server, path string) (net.Conn, *bufio.Reader) {
 	t.Helper()
-	conn, err := net.Dial("tcp", ts.Listener.Addr().String())
+	conn, err := net.DialTimeout("tcp", ts.Listener.Addr().String(), 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial websocket server: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set websocket deadline: %v", err)
 	}
 	key := "dGhlIHNhbXBsZSBub25jZQ=="
 	request := "GET " + path + " HTTP/1.1\r\n" +

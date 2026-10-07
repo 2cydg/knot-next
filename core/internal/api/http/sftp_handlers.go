@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	stdhttp "net/http"
 	"os"
 	"strconv"
@@ -239,7 +238,7 @@ func handleSFTPSessionEvents(w stdhttp.ResponseWriter, r *stdhttp.Request, sftpS
 }
 
 func handleSFTPTransferEvents(w stdhttp.ResponseWriter, r *stdhttp.Request, sftpService *sftp.Service, sessionID string) {
-	events, cancel, err := sftpService.SubscribeTransfers(sessionID)
+	events, cancel, snapshot, err := sftpService.SubscribeTransfersWithSnapshot(sessionID)
 	if err != nil {
 		writeSFTPError(w, response.RiskReadOnly, "sftp/"+sessionID+"/transfers/events", err)
 		return
@@ -254,7 +253,22 @@ func handleSFTPTransferEvents(w stdhttp.ResponseWriter, r *stdhttp.Request, sftp
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	go conn.drainControlFrames(cancel)
-	_ = conn.WriteFrame(wsOpcodeText, []byte(fmt.Sprintf(`{"type":"sftp.transfer.snapshot","session_id":%q}`, sessionID)))
+
+	// Send snapshot as first frame
+	snapshotFrame := map[string]any{
+		"type":       "sftp.transfer.snapshot",
+		"session_id": sessionID,
+		"transfers":  snapshot,
+	}
+	snapshotPayload, err := json.Marshal(snapshotFrame)
+	if err != nil {
+		return
+	}
+	if err := conn.WriteFrame(wsOpcodeText, snapshotPayload); err != nil {
+		return
+	}
+
+	// Stream subsequent events
 	for {
 		select {
 		case <-ctx.Done():

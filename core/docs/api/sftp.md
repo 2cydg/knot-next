@@ -98,7 +98,15 @@
 - `running`
 - `completed`
 - `failed`
+- `partial_failed`：批量项目部分成功、部分失败
 - `canceled`
+
+`queued`、`running` 为非终态；`completed`、`failed`、`partial_failed`、`canceled` 均为终态。
+终态包含非零的 `completed_at`，一旦提交，不再被迟到进度、重复收尾或取消覆盖。
+批量全失败为 `failed`，部分失败为 `partial_failed`；HTTP 202 仅表示任务已创建，客户端需要跟踪任务结果。
+
+`items` 保存批量项目的状态与错误。取消时保留此前 completed/failed 项目的结果，当前中断项目和之后未开始的项目标为 canceled。
+`bytes_copied` 可以在取消或失败时非零；`files_done` 只统计成功复制的文件。取消不承诺回滚已写入的文件、目录或数据。
 
 ### SFTP Event
 
@@ -408,7 +416,12 @@ query：
 说明：
 
 - 返回的是取消时的 transfer snapshot
-- 实际状态转为 `canceled` 依赖后台 worker 异步收敛
+- HTTP 200 表示取消请求已受理；实际状态转为 `canceled` 依赖后台 worker 异步收敛，继续 GET 查询直到终态
+- 已进入终态的任务重复取消返回原结果，不改变 `completed_at`
+- 取消与正常完成竞争时允许已完成的任务返回 completed；不会让已提交的终态翻转
+- 使用错误的 session/transfer 组合查询或取消时返回 404
+- 普通取消通过 worker 检查 context 收尾；远端永久不响应时，不能保证正在阻塞的网络 I/O 被立即打断
+- 关闭 session 会先取消关联任务，再关闭 SFTP client；事件流可能先关闭，使用 GET 查询任务收尾结果
 
 ## WebSocket 接口
 
@@ -446,9 +459,14 @@ query：
 ```json
 {
   "type": "sftp.transfer.snapshot",
-  "session_id": "sftp_1"
+  "session_id": "sftp_1",
+  "transfers": []
 }
 ```
+
+`transfers` 是本 session 当前保留的完整 Transfer 数组，按 `started_at` 升序排列；无任务时为 `[]`，不是 null。
+正在运行的任务和已保留的终态任务都包含在首帧，因此完成后再订阅也能直接读取结果。
+订阅注册与资源快照在同一临界区完成，随后发布的事件进入订阅通道。
 
 之后每个 text frame 都是 `sftp.TransferEvent`。
 
@@ -459,6 +477,7 @@ query：
 - `sftp.transfer.progress`
 - `sftp.transfer.completed`
 - `sftp.transfer.failed`
+- `sftp.transfer.partial_failed`
 - `sftp.transfer.canceled`
 
 ## 客户端建议
@@ -466,6 +485,11 @@ query：
 - 目录浏览优先使用 `GET /files`，单文件信息优先使用 `GET /files?stat=true`
 - 长传输任务启动后，应改用 `/transfers` 或 `/transfers/events` 跟踪，不要轮询 upload/download 接口本身
 - `matches` 无匹配时当前返回 `404`，不要把它当成空数组成功态
+- 保存 POST 返回的 transfer ID；首帧查找该 ID，然后 GET 确认最新状态，任一终态均应结束等待
+- 事件缓冲有界，慢消费者可能丢失进度或终态通知；GET 是任务结果依据，不能只等待某个事件必达
+- WS 断线后 GET 或重订阅恢复原任务，不重复提交上传/下载；积压的旧 progress 不应覆盖已观察到的终态
+- 快照仅包含当前进程内尚未清理的历史任务；core 重启或历史清理后 GET 可能返回 404，应报告结果不可查询
+- 有界等待与恢复示例见 [Streaming](../streaming.md)
 
 ## 常见错误
 
