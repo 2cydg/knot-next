@@ -145,6 +145,8 @@ func prepareServices(
 	sftpService.UseConfig(configService)
 	sftpService.UseSession(sessionService)
 	sftpService.UsePool(sharedPool)
+	sessionService.StartMaintenance(env.Context)
+	sftpService.StartMaintenance(env.Context)
 
 	coreService := core.New(core.DefaultVersion, startedAt)
 	coreService.UseConfig(configService)

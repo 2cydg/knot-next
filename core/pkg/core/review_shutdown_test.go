@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	protocolsftp "github.com/pkg/sftp"
 	"knot-core/internal/testutil/sshserver"
 	"knot-core/pkg/config"
 	"knot-core/pkg/session"
@@ -51,10 +52,11 @@ type shutdownFixture struct {
 func newShutdownFixture(t *testing.T) *shutdownFixture {
 	t.Helper()
 
+	handlers := protocolsftp.InMemHandler()
 	srv := sshserver.New(t, sshserver.Config{
-		User:     shutdownTestUser,
-		Password: shutdownTestPassword,
-		SFTPRoot: t.TempDir(),
+		User:         shutdownTestUser,
+		Password:     shutdownTestPassword,
+		SFTPHandlers: &handlers,
 	})
 	t.Cleanup(func() {
 		srv.Close()

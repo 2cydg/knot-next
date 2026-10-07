@@ -12,23 +12,26 @@ import (
 
 func TestExecPrunePreservesPendingCleanup(t *testing.T) {
 	svc := NewService()
+	now := time.Unix(10000, 0)
+	svc.execPolicy.History = 2
+	svc.execPolicy.Now = func() time.Time { return now }
 	svc.execs["pending"] = Exec{ID: "pending", CompletedAt: time.Unix(1, 0), CleanupError: "cleanup_timeout"}
 	svc.execActive["pending"] = &execOperation{done: make(chan struct{})}
-	for i := 1; i < maxExecs; i++ {
+	for i := 1; i <= svc.execPolicy.History+1; i++ {
 		id := fmt.Sprintf("history-%d", i)
-		svc.execs[id] = Exec{ID: id, CompletedAt: time.Unix(int64(i+1), 0)}
+		svc.execs[id] = Exec{ID: id, CompletedAt: now.Add(time.Duration(i) * -time.Second)}
 	}
 	svc.pruneExecsLocked()
 	if result, ok := svc.execs["pending"]; !ok || result.CleanupError != "cleanup_timeout" {
 		t.Fatal("pruning erased the pending cleanup failure")
 	}
-	if len(svc.execs) >= maxExecs {
+	if len(svc.execs) != svc.execPolicy.History+1 {
 		t.Fatal("settled history was not pruned")
 	}
 
 	// If every entry is live, pruning must neither delete live diagnostics nor
 	// index past the empty list of eligible history records.
-	for i := len(svc.execs); i < maxExecs; i++ {
+	for i := len(svc.execs); i < svc.execPolicy.Active; i++ {
 		id := fmt.Sprintf("live-%d", i)
 		svc.execs[id] = Exec{ID: id}
 	}
@@ -36,7 +39,7 @@ func TestExecPrunePreservesPendingCleanup(t *testing.T) {
 		svc.execActive[id] = &execOperation{done: make(chan struct{})}
 	}
 	svc.pruneExecsLocked()
-	if len(svc.execs) != maxExecs {
+	if len(svc.execs) != svc.execPolicy.Active {
 		t.Fatal("live records were deleted")
 	}
 }
@@ -56,6 +59,9 @@ func (c *observedWaitContext) Done() <-chan struct{} {
 
 func TestExecShutdownKeepsResultAfterHistoryPrune(t *testing.T) {
 	svc := NewService()
+	now := time.Unix(10000, 0)
+	svc.execPolicy.History = 2
+	svc.execPolicy.Now = func() time.Time { return now }
 	operation := &execOperation{done: make(chan struct{})}
 	svc.execActive["pending"] = operation
 	budget, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -65,13 +71,13 @@ func TestExecShutdownKeepsResultAfterHistoryPrune(t *testing.T) {
 	go func() { done <- svc.ShutdownExec(ctx) }()
 	awaitExec(t, ctx.entered)
 	svc.mu.Lock()
-	operation.result = Exec{ID: "pending", CleanupError: "cleanup_timeout"}
+	operation.result = Exec{ID: "pending", CompletedAt: now.Add(-time.Minute), CleanupError: "cleanup_timeout"}
 	svc.execs["pending"] = operation.result
 	delete(svc.execActive, "pending")
 	close(operation.done)
-	for i := 1; i < maxExecs; i++ {
+	for i := 1; i <= svc.execPolicy.History; i++ {
 		id := fmt.Sprintf("history-%d", i)
-		svc.execs[id] = Exec{ID: id, CompletedAt: time.Unix(int64(i), 0)}
+		svc.execs[id] = Exec{ID: id, CompletedAt: now.Add(time.Duration(i) * -time.Second)}
 	}
 	svc.pruneExecsLocked()
 	_, retained := svc.execs["pending"]
@@ -107,5 +113,36 @@ func TestExecCompletedResultWinsConcurrentCancellation(t *testing.T) {
 	}
 	if err, completed := waitExecResult(ctx, make(chan error)); !errors.Is(err, context.Canceled) || completed {
 		t.Fatalf("unfinished command ignored cancellation: %v %v", err, completed)
+	}
+}
+
+func TestExecHistoryCapacityAndTTL(t *testing.T) {
+	s := NewService()
+	now := time.Unix(10000, 0)
+	s.execPolicy.History = 2
+	s.execPolicy.TTL = time.Minute
+	s.execPolicy.Now = func() time.Time { return now }
+	s.execs["pending"] = Exec{ID: "pending", CompletedAt: now.Add(-time.Hour), CleanupError: "cleanup_timeout"}
+	s.execActive["pending"] = &execOperation{done: make(chan struct{})}
+	for i := 1; i <= 3; i++ {
+		id := fmt.Sprint(i)
+		s.execs[id] = Exec{ID: id, CompletedAt: now.Add(time.Duration(i-4) * time.Second)}
+	}
+	s.pruneExecsLocked()
+	if len(s.execs) != 3 || s.execs["2"].ID == "" || s.execs["3"].ID == "" {
+		t.Fatalf("capacity did not retain newest results: %+v", s.execs)
+	}
+	if _, exists := s.execs["1"]; exists {
+		t.Fatal("oldest unexpired result survived capacity pressure")
+	}
+	now = now.Add(time.Minute)
+	s.pruneExecsLocked()
+	if len(s.execs) != 1 || s.execs["pending"].CleanupError != "cleanup_timeout" {
+		t.Fatalf("TTL erased live cleanup or retained expired history: %+v", s.execs)
+	}
+	delete(s.execActive, "pending")
+	s.pruneExecsLocked()
+	if len(s.execs) != 0 {
+		t.Fatal("settled expired cleanup survived")
 	}
 }

@@ -462,6 +462,15 @@ attach WebSocket 帧方向总结：
 - `session.challenge.resolved`
 - `session.error`
 
+## 容量、历史与订阅回收
+
+- 活跃 SSH 会话最多 1024 个；connecting、challenge、connected、attached 和 detached 都占用活跃容量。累计创建/关闭次数不影响新建。
+- 已释放资源的 closed/failed 历史从 `exited_at` 起保留 10 分钟，最多 1024 条；数量压力先裁剪最旧终态。GET 触发过期清理，进程内每分钟也清理一次。裁剪或重启后 GET 返回 `404 NOT_FOUND`，不能据此推断远端执行成功。
+- 关闭结果先提交，连接/附件/output pump 的实际收尾随后完成。仍有 worker 的终态不裁剪；释放中的资源单独限为 1024 个，达到该上限时新建返回 `409 CONFLICT`，避免异常远端导致待释放对象无限累积。关闭调用超时后后台继续持有连接 lease；远端或底层 I/O 长时间阻塞时，该记录可能长期占用待释放额度，直到实际收尾结束。超时不表示引用已经归还。detached 保持活跃，需客户端显式关闭。
+- 每个 session 最多 16 个事件订阅（attach 的内部事件订阅也计入），最多 8 个 CWD follower。超限返回 `409 CONFLICT`；取消可重复调用并释放名额。
+- session 进入终态时关闭事件/CWD 订阅。对保留终态再次订阅 session events，只发送快照后结束。慢消费者可能丢事件，应使用 GET 确认结果。
+- exec 最多 4096 个并发执行/待收尾操作；内部终态历史保留 10 分钟、最多 4096 条。待收尾操作不因历史裁剪丢失诊断结果。
+
 ## 常见错误
 
 - `400 INVALID_JSON`

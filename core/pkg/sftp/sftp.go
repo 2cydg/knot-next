@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"knot-core/internal/resourcepolicy"
 	"knot-core/pkg/config"
 	"knot-core/pkg/session"
 	"knot-core/pkg/sshpool"
@@ -30,8 +31,6 @@ var (
 )
 
 const (
-	maxSessions         = 1024
-	maxTransfers        = 4096
 	challengeTimeout    = 60 * time.Second
 	maxAuthRetryCount   = 3
 	maxSessionSubs      = 16
@@ -52,21 +51,34 @@ type sessionProvider interface {
 }
 
 type Service struct {
-	mu           sync.RWMutex
-	root         string
-	nextID       int64
-	sessions     map[string]*resource
-	transfers    map[string]*transferState
-	subs         map[string]map[chan Event]struct{}
-	transferSubs map[string]map[chan TransferEvent]struct{}
-	config       configProvider
-	session      sessionProvider
-	pool         *sshpool.Pool
-	testMode     bool
-	onEvent      func(Event)
+	policy             resourcepolicy.Policy
+	transferPolicy     resourcepolicy.Policy
+	workers            resourcepolicy.Group
+	callbacks          resourcepolicy.Callbacks
+	stopped            bool
+	releaseErrors      []error
+	lifeCtx            context.Context
+	lifeCancel         context.CancelFunc
+	maintenanceStarted bool
+	mu                 sync.RWMutex
+	root               string
+	nextID             int64
+	sessions           map[string]*resource
+	transfers          map[string]*transferState
+	subs               map[string]map[chan Event]struct{}
+	transferSubs       map[string]map[chan TransferEvent]struct{}
+	config             configProvider
+	session            sessionProvider
+	pool               *sshpool.Pool
+	testMode           bool
+	onEvent            func(Event)
 }
 
 type resource struct {
+	lease       *sshpool.ClientLease
+	backendWork *resourcepolicy.Group
+	workers     int
+	releaseDone chan struct{}
 	Session
 	client           *pkgsftp.Client
 	poolKeys         []string
@@ -105,6 +117,7 @@ type pendingChallenge struct {
 }
 
 type transferState struct {
+	active bool
 	Transfer
 	cancel context.CancelFunc
 }
@@ -116,7 +129,11 @@ type transferWork struct {
 }
 
 func NewService(root string) *Service {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Service{
+		policy:         resourcepolicy.Sessions(),
+		transferPolicy: resourcepolicy.Transfers(),
+		lifeCtx:        ctx, lifeCancel: cancel,
 		root:         root,
 		nextID:       1,
 		sessions:     map[string]*resource{},
@@ -399,10 +416,16 @@ func (s *Service) Create(req CreateRequest) (Session, error) {
 		}
 	}
 
-	now := time.Now().UTC()
-	ctx, cancel := context.WithCancel(context.Background())
+	now := s.policy.Now().UTC()
+	ctx, cancel := context.WithCancel(s.lifeCtx)
 	s.mu.Lock()
-	if len(s.sessions) >= maxSessions {
+	s.pruneSessionsLocked()
+	if s.pendingLocked() >= s.policy.Active {
+		s.mu.Unlock()
+		cancel()
+		return Session{}, fmt.Errorf("%w: session cleanup limit reached", ErrConflict)
+	}
+	if s.stopped || s.activeLocked() >= s.policy.Active {
 		s.mu.Unlock()
 		cancel()
 		return Session{}, fmt.Errorf("%w: sftp session limit reached", ErrConflict)
@@ -431,9 +454,12 @@ func (s *Service) Create(req CreateRequest) (Session, error) {
 		res.State = "open"
 		res.Root = filepath.Join(s.root, "sessions", id)
 	}
+	ctx = resourcepolicy.WithWork(ctx, func() func() { s.mu.Lock(); defer s.mu.Unlock(); return s.beginWorkLocked(res) })
 	s.sessions[id] = res
+	creationDone := s.beginWorkLocked(res)
 	s.publishSessionLocked(res, Event{Type: "sftp.session.created", SessionID: id, State: res.State, Time: now})
 	s.mu.Unlock()
+	defer creationDone()
 
 	if testMode {
 		if err := os.MkdirAll(res.Root, 0o700); err != nil {
@@ -466,7 +492,9 @@ func (s *Service) Create(req CreateRequest) (Session, error) {
 	s.mu.Lock()
 	created := res.snapshot()
 	s.mu.Unlock()
-	go s.connectSession(ctx, id, req, cfgProvider, pool)
+	s.mu.Lock()
+	s.runLocked(res, func() { s.connectSession(ctx, id, req, cfgProvider, pool) })
+	s.mu.Unlock()
 	return created, nil
 }
 
@@ -478,7 +506,7 @@ func (s *Service) cleanupCreateFailure(id string) {
 			res.cancel()
 		}
 		if res.followCancel != nil {
-			res.followCancel()
+			s.cancelFollowLocked(res)
 		}
 		delete(s.sessions, id)
 	}
@@ -500,7 +528,7 @@ func (s *Service) beginFollow(id string, followID string) error {
 	}
 	s.mu.Lock()
 	res, ok := s.sessions[id]
-	if !ok {
+	if !ok || isTerminalSessionState(res.State) {
 		s.mu.Unlock()
 		cancel()
 		return ErrNotFound
@@ -509,8 +537,8 @@ func (s *Service) beginFollow(id string, followID string) error {
 		res.CurrentDir = followed.CurrentDir
 	}
 	res.followCancel = cancel
+	s.runLocked(res, func() { s.followSessionCWD(id, ch) })
 	s.mu.Unlock()
-	go s.followSessionCWD(id, ch)
 	return nil
 }
 
@@ -536,12 +564,12 @@ func (s *Service) connectSession(ctx context.Context, id string, req CreateReque
 		}
 	}
 	s.mu.Unlock()
-	client, poolKeys, finalCfg, err := s.openRemoteClient(ctx, id, req, server, runtimeCfg, pool)
+	client, lease, finalCfg, work, err := s.openRemoteClient(ctx, id, req, server, runtimeCfg, pool)
 	if err != nil {
 		s.failSession(id, err, finalCfg)
 		return
 	}
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	res, ok := s.sessions[id]
 	if !ok || res.State == "closed" || res.State == "disconnected" || res.State == "failed" {
@@ -549,13 +577,19 @@ func (s *Service) connectSession(ctx context.Context, id string, req CreateReque
 		// it: a subsystem close on a stalled remote must not hold the service
 		// lock, which every other request and teardown needs.
 		s.mu.Unlock()
-		_ = boundedSubsystemClose(client.Close)
-		pool.DecRef(poolKeys...)
+		_ = boundedSubsystemClose(func() error {
+			defer lease.Release()
+			err := client.Close()
+			_ = work.Wait(context.Background())
+			return err
+		}, ctx)
 		return
 	}
 	defer s.mu.Unlock()
 	res.client = client
-	res.poolKeys = cloneStrings(poolKeys)
+	res.backendWork = work
+	res.lease = lease
+	res.poolKeys = cloneStrings(lease.Keys)
 	res.cache = newRemoteDirCache(client, remoteDirCacheTTL)
 	res.State = "open"
 	res.UpdatedAt = now
@@ -566,59 +600,63 @@ func (s *Service) connectSession(ctx context.Context, id string, req CreateReque
 		candidate := *res.pendingCredentials
 		res.pendingCredentials = nil
 		if candidate.Remember {
-			go s.saveCredentials(id, res.serverID, candidate)
+			serverID := res.serverID
+			s.runLocked(res, func() { s.saveCredentials(id, serverID, candidate) })
 		}
 	}
 	s.publishSessionLocked(res, Event{Type: "sftp.session.opened", SessionID: id, State: res.State, Time: now})
+	s.runLocked(res, func() { s.watchRemote(res, client, finalCfg) })
 }
 
-func (s *Service) openRemoteClient(ctx context.Context, sessionID string, req CreateRequest, server config.ServerProfile, cfg config.RuntimeConfig, pool *sshpool.Pool) (*pkgsftp.Client, []string, config.RuntimeConfig, error) {
+func (s *Service) openRemoteClient(ctx context.Context, sessionID string, req CreateRequest, server config.ServerProfile, cfg config.RuntimeConfig, pool *sshpool.Pool) (*pkgsftp.Client, *sshpool.ClientLease, config.RuntimeConfig, *resourcepolicy.Group, error) {
 	currentCfg := cfg
 	for attempt := 0; attempt <= maxAuthRetryCount; attempt++ {
 		select {
 		case <-ctx.Done():
-			return nil, nil, currentCfg, ctx.Err()
+			return nil, nil, currentCfg, nil, ctx.Err()
 		default:
 		}
 		confirm := func(attemptCtx context.Context, prompt sshpool.HostKeyPrompt) bool {
 			return s.waitHostKeyResponse(attemptCtx, sessionID, server, prompt)
 		}
-		client, poolKeys, _, err := pool.GetClientContextWithPrompt(ctx, server, currentCfg, confirm, sshpool.DialOptions{
+		lease, err := pool.AcquireClientContextWithPrompt(ctx, server, currentCfg, confirm, sshpool.DialOptions{
 			AgentSocket:   req.AgentSocket,
 			HostKeyPolicy: req.HostKeyPolicy,
 		})
 		if err != nil {
 			if errors.Is(err, sshpool.ErrHostKeyReject) {
-				return nil, nil, currentCfg, err
+				return nil, nil, currentCfg, nil, err
 			}
 			if req.AllowAuthRetry && sshpool.IsAuthError(err) && attempt < maxAuthRetryCount {
 				nextCfg, retryErr := s.waitAuthResponse(ctx, sessionID, server, currentCfg, err, attempt+1)
 				if retryErr != nil {
-					return nil, nil, currentCfg, retryErr
+					return nil, nil, currentCfg, nil, retryErr
 				}
 				currentCfg = nextCfg
 				server = currentCfg.Servers[server.ID]
 				continue
 			}
-			return nil, nil, currentCfg, err
+			return nil, nil, currentCfg, nil, err
 		}
-		pool.IncRef(poolKeys...)
-		sftpClient, err := openSFTPSubsystem(ctx, client)
+		client := lease.Client
+		ownedCtx, work := resourcepolicy.Scope(ctx)
+		sftpClient, err := openSFTPSubsystem(ownedCtx, client)
 		if err != nil {
-			// The attempt is over, so the pool reference it just took is released
-			// here: a cancelled creation must not keep a shared connection alive.
-			pool.DecRef(poolKeys...)
-			return nil, nil, currentCfg, err
+			// Retain the reference until canceled setup and late channel cleanup
+			// have actually settled.
+			resourcepolicy.Go(ctx, func() { _ = work.Wait(context.Background()); lease.Release() })
+			return nil, nil, currentCfg, nil, err
 		}
-		return sftpClient, poolKeys, currentCfg, nil
+		return sftpClient, lease, currentCfg, work, nil
 	}
-	return nil, nil, currentCfg, fmt.Errorf("%w: retry limit reached", ErrConflict)
+	return nil, nil, currentCfg, nil, fmt.Errorf("%w: retry limit reached", ErrConflict)
 }
 
 // sftpTransport retains the SSH session and a locally cancellable reader.
 // Closing stdin alone sends EOF; closing this transport also sends channel close
 // and interrupts local SFTP reads even when the peer never sends EOF back.
 type sftpTransport struct {
+	workCtx context.Context
 	session *ssh.Session
 	stdin   io.WriteCloser
 	reader  *io.PipeReader
@@ -635,14 +673,18 @@ func (p *sftpTransport) Close() error {
 	p.once.Do(func() {
 		_ = p.reader.Close()
 		_ = p.output.Close()
-		p.err = boundedSubsystemClose(p.session.Close)
+		p.err = boundedSubsystemClose(p.session.Close, p.workCtx)
 	})
 	return p.err
 }
 
-func boundedSubsystemClose(close func() error) error {
+func boundedSubsystemClose(close func() error, contexts ...context.Context) error {
+	ctx := context.Background()
+	if len(contexts) > 0 && contexts[0] != nil {
+		ctx = contexts[0]
+	}
 	done := make(chan error, 1)
-	go func() { done <- close() }()
+	resourcepolicy.Go(ctx, func() { done <- close() })
 	timer := time.NewTimer(subsystemGrace)
 	defer timer.Stop()
 	select {
@@ -681,10 +723,10 @@ func openSFTPSubsystem(ctx context.Context, client *ssh.Client) (*pkgsftp.Client
 			_ = owned.Close()
 		}
 	}
-	stop := context.AfterFunc(ctx, abort)
+	stop := resourcepolicy.AfterFunc(ctx, abort)
 	defer stop()
 	done := make(chan opened, 1)
-	go func() {
+	resourcepolicy.Go(ctx, func() {
 		sub, err := client.NewSession()
 		if err != nil {
 			done <- opened{err: err}
@@ -709,7 +751,7 @@ func openSFTPSubsystem(ctx context.Context, client *ssh.Client) (*pkgsftp.Client
 			return
 		}
 		reader, output := io.Pipe()
-		owned := &sftpTransport{session: sub, stdin: stdin, reader: reader, output: output}
+		owned := &sftpTransport{workCtx: ctx, session: sub, stdin: stdin, reader: reader, output: output}
 		mu.Lock()
 		transport = owned
 		stopped := cancelled || ctx.Err() != nil
@@ -719,8 +761,8 @@ func openSFTPSubsystem(ctx context.Context, client *ssh.Client) (*pkgsftp.Client
 			done <- opened{err: ctx.Err()}
 			return
 		}
-		go func() { _, err := io.Copy(output, stdout); _ = output.CloseWithError(err) }()
-		go func() { _, _ = io.Copy(io.Discard, stderr) }()
+		resourcepolicy.Go(ctx, func() { _, err := io.Copy(output, stdout); _ = output.CloseWithError(err) })
+		resourcepolicy.Go(ctx, func() { _, _ = io.Copy(io.Discard, stderr) })
 		if err := sub.RequestSubsystem("sftp"); err != nil {
 			_ = owned.Close()
 			done <- opened{err: err}
@@ -738,7 +780,7 @@ func openSFTPSubsystem(ctx context.Context, client *ssh.Client) (*pkgsftp.Client
 			return
 		}
 		done <- opened{client: c}
-	}()
+	})
 	select {
 	case result := <-done:
 		if err := ctx.Err(); err != nil {
@@ -758,7 +800,7 @@ func openSFTPSubsystem(ctx context.Context, client *ssh.Client) (*pkgsftp.Client
 }
 
 func (s *Service) waitHostKeyResponse(ctx context.Context, sessionID string, server config.ServerProfile, prompt sshpool.HostKeyPrompt) bool {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	challenge := &pendingChallenge{
 		Challenge: Challenge{
 			SessionID:   sessionID,
@@ -823,7 +865,7 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 	if !ok || len(allowedMethods) == 0 {
 		allowedMethods = []string{config.AuthMethodPassword, config.AuthMethodKey, config.AuthMethodAgent}
 	}
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	challenge := &pendingChallenge{
 		Challenge: Challenge{
 			SessionID:      sessionID,
@@ -996,7 +1038,7 @@ func (s *Service) respondChallenge(id string, typ string, resp ChallengeResponse
 			res.State = "connecting"
 		}
 	}
-	res.UpdatedAt = time.Now().UTC()
+	res.UpdatedAt = s.policy.Now().UTC()
 	s.publishSessionLocked(res, Event{Type: "sftp.challenge.resolved", SessionID: id, State: res.State, Challenge: &challenge, Time: res.UpdatedAt})
 	s.mu.Unlock()
 	select {
@@ -1004,12 +1046,12 @@ func (s *Service) respondChallenge(id string, typ string, resp ChallengeResponse
 	default:
 	}
 	challenge.Pending = false
-	challenge.UpdatedAt = time.Now().UTC()
+	challenge.UpdatedAt = s.policy.Now().UTC()
 	return challenge, nil
 }
 
 func (s *Service) failPendingChallenge(sessionID string, typ string, message string) {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	res, ok := s.sessions[sessionID]
@@ -1028,16 +1070,21 @@ func (s *Service) failPendingChallenge(sessionID string, typ string, message str
 		res.authChallenge = nil
 		res.AuthPending = false
 	}
+	if res.cancel != nil {
+		res.cancel()
+	}
 	res.State = "failed"
 	res.DisconnectCause = message
 	res.ClosedAt = &now
 	res.UpdatedAt = now
 	res.pendingCredentials = nil
 	s.publishSessionLocked(res, Event{Type: "sftp.error", SessionID: sessionID, State: res.State, Error: message, Time: now})
+	s.cancelFollowLocked(res)
+	s.closeSubscribersLocked(res.ID)
 }
 
 func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig) {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	res, ok := s.sessions[id]
@@ -1048,8 +1095,11 @@ func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig) {
 		return
 	}
 	if res.followCancel != nil {
-		res.followCancel()
+		s.cancelFollowLocked(res)
 		res.followCancel = nil
+	}
+	if res.cancel != nil {
+		res.cancel()
 	}
 	res.State = "failed"
 	res.DisconnectCause = safeError(err, cfg)
@@ -1061,6 +1111,7 @@ func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig) {
 	res.HostKeyPending = false
 	res.AuthPending = false
 	s.publishSessionLocked(res, Event{Type: "sftp.error", SessionID: id, State: res.State, Error: res.DisconnectCause, Time: now})
+	s.closeSubscribersLocked(id)
 }
 
 // isTerminalSessionState reports whether an SFTP session state is final. The
@@ -1106,7 +1157,7 @@ func (s *Service) saveCredentials(sessionID string, serverID string, resp Challe
 // config-writer error that echoes a credential cannot leak it.
 func (s *Service) publishWarning(sessionID string, kind string, message string, secrets ...string) {
 	safe := sanitizeWarning(message, secrets...)
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	event := Event{
 		Type:      "sftp.warning",
 		SessionID: sessionID,
@@ -1144,8 +1195,10 @@ func sanitizeWarning(message string, secrets ...string) string {
 }
 
 func (s *Service) Get(id string) (Session, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneSessionsLocked()
+	s.pruneTransfersLocked()
 	res, ok := s.sessions[id]
 	if !ok {
 		return Session{}, ErrNotFound
@@ -1154,8 +1207,10 @@ func (s *Service) Get(id string) (Session, error) {
 }
 
 func (s *Service) ListSessions() []Session {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneSessionsLocked()
+	s.pruneTransfersLocked()
 	out := make([]Session, 0, len(s.sessions))
 	for _, res := range s.sessions {
 		out = append(out, res.snapshot())
@@ -1178,12 +1233,12 @@ func (s *Service) Close(id string) (Session, error) {
 		s.mu.Unlock()
 		return snapshot, nil
 	}
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	client, poolKeys := s.closeSessionLocked(res, "closed", "client requested close", now)
 	snapshot := res.snapshot()
 	s.mu.Unlock()
 
-	err := s.releaseDetached(client, poolKeys)
+	err := s.releaseDetached(res, client, poolKeys)
 	return snapshot, err
 }
 
@@ -1191,16 +1246,18 @@ func (s *Service) CloseByPoolKey(poolKey string) []Session {
 	if poolKey == "" {
 		return nil
 	}
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	closed := make([]Session, 0)
 	detached := make([]*pkgsftp.Client, 0)
 	detachedKeys := make([][]string, 0)
+	owners := make([]*resource, 0)
 	for _, res := range s.sessions {
 		if (res.State == "closed" || res.State == "failed" || res.State == "disconnected") || !containsString(res.poolKeys, poolKey) {
 			continue
 		}
 		client, poolKeys := s.closeSessionLocked(res, "disconnected", "ssh pool disconnected", now)
+		owners = append(owners, res)
 		detached = append(detached, client)
 		detachedKeys = append(detachedKeys, poolKeys)
 		closed = append(closed, res.snapshot())
@@ -1210,7 +1267,7 @@ func (s *Service) CloseByPoolKey(poolKey string) []Session {
 	// The remote subsystems are released after the lock is dropped, so one
 	// stalled close cannot hold the service lock against every other session.
 	for i, client := range detached {
-		s.releaseDetached(client, detachedKeys[i])
+		s.releaseDetached(owners[i], client, detachedKeys[i])
 	}
 	return closed
 }
@@ -1230,7 +1287,7 @@ func (s *Service) closeSessionLocked(res *resource, state string, cause string, 
 		res.cancel()
 	}
 	if res.followCancel != nil {
-		res.followCancel()
+		s.cancelFollowLocked(res)
 		res.followCancel = nil
 	}
 	// Signal transfer cancellation before closing the transport: pending I/O may
@@ -1238,8 +1295,14 @@ func (s *Service) closeSessionLocked(res *resource, state string, cause string, 
 	s.cancelSessionTransfersLocked(res.ID)
 	client := res.client
 	res.client = nil
+	res.cache = nil
 	poolKeys := res.poolKeys
 	res.poolKeys = nil
+	if client != nil || len(poolKeys) > 0 {
+		res.releaseDone = make(chan struct{})
+		done := res.releaseDone
+		s.runLocked(res, func() { <-done })
+	}
 	res.State = state
 	res.DisconnectCause = cause
 	res.UpdatedAt = now
@@ -1269,17 +1332,27 @@ func (s *Service) closeSessionLocked(res *resource, state string, cause string, 
 }
 
 // releaseDetached closes a session's remote subsystem and returns its pool
-// references. It runs outside the service lock: both steps touch the network,
-// and Close must stay responsive when the remote has stopped answering.
-func (s *Service) releaseDetached(client *pkgsftp.Client, poolKeys []string) error {
-	var err error
-	if client != nil {
-		err = boundedSubsystemClose(client.Close)
+// references. It runs outside the service lock. The caller has a bounded wait;
+// the background owner deliberately retains its lease until actual work ends,
+// even if a wedged peer keeps that wait alive beyond teardownGrace.
+func (s *Service) releaseDetached(res *resource, client *pkgsftp.Client, poolKeys []string) error {
+	if client == nil && len(poolKeys) == 0 {
+		return nil
 	}
-	if len(poolKeys) > 0 && s.pool != nil {
-		s.pool.DecRef(poolKeys...)
-	}
-	return err
+	return boundedSubsystemClose(func() error {
+		defer close(res.releaseDone)
+		var err error
+		if client != nil {
+			err = client.Close()
+		}
+		if res.backendWork != nil {
+			_ = res.backendWork.Wait(context.Background())
+		}
+		if res.lease != nil {
+			res.lease.Release()
+		}
+		return err
+	})
 }
 
 func (s *Service) cancelSessionTransfersLocked(sessionID string) {
@@ -1296,11 +1369,20 @@ func (s *Service) cancelSessionTransfersLocked(sessionID string) {
 func (s *Service) Subscribe(id string) (<-chan Event, func(), Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneSessionsLocked()
+	s.pruneTransfersLocked()
 	res, ok := s.sessions[id]
 	if !ok {
 		return nil, nil, Session{}, ErrNotFound
 	}
+	if len(s.subs[id]) >= maxSessionSubs {
+		return nil, nil, Session{}, fmt.Errorf("%w: subscriber limit reached", ErrConflict)
+	}
 	ch := make(chan Event, maxSessionSubs)
+	if isTerminalSessionState(res.State) {
+		close(ch)
+		return ch, func() {}, res.snapshot(), nil
+	}
 	if s.subs[id] == nil {
 		s.subs[id] = map[chan Event]struct{}{}
 	}
@@ -1312,6 +1394,9 @@ func (s *Service) Subscribe(id string) (<-chan Event, func(), Session, error) {
 			if _, ok := subs[ch]; ok {
 				delete(subs, ch)
 				close(ch)
+				if len(subs) == 0 {
+					delete(s.subs, id)
+				}
 			}
 		}
 	}
@@ -1326,6 +1411,8 @@ func (s *Service) SubscribeTransfers(sessionID string) (<-chan TransferEvent, fu
 func (s *Service) SubscribeTransfersWithSnapshot(sessionID string) (<-chan TransferEvent, func(), []Transfer, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneSessionsLocked()
+	s.pruneTransfersLocked()
 	res, ok := s.sessions[sessionID]
 	if !ok {
 		return nil, nil, nil, ErrNotFound
@@ -1335,6 +1422,9 @@ func (s *Service) SubscribeTransfersWithSnapshot(sessionID string) (<-chan Trans
 	}
 
 	// Register subscriber
+	if len(s.transferSubs[sessionID]) >= maxTransferSubs {
+		return nil, nil, nil, fmt.Errorf("%w: transfer subscriber limit reached", ErrConflict)
+	}
 	ch := make(chan TransferEvent, maxTransferSubs)
 	if s.transferSubs[sessionID] == nil {
 		s.transferSubs[sessionID] = map[chan TransferEvent]struct{}{}
@@ -1360,6 +1450,9 @@ func (s *Service) SubscribeTransfersWithSnapshot(sessionID string) (<-chan Trans
 			if _, ok := subs[ch]; ok {
 				delete(subs, ch)
 				close(ch)
+				if len(subs) == 0 {
+					delete(s.transferSubs, sessionID)
+				}
 			}
 		}
 	}
@@ -1658,11 +1751,19 @@ func (s *Service) startTransfer(sessionID string, direction string, source strin
 		s.mu.Unlock()
 		return Transfer{}, fmt.Errorf("%w: sftp session is not open", ErrConflict)
 	}
-	if len(s.transfers) >= maxTransfers {
-		s.pruneTransfersLocked()
+	s.pruneTransfersLocked()
+	active := 0
+	for _, tr := range s.transfers {
+		if tr.active {
+			active++
+		}
 	}
-	now := time.Now().UTC()
-	ctx, cancel := context.WithCancel(context.Background())
+	if s.stopped || active >= s.transferPolicy.Active {
+		s.mu.Unlock()
+		return Transfer{}, fmt.Errorf("%w: transfer limit reached", ErrConflict)
+	}
+	now := s.policy.Now().UTC()
+	ctx, cancel := context.WithCancel(s.lifeCtx)
 	transfer := &transferState{
 		Transfer: Transfer{
 			ID:        "transfer_" + strconv.FormatInt(s.nextID, 10),
@@ -1675,6 +1776,7 @@ func (s *Service) startTransfer(sessionID string, direction string, source strin
 			StartedAt: now,
 		},
 		cancel: cancel,
+		active: true,
 	}
 	s.nextID++
 	s.transfers[transfer.ID] = transfer
@@ -1682,13 +1784,21 @@ func (s *Service) startTransfer(sessionID string, direction string, source strin
 
 	// Take snapshot before releasing lock and starting worker
 	snapshot := transfer.snapshot()
+	s.runLocked(res, func() { s.executeTransfer(ctx, transfer.ID, worker) })
 	s.mu.Unlock()
-
-	go s.executeTransfer(ctx, transfer.ID, worker)
 	return snapshot, nil
 }
 
 func (s *Service) executeTransfer(ctx context.Context, transferID string, worker func(context.Context, *backendView, *transferWork) (string, error)) {
+	defer func() {
+		s.mu.Lock()
+		if tr := s.transfers[transferID]; tr != nil {
+			tr.active = false
+			tr.cancel()
+			s.pruneTransfersLocked()
+		}
+		s.mu.Unlock()
+	}()
 	res, work, ok := s.markTransferRunning(ctx, transferID)
 	if !ok {
 		return
@@ -1711,7 +1821,7 @@ func (s *Service) executeTransfer(ctx context.Context, transferID string, worker
 }
 
 func (s *Service) markTransferRunning(ctx context.Context, transferID string) (*backendView, *transferWork, bool) {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	transfer, ok := s.transfers[transferID]
@@ -1742,7 +1852,7 @@ func (s *Service) markTransferRunning(ctx context.Context, transferID string) (*
 }
 
 func (s *Service) finishTransfer(id string, state string, message string) {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	transfer, ok := s.transfers[id]
@@ -1788,7 +1898,7 @@ func (s *Service) applyWorkerProgressLocked(dst *transferState, src Transfer) {
 // publishWorkerProgress publishes progress from worker's private copy to shared state.
 // Called by the same worker that owns the transferWork.
 func (s *Service) publishWorkerProgress(work *transferWork) {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current, ok := s.transfers[work.ID]
@@ -1802,7 +1912,7 @@ func (s *Service) publishWorkerProgress(work *transferWork) {
 // finishTransferFromWorker submits final progress and terminal state in one atomic operation.
 // This ensures GET, snapshot, and events see consistent final values.
 func (s *Service) finishTransferFromWorker(id string, work *transferWork, state string, message string) {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	transfer, ok := s.transfers[id]
@@ -1820,8 +1930,10 @@ func (s *Service) finishTransferFromWorker(id string, work *transferWork, state 
 }
 
 func (s *Service) ListTransfers(sessionID string) ([]Transfer, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneSessionsLocked()
+	s.pruneTransfersLocked()
 	if _, ok := s.sessions[sessionID]; !ok {
 		return nil, ErrNotFound
 	}
@@ -1838,8 +1950,10 @@ func (s *Service) ListTransfers(sessionID string) ([]Transfer, error) {
 }
 
 func (s *Service) Transfer(sessionID string, transferID string) (Transfer, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneSessionsLocked()
+	s.pruneTransfersLocked()
 	transfer, ok := s.transfers[transferID]
 	if !ok || transfer.SessionID != sessionID {
 		return Transfer{}, ErrNotFound
@@ -2392,7 +2506,7 @@ func (s *Service) copyWithProgress(ctx context.Context, work *transferWork, curr
 				if mode != 0 {
 					_ = os.Chmod(currentPath, mode.Perm())
 				}
-				now := time.Now().UTC()
+				now := s.policy.Now().UTC()
 				if last.IsZero() || now.Sub(last) >= progressEmitEvery || work.BytesCopied >= total {
 					last = now
 					s.publishWorkerProgress(work)
@@ -2680,10 +2794,17 @@ func (s *Service) dependencies() (configProvider, sessionProvider, *sshpool.Pool
 }
 
 func (s *Service) followSessionCWD(id string, ch <-chan session.CWDNotify) {
+	defer func() {
+		s.mu.Lock()
+		if res := s.sessions[id]; res != nil {
+			s.cancelFollowLocked(res)
+		}
+		s.mu.Unlock()
+	}()
 	for notify := range ch {
 		now := notify.Time
 		if now.IsZero() {
-			now = time.Now().UTC()
+			now = s.policy.Now().UTC()
 		}
 		s.mu.Lock()
 		res, ok := s.sessions[id]
@@ -2692,6 +2813,7 @@ func (s *Service) followSessionCWD(id string, ch <-chan session.CWDNotify) {
 			return
 		}
 		if notify.Closed {
+			s.cancelFollowLocked(res)
 			res.followCancel = nil
 			s.mu.Unlock()
 			return
@@ -2713,7 +2835,7 @@ func (s *Service) followSessionCWD(id string, ch <-chan session.CWDNotify) {
 
 func (s *Service) publishSessionLocked(res *resource, event Event) {
 	if event.Time.IsZero() {
-		event.Time = time.Now().UTC()
+		event.Time = s.policy.Now().UTC()
 	}
 	for ch := range s.subs[res.ID] {
 		select {
@@ -2722,7 +2844,9 @@ func (s *Service) publishSessionLocked(res *resource, event Event) {
 		}
 	}
 	if s.onEvent != nil {
-		s.onEvent(cloneEvent(event))
+		callback := s.onEvent
+		copy := cloneEvent(event)
+		s.callbacks.Send(func() { callback(copy) })
 	}
 }
 
@@ -2748,7 +2872,8 @@ func (s *Service) publishTransferLocked(transfer *transferState, typ string, now
 		}
 	}
 	if s.onEvent != nil {
-		s.onEvent(Event{
+		callback := s.onEvent
+		event := Event{
 			Type:        typ,
 			SessionID:   transfer.SessionID,
 			State:       transfer.State,
@@ -2761,7 +2886,8 @@ func (s *Service) publishTransferLocked(transfer *transferState, typ string, now
 			CurrentPath: transfer.CurrentPath,
 			Error:       transfer.Error,
 			Time:        now,
-		})
+		}
+		s.callbacks.Send(func() { callback(event) })
 	}
 }
 
@@ -3076,26 +3202,14 @@ func paginateEntries(entries []Entry, offset int, limit int) []Entry {
 }
 
 func (s *Service) pruneTransfersLocked() {
-	if len(s.transfers) < maxTransfers {
-		return
-	}
-	type item struct {
-		id string
-		t  time.Time
-	}
-	items := make([]item, 0, len(s.transfers))
-	for id, transfer := range s.transfers {
-		if transfer.State == "running" || transfer.State == "queued" {
-			continue
+	var items []resourcepolicy.Item
+	for id, tr := range s.transfers {
+		if isTerminalState(tr.State) && !tr.active {
+			items = append(items, resourcepolicy.Item{ID: id, End: tr.CompletedAt})
 		}
-		items = append(items, item{id: id, t: transfer.CompletedAt})
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].t.Before(items[j].t)
-	})
-	limit := len(items) - maxTransfers/2
-	for i := 0; i <= limit && i < len(items); i++ {
-		delete(s.transfers, items[i].id)
+	for _, id := range s.transferPolicy.Expired(items) {
+		delete(s.transfers, id)
 	}
 }
 

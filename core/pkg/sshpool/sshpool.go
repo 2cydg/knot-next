@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"knot-core/internal/resourcepolicy"
 	"knot-core/pkg/config"
 
 	"golang.org/x/crypto/ssh"
@@ -90,6 +91,8 @@ type DialOptions struct {
 }
 
 type Pool struct {
+	workers            resourcepolicy.Group
+	callbacks          resourcepolicy.Callbacks
 	mu                 sync.Mutex
 	entries            map[string]*entry
 	inflight           map[string]*inflightRoute
@@ -99,10 +102,6 @@ type Pool struct {
 	DisconnectCallback func(string)
 	ctx                context.Context
 	cancel             context.CancelFunc
-	// interacting counts the attempts that carry their own host key prompt. They
-	// are not shared through inflight, so CloseAll has to be able to reach them
-	// by cancelling the pool context and wait for them to unwind.
-	interacting sync.WaitGroup
 }
 
 // attemptGrace bounds how long CloseAll waits for interactive creations to
@@ -128,6 +127,7 @@ type entry struct {
 // disturbing the others, and so the last waiter to leave stops a creation that
 // nobody is waiting for any more.
 type inflightRoute struct {
+	key     string // Actual publication key; it can differ after an identity rotation.
 	done    chan struct{}
 	client  *ssh.Client
 	err     error
@@ -162,18 +162,21 @@ func NewPool() *Pool {
 		ctx:         ctx,
 		cancel:      cancel,
 	}
-	go p.cleanupLoop()
+	p.workers.Add()
+	go func() { defer p.workers.Done(); p.cleanupLoop() }()
 	return p
 }
 
 // GetClient returns a pooled client for server without a caller context. It is
 // kept for callers that have no cancellation to propagate; new code should use
-// GetClientContext so a cancelled attempt ends its dial and handshake.
+// AcquireClientContext so the returned route is already held and a cancelled
+// attempt ends its dial and handshake.
 func (p *Pool) GetClient(server config.ServerProfile, cfg config.RuntimeConfig, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, []string, bool, error) {
 	return p.GetClientContext(context.Background(), server, cfg, confirm, opts)
 }
 
-// GetClientContext returns a pooled client for server, creating one if needed.
+// GetClientContext returns an unowned pooled client for legacy callers. Core
+// resources must use AcquireClientContext for atomic reference ownership.
 //
 // ctx bounds this caller's wait and its own creation attempt: a cancelled caller
 // stops waiting, and stops a creation nobody else is waiting for. It never
@@ -181,6 +184,49 @@ func (p *Pool) GetClient(server config.ServerProfile, cfg config.RuntimeConfig, 
 // marks an interactive creation whose host key prompt belongs to this caller
 // alone, so it is never merged with another session's in-flight attempt.
 func (p *Pool) GetClientContext(ctx context.Context, server config.ServerProfile, cfg config.RuntimeConfig, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, []string, bool, error) {
+	lease, err := p.getClientContext(ctx, server, cfg, confirm, opts, false)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return lease.Client, lease.Keys, lease.Created, nil
+}
+
+// ClientLease owns one reference to every route entry. Release is idempotent and
+// tied to the original entries, so Clear/recreation cannot release a new owner.
+// Keep the lease until all channel and cleanup work has actually ended.
+type ClientLease struct {
+	Client   *ssh.Client
+	Keys     []string
+	Created  bool
+	releases []func()
+	entries  []*entry
+	once     sync.Once
+}
+
+func (l *ClientLease) Release() {
+	l.once.Do(func() {
+		for i := len(l.releases) - 1; i >= 0; i-- {
+			l.releases[i]()
+		}
+	})
+}
+
+// AcquireClientContext returns a client with its complete route already held.
+// Unlike the legacy GetClientContext + IncRef sequence, identity replacement
+// cannot intervene between returning the client and taking its references.
+func (p *Pool) AcquireClientContext(ctx context.Context, server config.ServerProfile, cfg config.RuntimeConfig, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ClientLease, error) {
+	return p.getClientContext(ctx, server, cfg, confirm, opts, true)
+}
+
+func (p *Pool) AcquireClientContextWithPrompt(ctx context.Context, server config.ServerProfile, cfg config.RuntimeConfig, prompt func(context.Context, HostKeyPrompt) bool, opts DialOptions) (*ClientLease, error) {
+	if prompt == nil {
+		return p.AcquireClientContext(ctx, server, cfg, nil, opts)
+	}
+	opts.prompt = prompt
+	return p.AcquireClientContext(ctx, server, cfg, nil, opts)
+}
+
+func (p *Pool) getClientContext(ctx context.Context, server config.ServerProfile, cfg config.RuntimeConfig, confirm func(HostKeyPrompt) bool, opts DialOptions, retain bool) (*ClientLease, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -191,27 +237,88 @@ func (p *Pool) GetClientContext(ctx context.Context, server config.ServerProfile
 	}
 	routes, err := routeChain(server, cfg)
 	if err != nil {
-		return nil, nil, false, err
+		return nil, err
 	}
 	if opts.HostKeyPolicy != "" {
 		for i := range routes {
 			routes[i].key += "|host-key-policy=" + opts.HostKeyPolicy
 		}
 	}
-	var jump *ssh.Client
-	keys := make([]string, 0, len(routes))
-	created := false
+	lease := &ClientLease{Keys: make([]string, 0, len(routes))}
 	for _, route := range routes {
-		client, key, wasCreated, err := p.getRouteClient(ctx, route, cfg, jump, confirm, opts)
-		if err != nil {
-			return nil, nil, false, err
+		for {
+			if err := ctx.Err(); err != nil {
+				lease.Release()
+				return nil, err
+			}
+			client, key, created, err := p.getRouteClient(ctx, route, cfg, lease.Client, confirm, opts, lease.entries)
+			if err != nil {
+				lease.Release()
+				return nil, err
+			}
+			if retain {
+				ent, release, held := p.retainClient(key, client)
+				if !held {
+					// Idle replacement or Clear won before acquisition. Retry rather
+					// than returning the old client or incrementing its replacement.
+					continue
+				}
+				lease.entries = append(lease.entries, ent)
+				lease.releases = append(lease.releases, release)
+			}
+			lease.Client = client
+			lease.Keys = append(lease.Keys, key)
+			lease.Created = lease.Created || created
+			break
 		}
-		jump = client
-		keys = append(keys, key)
-		created = created || wasCreated
 	}
-	p.setChainKeys(keys...)
-	return jump, keys, created, nil
+	p.setChainKeys(lease.Keys...)
+	return lease, nil
+}
+
+// retainClient validates the exact client and increments its entry in the same
+// critical section. The release captures that entry, never a reusable key.
+func (p *Pool) retainClient(key string, client *ssh.Client) (*entry, func(), bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ent := p.entries[key]
+	if p.closed || ent == nil || ent.client != client {
+		return nil, nil, false
+	}
+	ent.refCount++
+	ent.lastAccess = time.Now()
+	var once sync.Once
+	return ent, func() {
+		once.Do(func() {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			ent.refCount--
+			ent.lastAccess = time.Now()
+		})
+	}, true
+}
+
+// retainPrefixLocked gives shared dial work its own references. A canceled
+// waiter can release its lease while the pool-owned dial is still unwinding.
+func (p *Pool) retainPrefixLocked(prefix []*entry) func() {
+	if len(prefix) == 0 {
+		return nil
+	}
+	entries := append([]*entry(nil), prefix...)
+	for _, ent := range entries {
+		ent.refCount++
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+			for _, ent := range entries {
+				ent.refCount--
+				ent.lastAccess = time.Now()
+			}
+		})
+	}
 }
 
 // GetClientContextWithPrompt gives interactive callbacks the effective attempt
@@ -222,7 +329,7 @@ func (p *Pool) GetClientContextWithPrompt(ctx context.Context, server config.Ser
 		return p.GetClientContext(ctx, server, cfg, nil, opts)
 	}
 	opts.prompt = prompt
-	return p.GetClientContext(ctx, server, cfg, func(HostKeyPrompt) bool { return false }, opts)
+	return p.GetClientContext(ctx, server, cfg, nil, opts)
 }
 
 func (p *Pool) SetIdleTimeout(d time.Duration) {
@@ -233,6 +340,8 @@ func (p *Pool) SetIdleTimeout(d time.Duration) {
 	}
 }
 
+// IncRef is legacy key-based bookkeeping. It cannot atomically validate the
+// client returned earlier by GetClient; core owners must use ClientLease instead.
 func (p *Pool) IncRef(keys ...string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -307,7 +416,8 @@ func (p *Pool) Clear() int {
 	return count
 }
 
-func (p *Pool) CloseAll() int {
+// stop detaches entries once and schedules transport close outside the pool lock.
+func (p *Pool) stop() int {
 	p.cancel()
 	p.mu.Lock()
 	if p.closed {
@@ -315,33 +425,34 @@ func (p *Pool) CloseAll() int {
 		return 0
 	}
 	p.closed = true
+	// Observers are advisory and may reenter Shutdown. Drop queued notifications
+	// without waiting for the current observer; transport workers own cleanup.
+	p.callbacks.Close()
 	entries := p.entries
 	p.entries = map[string]*entry{}
+	p.workers.Add()
 	p.mu.Unlock()
-	p.closeEntries(entries, true)
-	// Cancelling the pool context ends interactive creations that were still
-	// dialling. They are waited for so a closed pool cannot later publish a
-	// client into an entry that no longer exists.
-	p.waitInteractive(attemptGrace)
+	// Shutdown suppresses advisory disconnects; Clear and idle cleanup still
+	// request notifications while their dispatcher is open.
+	go func() { defer p.workers.Done(); p.closeEntries(entries, false) }()
 	return len(entries)
 }
+func (p *Pool) CloseAll() int {
+	count := p.stop()
+	p.waitInteractive(attemptGrace)
+	return count
+}
 
-// waitInteractive waits at most grace for the in-flight interactive creations
-// to unwind. Past the grace the caller is released anyway: the creations have
-// already been cancelled and their result is discarded on the way out, so
-// teardown cannot be pinned by a dial that ignores its context.
+// Shutdown reports an incomplete release instead of silently treating a grace
+// timeout as success. All dial, cleanup and keepalive workers are owned here.
+func (p *Pool) Shutdown(ctx context.Context) error {
+	p.stop()
+	return p.workers.Wait(ctx)
+}
 func (p *Pool) waitInteractive(grace time.Duration) {
-	done := make(chan struct{})
-	go func() {
-		p.interacting.Wait()
-		close(done)
-	}()
-	timer := time.NewTimer(grace)
-	defer timer.Stop()
-	select {
-	case <-done:
-	case <-timer.C:
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	_ = p.workers.Wait(ctx)
 }
 
 func (p *Pool) statsLocked(now time.Time) []EntryStat {
@@ -400,6 +511,7 @@ func (p *Pool) keepAliveLoop(key string, client *ssh.Client, cfg config.RuntimeC
 		_ = client.Wait()
 		close(done)
 	}()
+	defer func() { <-done }()
 	if interval <= 0 {
 		select {
 		case <-done:
@@ -475,20 +587,16 @@ func (p *Pool) notifyConnect(key string, client *ssh.Client) {
 	if p.ConnectCallback == nil {
 		return
 	}
-	go func() {
-		defer recoverCallbackPanic("ssh pool connect callback")
-		p.ConnectCallback(key, client)
-	}()
+	callback := p.ConnectCallback
+	p.callbacks.Send(func() { callback(key, client) })
 }
 
 func (p *Pool) notifyDisconnect(key string) {
 	if p.DisconnectCallback == nil {
 		return
 	}
-	go func() {
-		defer recoverCallbackPanic("ssh pool disconnect callback")
-		p.DisconnectCallback(key)
-	}()
+	callback := p.DisconnectCallback
+	p.callbacks.Send(func() { callback(key) })
 }
 
 func (p *Pool) IsAlive(key string, client *ssh.Client) bool {
@@ -498,18 +606,12 @@ func (p *Pool) IsAlive(key string, client *ssh.Client) bool {
 	return ok && ent.client == client
 }
 
-func recoverCallbackPanic(name string) {
-	if r := recover(); r != nil {
-		slog.Error(name+" panic", "recover", r)
-	}
-}
-
 // getRouteClient returns a usable client for one step of the route chain
 // together with the pool key it is registered under. The key can differ from
 // route.key when the stored identity no longer matches the credentials of this
 // attempt, so callers must use the returned key for any later reference
 // bookkeeping.
-func (p *Pool) getRouteClient(ctx context.Context, route routeStep, cfg config.RuntimeConfig, jump *ssh.Client, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, string, bool, error) {
+func (p *Pool) getRouteClient(ctx context.Context, route routeStep, cfg config.RuntimeConfig, jump *ssh.Client, confirm func(HostKeyPrompt) bool, opts DialOptions, prefix []*entry) (*ssh.Client, string, bool, error) {
 	identityProfile := route.server
 	if route.via != nil {
 		identityProfile.JumpHostIDs = route.via
@@ -518,7 +620,7 @@ func (p *Pool) getRouteClient(ctx context.Context, route routeStep, cfg config.R
 
 	// An interactive attempt owns its own creation: its host key prompt belongs
 	// to this caller, so it must never be merged with another session's attempt.
-	if confirm != nil {
+	if confirm != nil || opts.prompt != nil {
 		key, _, err := p.resolveKey(route.key, identity)
 		if err != nil {
 			return nil, route.key, false, err
@@ -540,9 +642,9 @@ func (p *Pool) getRouteClient(ctx context.Context, route routeStep, cfg config.R
 			p.mu.Unlock()
 			return nil, key, false, errors.New("ssh pool is closed")
 		}
-		p.interacting.Add(1)
+		p.workers.Add()
 		p.mu.Unlock()
-		defer p.interacting.Done()
+		defer p.workers.Done()
 
 		effectiveConfirm := func(prompt HostKeyPrompt) bool {
 			if opts.prompt != nil {
@@ -600,8 +702,10 @@ func (p *Pool) getRouteClient(ctx context.Context, route routeStep, cfg config.R
 				cancel:   cancel,
 			}
 			p.inflight[key] = inflight
+			p.workers.Add()
+			releasePrefix := p.retainPrefixLocked(prefix)
 			p.mu.Unlock()
-			go p.runCreation(createCtx, key, route, identity, cfg, jump, opts, inflight)
+			go p.runCreation(createCtx, key, route, identity, cfg, jump, opts, inflight, releasePrefix)
 		} else {
 			inflight.waiters++
 			p.mu.Unlock()
@@ -611,7 +715,7 @@ func (p *Pool) getRouteClient(ctx context.Context, route routeStep, cfg config.R
 		if err != nil {
 			return nil, key, false, err
 		}
-		return client, key, created, nil
+		return client, inflight.key, created, nil
 	}
 }
 
@@ -619,7 +723,11 @@ func (p *Pool) getRouteClient(ctx context.Context, route routeStep, cfg config.R
 // the in-flight entry. It runs under a context derived from the pool, never from
 // a single caller, so a caller that gives up cannot fail the others still
 // waiting on this connection.
-func (p *Pool) runCreation(ctx context.Context, key string, route routeStep, identity []byte, cfg config.RuntimeConfig, jump *ssh.Client, opts DialOptions, inflight *inflightRoute) {
+func (p *Pool) runCreation(ctx context.Context, key string, route routeStep, identity []byte, cfg config.RuntimeConfig, jump *ssh.Client, opts DialOptions, inflight *inflightRoute, releasePrefix func()) {
+	defer p.workers.Done()
+	if releasePrefix != nil {
+		defer releasePrefix()
+	}
 	client, err := dialClient(ctx, route.server, cfg, jump, nil, opts)
 	if err == nil && ctx.Err() != nil {
 		// The creation outlived its purpose; do not publish a client nobody is
@@ -628,16 +736,24 @@ func (p *Pool) runCreation(ctx context.Context, key string, route routeStep, ide
 		err = ctx.Err()
 	}
 	created := false
+	publishedKey := key
 	if err == nil {
 		var published *ssh.Client
-		if _, published, created, err = p.publish(key, route, identity, client, cfg); err != nil {
+		if publishedKey, published, created, err = p.publish(key, route, identity, client, cfg); err != nil {
 			_ = client.Close()
 		} else {
 			client = published
 		}
 	}
 
+	// The actual dial/setup has ended. Return the worker's prefix references
+	// before publishing completion to callers, including canceled ones. The
+	// deferred, idempotent release also covers future early returns.
+	if releasePrefix != nil {
+		releasePrefix()
+	}
 	p.mu.Lock()
+	inflight.key = publishedKey
 	inflight.client = client
 	inflight.err = err
 	inflight.created = created
@@ -790,13 +906,15 @@ func (p *Pool) publish(base string, route routeStep, identity []byte, client *ss
 		chainKeys:  []string{key},
 		identity:   identity,
 	}
+	p.workers.Add()
 	p.mu.Unlock()
 
 	if stale != nil && stale != client {
 		_ = stale.Close()
-		p.notifyDisconnect(key)
+		// The replaced entry was idle. Its key now belongs to the new client;
+		// a delayed disconnect callback would close that client's new owners.
 	}
-	go p.keepAliveLoop(key, client, cfg)
+	go func() { defer p.workers.Done(); p.keepAliveLoop(key, client, cfg) }()
 	p.notifyConnect(key, client)
 	return key, client, true, nil
 }

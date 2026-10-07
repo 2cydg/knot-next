@@ -157,7 +157,7 @@ func (s *Service) VersionInfo() VersionInfo {
 	}
 }
 
-func (s *Service) SubscribeEvents() (<-chan Event, func()) {
+func (s *Service) SubscribeEvents() (<-chan Event, func(), error) {
 	return s.events.Subscribe()
 }
 
@@ -217,6 +217,8 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		mu       sync.Mutex
 		releases []error
 	)
+	// These classes share one budget. A deadline error can also be returned by
+	// an already drained class; it is not evidence that this class still owns work.
 	release := func(name string, fn func(ctx context.Context) error) {
 		wg.Add(1)
 		go func() {
@@ -242,39 +244,13 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	}
 
 	if sessionService != nil {
-		sessionService.CancelExec()
-		release("exec", sessionService.ShutdownExec)
-		release("session", func(ctx context.Context) error {
-			var errs []error
-			for _, res := range sessionService.List() {
-				if ctx.Err() != nil {
-					return errors.Join(append(errs, ctx.Err())...)
-				}
-				if res.State != "closed" {
-					_, err := sessionService.Disconnect(res.ID)
-					errs = append(errs, err)
-				}
-			}
-			return errors.Join(errs...)
-		})
+		release("session", sessionService.Shutdown)
 	}
 	if sftpService != nil {
-		release("sftp", func(ctx context.Context) error {
-			var errs []error
-			for _, res := range sftpService.ListSessions() {
-				if ctx.Err() != nil {
-					return errors.Join(append(errs, ctx.Err())...)
-				}
-				if res.State != "closed" {
-					_, err := sftpService.Close(res.ID)
-					errs = append(errs, err)
-				}
-			}
-			return errors.Join(errs...)
-		})
+		release("sftp", sftpService.Shutdown)
 	}
 	if pool != nil {
-		release("ssh pool", func(context.Context) error { pool.CloseAll(); return nil })
+		release("ssh pool", pool.Shutdown)
 	}
 	// The wait is bounded by the same budget. A release step that never returns —
 	// a subsystem close parked on a remote that stopped answering — must not keep
@@ -299,6 +275,8 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	mu.Lock()
 	report := append([]error(nil), releases...)
 	mu.Unlock()
+
+	s.events.Close()
 
 	// A cancelled budget means teardown ran out of time part-way or skipped a
 	// class entirely; the caller must be able to observe that rather than read it

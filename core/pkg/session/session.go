@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"knot-core/internal/resourcepolicy"
 	"knot-core/pkg/config"
 	"knot-core/pkg/sshpool"
 
@@ -28,8 +29,6 @@ var (
 )
 
 const (
-	maxSessions            = 1024
-	maxExecs               = 4096
 	challengeTimeout       = 60 * time.Second
 	maxAuthRetryCount      = 3
 	maxSessionSubscribers  = 16
@@ -48,23 +47,32 @@ type configWriter interface {
 }
 
 type Service struct {
-	mu         sync.RWMutex
-	nextID     int64
-	sessions   map[string]*resource
-	execs      map[string]Exec
-	execCtx    context.Context
-	execCancel context.CancelCauseFunc
-	execActive map[string]*execOperation
-	config     configWriter
-	pool       *sshpool.Pool
-	dial       DialOptions
-	testMode   bool
-	onEvent    func(Event)
+	execPolicy         resourcepolicy.Policy
+	policy             resourcepolicy.Policy
+	workers            resourcepolicy.Group
+	callbacks          resourcepolicy.Callbacks
+	stopped            bool
+	releaseErrors      []error
+	maintenanceStarted bool
+	mu                 sync.RWMutex
+	nextID             int64
+	sessions           map[string]*resource
+	execs              map[string]Exec
+	execCtx            context.Context
+	execCancel         context.CancelCauseFunc
+	execActive         map[string]*execOperation
+	config             configWriter
+	pool               *sshpool.Pool
+	dial               DialOptions
+	testMode           bool
+	onEvent            func(Event)
 }
 
 func NewService() *Service {
 	execCtx, execCancel := context.WithCancelCause(context.Background())
 	return &Service{
+		execPolicy: resourcepolicy.Execs(),
+		policy:     resourcepolicy.Sessions(),
 		nextID:     1,
 		sessions:   map[string]*resource{},
 		execs:      map[string]Exec{},
@@ -159,6 +167,7 @@ type pendingChallenge struct {
 }
 
 type resource struct {
+	workers int
 	Resource
 	serverID         string
 	hostKeyChallenge *pendingChallenge
@@ -189,12 +198,14 @@ type resource struct {
 }
 
 type interactiveBackend struct {
+	lease      *sshpool.ClientLease
 	session    *ssh.Session
 	stdin      io.WriteCloser
 	pump       *outputPump
 	exitResult *exitResult
 	mu         sync.Mutex
 	closed     bool
+	closeDone  chan struct{}
 	// inputSlot is held by the actual stdin write, including after its attachment
 	// stops waiting. Reattachment cannot create another writer on this backend.
 	inputSlot chan struct{}
@@ -347,15 +358,19 @@ func (s *Service) Create(req CreateRequest) (Resource, error) {
 	if !testMode && cfgProvider == nil {
 		return Resource{}, fmt.Errorf("%w: config service is not available", ErrConflict)
 	}
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.sessions) >= maxSessions {
+	s.pruneSessionsLocked()
+	if s.pendingLocked() >= s.policy.Active {
+		return Resource{}, fmt.Errorf("%w: session cleanup limit reached", ErrConflict)
+	}
+	if s.stopped || s.activeLocked() >= s.policy.Active {
 		return Resource{}, fmt.Errorf("%w: session limit reached", ErrConflict)
 	}
 	id := strconv.FormatInt(s.nextID, 10)
 	s.nextID++
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.execCtx)
 	res := Resource{
 		ID:            id,
 		ServerRef:     req.ServerRef,
@@ -378,6 +393,7 @@ func (s *Service) Create(req CreateRequest) (Resource, error) {
 		cwdSubscribers: map[chan CWDNotify]struct{}{},
 		cancel:         cancel,
 	}
+	ctx = resourcepolicy.WithWork(ctx, func() func() { s.mu.Lock(); defer s.mu.Unlock(); return s.beginWorkLocked(session) })
 	s.sessions[id] = session
 	s.publishSessionLocked(session, Event{Type: "session.created", SessionID: id, State: res.State, Time: now})
 	if testMode {
@@ -388,7 +404,7 @@ func (s *Service) Create(req CreateRequest) (Resource, error) {
 		s.publishSessionLocked(session, Event{Type: "session.connected", SessionID: id, State: session.State, Time: now})
 		return session.snapshot(), nil
 	}
-	go s.connectSession(ctx, id, req, cfgProvider, pool, dialOpts, testMode)
+	s.runLocked(session, func() { s.connectSession(ctx, id, req, cfgProvider, pool, dialOpts, testMode) })
 	return session.snapshot(), nil
 }
 
@@ -397,8 +413,9 @@ func (s *Service) List() []Resource {
 }
 
 func (s *Service) ListWithOptions(opts ListOptions) []Resource {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneSessionsLocked()
 	out := make([]Resource, 0, len(s.sessions))
 	for _, session := range s.sessions {
 		snapshot := session.snapshot()
@@ -422,18 +439,13 @@ func (s *Service) ListWithOptions(opts ListOptions) []Resource {
 func (s *Service) ActiveCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	count := 0
-	for _, session := range s.sessions {
-		if session.State != "closed" && session.State != "failed" {
-			count++
-		}
-	}
-	return count
+	return s.activeLocked()
 }
 
 func (s *Service) Get(id string) (Resource, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneSessionsLocked()
 	session, ok := s.sessions[id]
 	if !ok {
 		return Resource{}, ErrNotFound
@@ -457,7 +469,7 @@ func (s *Service) Attach(id string) (Resource, error) {
 	if session.backend == nil {
 		return Resource{}, fmt.Errorf("%w: SSH PTY backend is not connected", ErrConflict)
 	}
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	session.Attached = true
 	session.State = "attached"
 	session.UpdatedAt = now
@@ -492,11 +504,12 @@ func (s *Service) AttachStream(id string) (AttachStream, Resource, error) {
 	if retiring != nil {
 		retiring.revoke()
 	}
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	session.Attached = true
 	session.attachGen++
 	claim := newAttachmentClaim(session.attachGen, backend)
 	session.claim = claim
+	s.runLocked(session, func() { <-claim.done })
 	session.State = "attached"
 	session.UpdatedAt = now
 	s.publishSessionLocked(session, Event{Type: "session.attached", SessionID: id, State: session.State, Time: now})
@@ -545,7 +558,7 @@ func (s *Service) AttachStream(id string) (AttachStream, Resource, error) {
 // detachAttachment releases attachment ownership only if gen still owns it, so a
 // finishing attachment can never detach a newer one.
 func (s *Service) detachAttachment(id string, gen int64) {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session, ok := s.sessions[id]
@@ -584,7 +597,7 @@ func (s *Service) Detach(id string) (Resource, error) {
 	if session.State == "closed" || session.State == "failed" {
 		return session.snapshot(), nil
 	}
-	s.releaseAttachLocked(session, time.Now().UTC())
+	s.releaseAttachLocked(session, s.policy.Now().UTC())
 	return session.snapshot(), nil
 }
 
@@ -619,7 +632,7 @@ func (s *Service) failControl(id string, target *resource, op string, cause erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if current, ok := s.sessions[id]; ok && current == target && !isTerminalState(current.State) {
-		s.publishSessionLocked(current, Event{Type: "session.error", SessionID: id, State: current.State, Error: err.Error(), Time: time.Now().UTC()})
+		s.publishSessionLocked(current, Event{Type: "session.error", SessionID: id, State: current.State, Error: err.Error(), Time: s.policy.Now().UTC()})
 	}
 	return err
 }
@@ -643,7 +656,7 @@ func (s *Service) Control(id string, req ControlRequest) (Resource, error) {
 		s.mu.Unlock()
 		return Resource{}, fmt.Errorf("%w: closed session cannot be controlled", ErrConflict)
 	}
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 
 	switch req.Type {
 	case "detach":
@@ -723,7 +736,7 @@ func (s *Service) Control(id string, req ControlRequest) (Resource, error) {
 		current.Rows = req.Rows
 		current.Cols = req.Cols
 	}
-	current.UpdatedAt = time.Now().UTC()
+	current.UpdatedAt = s.policy.Now().UTC()
 	if req.Type == "resize" {
 		s.publishSessionLocked(current, Event{Type: "session.resized", SessionID: id, State: current.State, Rows: req.Rows, Cols: req.Cols, Time: current.UpdatedAt})
 	}
@@ -738,7 +751,7 @@ func (s *Service) DisconnectByPoolKey(poolKey string) []Resource {
 	if poolKey == "" {
 		return nil
 	}
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	var closed []Resource
 	var backends []*interactiveBackend
@@ -762,11 +775,19 @@ func (s *Service) DisconnectByPoolKey(poolKey string) []Resource {
 func (s *Service) Subscribe(id string) (<-chan Event, func(), Resource, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneSessionsLocked()
 	session, ok := s.sessions[id]
 	if !ok {
 		return nil, nil, Resource{}, ErrNotFound
 	}
+	if len(session.subscribers) >= maxSessionSubscribers {
+		return nil, nil, Resource{}, fmt.Errorf("%w: subscriber limit reached", ErrConflict)
+	}
 	ch := make(chan Event, maxSessionSubscribers)
+	if isTerminalState(session.State) {
+		close(ch)
+		return ch, func() {}, session.snapshot(), nil
+	}
 	session.subscribers[ch] = struct{}{}
 	cancel := func() {
 		s.mu.Lock()
@@ -784,12 +805,16 @@ func (s *Service) Subscribe(id string) (<-chan Event, func(), Resource, error) {
 func (s *Service) SubscribeCWD(id string) (<-chan CWDNotify, func(), Resource, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pruneSessionsLocked()
 	session, ok := s.sessions[id]
 	if !ok {
 		return nil, nil, Resource{}, ErrNotFound
 	}
 	if session.State == "closed" || session.State == "failed" {
 		return nil, nil, Resource{}, fmt.Errorf("%w: closed session cannot be followed", ErrConflict)
+	}
+	if len(session.cwdSubscribers) >= maxSessionCWDFollowers {
+		return nil, nil, Resource{}, fmt.Errorf("%w: CWD follower limit reached", ErrConflict)
 	}
 	ch := make(chan CWDNotify, maxSessionCWDFollowers)
 	session.cwdSubscribers[ch] = struct{}{}
@@ -807,28 +832,14 @@ func (s *Service) SubscribeCWD(id string) (<-chan CWDNotify, func(), Resource, e
 }
 
 func (s *Service) pruneExecsLocked() {
-	if len(s.execs) < maxExecs {
-		return
-	}
-	type item struct {
-		id string
-		t  time.Time
-	}
-	items := make([]item, 0, len(s.execs))
+	var items []resourcepolicy.Item
 	for id, exec := range s.execs {
-		// Pending cleanup is live work, even though its caller has received a
-		// terminal result. Keep its diagnostic record until all workers settle.
-		if _, active := s.execActive[id]; active {
-			continue
+		if _, active := s.execActive[id]; !active {
+			items = append(items, resourcepolicy.Item{ID: id, End: exec.CompletedAt})
 		}
-		items = append(items, item{id: id, t: exec.CompletedAt})
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return items[i].t.Before(items[j].t)
-	})
-	remove := min(len(items), len(s.execs)-maxExecs/2+1)
-	for i := 0; i < remove; i++ {
-		delete(s.execs, items[i].id)
+	for _, id := range s.execPolicy.Expired(items) {
+		delete(s.execs, id)
 	}
 }
 
@@ -907,7 +918,7 @@ func (s *Service) respondChallenge(id string, typ string, resp ChallengeResponse
 			session.State = "connecting"
 		}
 	}
-	session.UpdatedAt = time.Now().UTC()
+	session.UpdatedAt = s.policy.Now().UTC()
 	s.publishSessionLocked(session, Event{Type: "session.challenge.resolved", SessionID: id, State: session.State, Challenge: &challenge, Time: session.UpdatedAt})
 	s.mu.Unlock()
 	select {
@@ -915,7 +926,7 @@ func (s *Service) respondChallenge(id string, typ string, resp ChallengeResponse
 	default:
 	}
 	challenge.Pending = false
-	challenge.UpdatedAt = time.Now().UTC()
+	challenge.UpdatedAt = s.policy.Now().UTC()
 	return challenge, nil
 }
 
@@ -973,26 +984,24 @@ func (s *Service) connectSession(ctx context.Context, id string, req CreateReque
 		return
 	}
 	s.attachBackend(id, backend, poolKeys)
-	go s.watchInteractive(id, backend, pool, poolKeys, finalCfg)
+	s.mu.Lock()
+	res := s.sessions[id]
+	s.runLocked(res, func() { s.watchInteractive(id, backend, finalCfg) })
+	s.mu.Unlock()
 }
 
 func (s *Service) attachBackend(id string, backend *interactiveBackend, poolKeys []string) {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	session, ok := s.sessions[id]
-	if !ok {
+	if !ok || isTerminalState(session.State) {
+		s.mu.Unlock()
 		if backend != nil {
 			_ = backend.Close()
 		}
 		return
 	}
-	if session.State == "closed" || session.State == "failed" {
-		if backend != nil {
-			_ = backend.Close()
-		}
-		return
-	}
+	defer s.mu.Unlock()
 	session.backend = backend
 	session.poolKeys = cloneStrings(poolKeys)
 	if session.Attached {
@@ -1008,7 +1017,8 @@ func (s *Service) attachBackend(id string, backend *interactiveBackend, poolKeys
 	if session.pendingCredentials != nil && session.pendingCredentials.Remember {
 		candidate := *session.pendingCredentials
 		session.pendingCredentials = nil
-		go s.saveCredentials(id, session.serverID, candidate)
+		serverID := session.serverID
+		s.runLocked(session, func() { s.saveCredentials(id, serverID, candidate) })
 	} else {
 		session.pendingCredentials = nil
 	}
@@ -1017,7 +1027,7 @@ func (s *Service) attachBackend(id string, backend *interactiveBackend, poolKeys
 }
 
 func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig, state string) {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session, ok := s.sessions[id]
@@ -1029,6 +1039,9 @@ func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig, st
 	// rewrite the recorded outcome, time or cause.
 	if isTerminalState(session.State) {
 		return
+	}
+	if session.cancel != nil {
+		session.cancel()
 	}
 	session.State = state
 	session.Attached = false
@@ -1042,6 +1055,7 @@ func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig, st
 	session.HostKeyPending = false
 	session.AuthPending = false
 	s.publishSessionLocked(session, Event{Type: "session.error", SessionID: id, State: session.State, Error: session.FrameworkError, Time: now})
+	s.closeSubscribersLocked(session)
 }
 
 // openSSHSession opens a channel on a pooled client under ctx. x/crypto/ssh has
@@ -1057,19 +1071,19 @@ func openSSHSession(ctx context.Context, client *ssh.Client) (*ssh.Session, erro
 		err     error
 	}
 	done := make(chan result, 1)
-	go func() {
+	resourcepolicy.Go(ctx, func() {
 		session, err := client.NewSession()
 		done <- result{session: session, err: err}
-	}()
+	})
 	select {
 	case res := <-done:
 		return res.session, res.err
 	case <-ctx.Done():
-		go func() {
+		resourcepolicy.Go(ctx, func() {
 			if res := <-done; res.session != nil {
 				_ = res.session.Close()
 			}
-		}()
+		})
 		return nil, ctx.Err()
 	}
 }
@@ -1082,13 +1096,13 @@ func sessionSetup(ctx context.Context, session *ssh.Session, step func() error) 
 		return err
 	}
 	done := make(chan error, 1)
-	go func() { done <- step() }()
+	resourcepolicy.Go(ctx, func() { done <- step() })
 	select {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
 		_ = session.Close()
-		go func() { <-done }()
+		resourcepolicy.Go(ctx, func() { <-done })
 		return ctx.Err()
 	}
 }
@@ -1104,7 +1118,7 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 		confirm := func(attemptCtx context.Context, prompt sshpool.HostKeyPrompt) bool {
 			return s.waitHostKeyResponse(attemptCtx, sessionID, server, prompt)
 		}
-		client, poolKeys, _, err := pool.GetClientContextWithPrompt(ctx, server, currentCfg, confirm, sshpool.DialOptions{
+		lease, err := pool.AcquireClientContextWithPrompt(ctx, server, currentCfg, confirm, sshpool.DialOptions{
 			AgentSocket:   dialOpts.AgentSocket,
 			HostKeyPolicy: req.HostKeyPolicy,
 			Timeout:       dialOpts.Timeout,
@@ -1124,17 +1138,21 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 			}
 			return nil, nil, currentCfg, err
 		}
-		pool.IncRef(poolKeys...)
-		sshSession, err := openSSHSession(ctx, client)
+		client, poolKeys := lease.Client, lease.Keys
+		ownedCtx, work := resourcepolicy.Scope(ctx)
+		release := func() {
+			resourcepolicy.Go(ctx, func() { _ = work.Wait(context.Background()); lease.Release() })
+		}
+		sshSession, err := openSSHSession(ownedCtx, client)
 		if err != nil {
-			pool.DecRef(poolKeys...)
+			release()
 			return nil, nil, currentCfg, err
 		}
-		if err := sessionSetup(ctx, sshSession, func() error {
+		if err := sessionSetup(ownedCtx, sshSession, func() error {
 			return sshSession.RequestPty(req.Term, req.Rows, req.Cols, sshTerminalModes())
 		}); err != nil {
 			_ = sshSession.Close()
-			pool.DecRef(poolKeys...)
+			release()
 			return nil, nil, currentCfg, err
 		}
 		setSSHSessionEnvironment(sshSession, req.Env)
@@ -1146,19 +1164,19 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 		stdin, err := sshSession.StdinPipe()
 		if err != nil {
 			_ = sshSession.Close()
-			pool.DecRef(poolKeys...)
+			release()
 			return nil, nil, currentCfg, err
 		}
 		stdout, err := sshSession.StdoutPipe()
 		if err != nil {
 			_ = sshSession.Close()
-			pool.DecRef(poolKeys...)
+			release()
 			return nil, nil, currentCfg, err
 		}
 		stderr, err := sshSession.StderrPipe()
 		if err != nil {
 			_ = sshSession.Close()
-			pool.DecRef(poolKeys...)
+			release()
 			return nil, nil, currentCfg, err
 		}
 		stdout = newObservedReader(stdout, func(path string) {
@@ -1167,9 +1185,9 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 		stderr = newObservedReader(stderr, func(path string) {
 			s.updateCurrentDir(sessionID, path)
 		})
-		if err := sessionSetup(ctx, sshSession, sshSession.Shell); err != nil {
+		if err := sessionSetup(ownedCtx, sshSession, sshSession.Shell); err != nil {
 			_ = sshSession.Close()
-			pool.DecRef(poolKeys...)
+			release()
 			return nil, nil, currentCfg, err
 		}
 
@@ -1180,6 +1198,7 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 		pump.AddReader(streamStdout, stdout)
 		pump.AddReader(streamStderr, stderr)
 		backend := &interactiveBackend{
+			lease:      lease,
 			session:    sshSession,
 			stdin:      stdin,
 			pump:       pump,
@@ -1193,7 +1212,7 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 }
 
 func (s *Service) waitHostKeyResponse(ctx context.Context, sessionID string, server config.ServerProfile, prompt sshpool.HostKeyPrompt) bool {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	challenge := &pendingChallenge{
 		Challenge: Challenge{
 			SessionID:   sessionID,
@@ -1253,7 +1272,7 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 	if !ok || len(allowedMethods) == 0 {
 		allowedMethods = []string{config.AuthMethodPassword, config.AuthMethodKey, config.AuthMethodAgent}
 	}
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	challenge := &pendingChallenge{
 		Challenge: Challenge{
 			SessionID:      sessionID,
@@ -1357,7 +1376,7 @@ func (s *Service) runtimeConfigForAuthResponse(cfg config.RuntimeConfig, server 
 }
 
 func (s *Service) failPendingChallenge(sessionID string, typ string, message string) {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session, ok := s.sessions[sessionID]
@@ -1376,16 +1395,20 @@ func (s *Service) failPendingChallenge(sessionID string, typ string, message str
 		session.authChallenge = nil
 		session.AuthPending = false
 	}
+	if session.cancel != nil {
+		session.cancel()
+	}
 	session.State = "failed"
 	session.FrameworkError = message
 	session.ExitedAt = &now
 	session.UpdatedAt = now
 	session.pendingCredentials = nil
 	s.publishSessionLocked(session, Event{Type: "session.error", SessionID: sessionID, State: session.State, Error: message, Time: now})
+	s.closeSubscribersLocked(session)
 }
 
 func (s *Service) publishError(sessionID string, message string) {
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if session, ok := s.sessions[sessionID]; ok {
@@ -1396,7 +1419,7 @@ func (s *Service) publishError(sessionID string, message string) {
 // watchInteractive is the single owner of a session's terminal transition. It
 // waits for the remote to exit, drains output that was already received, records
 // the outcome once, and releases the pool references.
-func (s *Service) watchInteractive(id string, backend *interactiveBackend, pool *sshpool.Pool, poolKeys []string, cfg config.RuntimeConfig) {
+func (s *Service) watchInteractive(id string, backend *interactiveBackend, cfg config.RuntimeConfig) {
 	// ssh.Session.Wait returns only after the stdin/stdout/stderr copies have all
 	// finished, so by the time it returns the pump has read every byte the remote
 	// sent. A bounded wait (instead of a fixed sleep) covers a wedged reader.
@@ -1407,10 +1430,9 @@ func (s *Service) watchInteractive(id string, backend *interactiveBackend, pool 
 
 	outcome := computeExitResult(err)
 
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	session, ok := s.sessions[id]
-	var backendToClose *interactiveBackend
 	switch {
 	case !ok:
 		// The session record is gone; still publish the outcome so no attach
@@ -1426,14 +1448,18 @@ func (s *Service) watchInteractive(id string, backend *interactiveBackend, pool 
 		if outcome.FrameworkError != "" {
 			state = "failed"
 		}
-		backendToClose = s.closeSessionLocked(session, state, outcome, now)
+		s.closeSessionLocked(session, state, outcome, now)
 	}
 	s.mu.Unlock()
 
-	if backendToClose != nil {
-		_ = backendToClose.Close()
+	_ = backend.Close()
+	// Close bounds the caller, not the real cleanup. Keep ownership until the
+	// backend settles, even after ErrTeardownTimeout; Shutdown reports its budget
+	// expiry instead of pretending this work ended or returning the lease early.
+	<-backend.completion()
+	if backend.lease != nil {
+		backend.lease.Release()
 	}
-	pool.DecRef(poolKeys...)
 }
 
 // exitStatuser matches anything exposing a remote exit status, including wrapped
@@ -1493,7 +1519,7 @@ func (s *Service) updateCurrentDir(id string, dir string) {
 	if dir == "" {
 		return
 	}
-	now := time.Now().UTC()
+	now := s.policy.Now().UTC()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session, ok := s.sessions[id]
@@ -1531,6 +1557,10 @@ func (s *Service) closeSessionLocked(session *resource, state string, outcome Ex
 		return nil
 	}
 	backend := session.backend
+	if backend != nil {
+		done := backend.completion()
+		s.runLocked(session, func() { <-done })
+	}
 	s.commitOutcomeLocked(session, outcome)
 	if session.cancel != nil {
 		session.cancel()
@@ -1572,6 +1602,10 @@ func (s *Service) closeSessionLocked(session *resource, state string, outcome Ex
 		Error:     session.FrameworkError,
 		Time:      now,
 	})
+	for ch := range session.subscribers {
+		close(ch)
+		delete(session.subscribers, ch)
+	}
 	return backend
 }
 
@@ -1599,7 +1633,7 @@ func (s *Service) commitOutcomeLocked(session *resource, outcome ExitOutcome) {
 
 func (s *Service) publishSessionLocked(session *resource, event Event) {
 	if event.Time.IsZero() {
-		event.Time = time.Now().UTC()
+		event.Time = s.policy.Now().UTC()
 	}
 	for ch := range session.subscribers {
 		select {
@@ -1608,7 +1642,9 @@ func (s *Service) publishSessionLocked(session *resource, event Event) {
 		}
 	}
 	if s.onEvent != nil {
-		s.onEvent(cloneEvent(event))
+		callback := s.onEvent
+		copy := cloneEvent(event)
+		s.callbacks.Send(func() { callback(copy) })
 	}
 }
 
@@ -1770,6 +1806,15 @@ func boundedClose(grace time.Duration, release func() error) error {
 	}
 }
 
+func (b *interactiveBackend) completion() <-chan struct{} {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closeDone == nil {
+		b.closeDone = make(chan struct{})
+	}
+	return b.closeDone
+}
+
 func (b *interactiveBackend) Close() error {
 	b.mu.Lock()
 	if b.closed {
@@ -1777,6 +1822,10 @@ func (b *interactiveBackend) Close() error {
 		return nil
 	}
 	b.closed = true
+	if b.closeDone == nil {
+		b.closeDone = make(chan struct{})
+	}
+	done := b.closeDone
 	stdin := b.stdin
 	b.stdin = nil
 	pump := b.pump
@@ -1801,7 +1850,11 @@ func (b *interactiveBackend) Close() error {
 		steps = append(steps, session.Close)
 	}
 	return boundedClose(teardownGrace, func() error {
+		defer close(done)
 		err := closeConcurrently(steps...)
+		if pump != nil {
+			pump.wg.Wait()
+		}
 		// Successful release also waits for the backend's actual writer. A close
 		// that fails to unblock stdin cannot be mistaken for completed teardown.
 		if slot != nil {

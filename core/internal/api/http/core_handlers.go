@@ -13,7 +13,11 @@ func (s *Server) eventsWS(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		requireMethod(w, r, stdhttp.MethodGet)
 		return
 	}
-	events, cancel := s.core.SubscribeEvents()
+	events, cancel, err := s.core.SubscribeEvents()
+	if err != nil {
+		writeAPIError(w, stdhttp.StatusConflict, response.RiskReadOnly, "events", "EVENT_SUBSCRIPTION_UNAVAILABLE", err.Error())
+		return
+	}
 	defer cancel()
 	conn, err := s.upgradeWebSocket(w, r)
 	if err != nil {

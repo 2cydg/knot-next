@@ -188,3 +188,102 @@ GOWORK=off go test -count=40 -run TestAttachReportsTruncated ./internal/api/http
 - 临时期限制 overlay：每次读取重新使用 `now + 5s`，`TestSFTPProtocolTerminalEventDeadline/idle` 预期失败，60 ms 预算被拖到 5.002 秒。日志 `/tmp/knot-b05-review-deadline-mutation.log`。
 
 两个 overlay 位于 `/tmp/knot-b05-review-overlays/`，仅供 Go 测试临时替换源码，没有修改生产工作区文件。未新增依赖、未 Git 提交。`backend` 文档已改为创建时即为 `ssh-sftp`，createSession helper 同时检查 connecting 响应的 backend。
+
+## B06：会话、历史、订阅与 worker 回收
+
+| 字段 | 内容 |
+| --- | --- |
+| 基线与变更 | `9e7fd0fa0f9a878d9ce6ccf2bf94fe37207792ac` + 未提交工作区；新增 `internal/resourcepolicy/`、SSH/SFTP `retention.go` 及回归；修改 session/exec/SFTP/pool/core 和进程接线；全局订阅超限在 WS 升级前返回错误 |
+| 来源 | 在当前 B01–B05 实现上修复；复用当前 `sshserver`、exec 延迟 channel、gated stdin、真实 SFTP handler 与 shutdown fixture，无旧项目代码复制，无新增依赖 |
+| 环境 | Linux amd64，Go 1.27.1；module 保持 `go 1.26.2`；真实 loopback SSH/SFTP，随机端口、临时目录、人工凭据 |
+| 结果 | R01–R07 本机验收通过，详细场景如下；无 Git 提交 |
+| 平台 | Linux 实际运行；Linux/macOS/Windows × amd64/arm64 六目标构建通过。macOS/Windows 原生运行未执行，未将交叉构建记为运行验收 |
+
+### 场景与实际断言
+
+| 编号 | 测试 | 断言 |
+| --- | --- | --- |
+| R01 | 两包 `TestTerminalRetentionDoesNotBlockCreation`，`TestTransferHistoryCapacityAndActiveProtection`，`TestSessionMaintenancePrunesWithoutRequests` / `TestSFTPMaintenancePrunesWithoutRequests` | 注入时钟与小 policy，最旧终态优先删除，保留结果/时间可查，过期 ErrNotFound（HTTP 映射 404），活跃记录不删除；无新请求时定期清理也执行 |
+| R02 | `TestSessionCreationBeyondLifetimeLimit` / `TestSFTPCreationBeyondLifetimeLimit` | 各创建关闭 1056 个 session，再创建成功；已收尾历史最多 1024，活跃数归零。大批次使用本地可控 backend，真实协议小批次由 R04/R06 补齐 |
+| R03 | 两包 `TestTerminalRetentionDoesNotBlockCreation`、`TestTransferRetentionWaitsForWorker`、`TestTerminalHistoryWaitsForBackendRelease` | 活跃限额拒绝新建，关闭后可创建；Transfer 实际 worker 限额生效；释放中的终态仍持有 worker、不能裁剪，待释放 session 也有单独容量防止永久阻塞对象无限累积 |
+| R04 | `TestSessionConcurrentCloseOwnership` / `TestSFTPConcurrentCloseOwnership`；`TestSessionCloseKeepsSharedReference` / `TestSFTPCloseKeepsSharedReference` | SSH/SFTP 各 50 轮同时关闭/重复关闭/远端退出或 pool 断开；每轮 worker 完成，ref 为零；同连接另一 owner 留下 ref=1 且仍可 resize/list，能发现重复 release 而不只检查 ref 未负 |
+| R05 | `TestSessionSubscriberLimitsAndIdempotentCancel`、`TestSFTPSubscriberLimitsAndIdempotentCancel`、`TestGlobalSubscriberLimitAndClose`、`TestResourceSubscriberLimitsReturnConflict` | SSH/SFTP/transfer 16、CWD 8、global 64 的真实数量限额；慢消费者不阻塞，取消两次/关闭后取消安全，名额重用，channel 与 map 清理；HTTP 409 及 error code 验证 |
+| R06 | `TestResourceShutdownAfterRepeatedWork`、`TestSFTPFollowCloseReleasesOwner`、`TestCanceledChannelOpenRetainsCleanupOwner`、`TestPoolShutdownWaitsForCreationAndCleanup`、`TestPoolShutdownWaitsForKeepaliveAndCallbackReentry` | 真实 SSH/SFTP 共 pool，多次 attach/follow/transfer/exec 后两次并发 shutdown；实际 exec/远端 worker 完成，连接和 ref 清零、订阅结束；迟到 channel/不遵守取消的拨号/阻塞 backend 不会被误报释放，预算不足明确报错，放行后再次等待成功；清理 loop 可结束 |
+| R07 | `TestSessionCallbackReentryAndPanic` / `TestSFTPCallbackReentryAndPanic`，`TestSFTPFailureReleasesSubscribersAndFollower`，resourcepolicy callback 测试 | 回调能 GET 和 Shutdown；panic 后继续通知；follow cancel 在锁外可反入目标服务；回调队列有界，其他资源正常收尾 |
+| 配置回收 | `TestPoolIdleReplacementKeepsNewOwner` + 既有 identity/route 回归 | 空闲旧身份被替换时关闭旧 client，避免按复用 key 发迟到 disconnect 误关新 owner；活跃身份仍用既有 revision 隔离，不在普通配置保存时 Clear |
+| 失败路径 | `TestSessionFailureClosesSubscribersAndContext` / `TestSFTPFailureReleasesSubscribersAndFollower`、`TestSFTPTransportDropNeedsNoCallback` | connect/host key/auth 失败结束订阅、CWD 和 context；每个真实 SFTP client 自行观察 transport loss，资源回收不依赖通知送达 |
+
+### 验证命令与工件
+
+目录 `knot-next/core`；所有 Go 命令使用 `GOWORK=off GOCACHE=/tmp/knot-plan-20261006-go-build`。首次普通沙箱禁止 socket，随后在获准的可监听环境运行；未通过 skip 绕过协议用例。
+
+```bash
+go test -count=1 -timeout=180s \
+  -coverpkg=./pkg/session,./pkg/sftp,./pkg/sshpool,./pkg/core,./internal/resourcepolicy \
+  -coverprofile=/tmp/knot-b06-cover.out ./...
+
+go test -race -count=1 -timeout=180s \
+  ./pkg/session ./pkg/sftp ./pkg/sshpool ./pkg/core \
+  ./internal/api/http ./tests/integration ./internal/resourcepolicy
+
+B06_RUN='Test(Terminal|SessionSubscriber|SessionCallback|SessionConcurrent|SessionMaintenance|SessionFailure|SessionCloseKeeps|CanceledChannel|SFTPSubscriber|SFTPFollowClose|SFTPCallback|SFTPConcurrent|SFTPTransport|SFTPMaintenance|SFTPFailure|SFTPCloseKeeps|TransferRetention|TransferHistory|PoolShutdown|ResourceShutdown|GlobalSubscriber|ResourceSubscriber|HistoryPolicy|WorkerOwnership|CallbackQueue|CancellationCallback)'
+go test -race -count=20 -timeout=240s -run "$B06_RUN" \
+  ./pkg/session ./pkg/sftp ./pkg/sshpool ./pkg/core ./internal/api/http ./internal/resourcepolicy
+
+go test -race -count=20 -timeout=30s -run '^TestPoolIdleReplacementKeepsNewOwner$' ./pkg/sshpool
+go vet ./...
+go tool cover -func=/tmp/knot-b06-cover.out
+```
+
+- 最终全量测试通过（session 7.615 秒、SFTP 8.828 秒、integration 2.109 秒）。
+- 最终受影响包及完整协议链路的一次全量 race 通过（session 10.788 秒、SFTP 11.788 秒、pool 3.750 秒、core 1.156 秒、HTTP 1.988 秒、integration 2.975 秒），无 race 报告。
+- 20 次定向 race 通过（session 8.604 秒、SFTP 11.387 秒、pool 1.512 秒、core 2.941 秒、HTTP 1.098 秒）；新增空闲替换回归另跑 20 次 race，通过（1.017 秒）。
+- `go vet ./...`、`git diff --check` 通过；六目标以 `CGO_ENABLED=0 GOOS=... GOARCH=... go build -o /tmp/knot-b06-core-... ./cmd/core` 构建，Windows 使用 `.exe`。
+- resourcepolicy 全部函数语句覆盖 100%；会话/Transfer 裁剪、待释放计数、subscriber 清理、worker 注册、maintenance 与 follow 取消的新函数 100%；SSH/SFTP Shutdown 分别 86.4% / 85.7%，其余未覆盖为底层关闭失败后的错误累积路径。pool stop/Shutdown/通知 100%，cleanup loop 83.3%、keepalive 95.7%。这些是函数级核查，不以整个旧业务包的总比例替代验收。
+- 覆盖工件 `/tmp/knot-b06-cover.out`、`/tmp/knot-b06-cover-functions.txt`；未覆盖的旧 SSH/SFTP setup pipe/Agent 分支仍不等于平台已验收，本次不扩展密钥/Windows Agent。
+- 空闲替换变异：Go overlay 恢复错误的 `notifyDisconnect(key)`，新测试确定失败，观察到 callbacks=1、replacement ref=0。工件 `/tmp/knot-b06-idle-callback-{overlay.json,mutation.go,mutation.log}`，工作区生产源码未被变异改写。
+
+### 已明确的边界
+
+历史在当前进程内保存；容量压力可提前裁剪，404 不代表执行成功。仍有实际 cleanup 的终态不裁剪，超过待释放容量时拒绝新增。detached 不自动 TTL 关闭，客户端负责显式断开。
+
+用户提供的观察者回调可自己调用 Shutdown，因此不作为 Shutdown 的等待对象；最多一个调用和 256 条待处理通知，服务退出丢弃待处理服务通知，panic 隔离。业务 worker、取消回调、follow、backend、迟到 channel 与 pool 工作仍明确跟踪并等待。不可中断的第三方协议操作在预算内未完成时返回错误，由 transport 关闭最终解阻。
+
+本轮没有运行外部 SSH 端点 smoke 或 macOS/Windows 原生用例，不改变 B07–B12 的剩余范围。
+
+### B06 审阅修复后的验证
+
+逐项结论与理由见 workspace `docs/running/B06-resource-lifecycle-plan.md` 的“审阅报告逐项核查与处理”。上节为初版验收；下列是本轮修复后的最终结果，仍以 `9e7fd0f` + 未提交工作区为基线，无新增依赖。
+
+本轮修复无容量压力时反复排序及辅助 worker 重复裁剪 Transfer 的开销、exec 数量裁剪被 TTL 掩盖的测试、重复上限常量、pool 退出保留排队 observer、ActiveCount 判定重复，以及 core 的 GetClient/IncRef 取得窗口。连接 lease 返回前已经持有整条链路，释放绑定原条目且幂等；shared 拨号拥有独立的跳板引用，调用者取消后仍持有到实际拨号结束。shared 创建返回实际 revision publication key。仍保留兼容的 unowned GetClient / key-based IncRef/DecRef；core 资源均已迁移至 Acquire/lease。
+
+R-1 采用报告建议 (b)：继续跟踪真实收尾，未采用超时提前归还引用。真实 SSH + gated stdin 的 `TestSessionTeardownTimeoutRetainsPoolOwner` 验证响应超时仍 ref=1、Shutdown 预算不足报错、实际收尾后 ref=0。访问/维护仍不裁剪正在收尾的终态；文档明确其可长期占用待释放额度。同 End 的字典序只是确定性并列规则，文档不承诺按创建顺序裁剪。空 Group 的期限错误保留，补充了共享预算不等于资源仍存活的说明。
+
+最终执行目录 `knot-next/core`，所有 Go 命令沿用 `GOWORK=off GOCACHE=/tmp/knot-plan-20261006-go-build`；协议用例在已获准的可监听环境运行，没有跳过测试。
+
+| 验证 | 最终结果 |
+| --- | --- |
+| 全量测试及覆盖 | `go test -count=1 -timeout=180s -coverpkg=./pkg/session,./pkg/sftp,./pkg/sshpool,./pkg/core,./internal/resourcepolicy -coverprofile=/tmp/knot-b06-review-cover.out ./...` 通过；session 7.563 秒、SFTP 8.735 秒、pool 2.689 秒、integration 1.865 秒 |
+| 完整受影响包 race | `go test -race -count=1 -timeout=180s ./pkg/session ./pkg/sftp ./pkg/sshpool ./pkg/core ./internal/api/http ./tests/integration ./internal/resourcepolicy` 通过，无 race；session 9.609 秒、SFTP 10.187 秒、pool 3.764 秒、core 1.143 秒、HTTP 1.934 秒、integration 13.333 秒 |
+| 20 次审阅/历史/收尾回归 | plan 中完整 `Test(Lease\|PoolShutdown\|SessionTeardown\|ExecHistory\|ExecPrune\|ExecShutdownKeeps\|HistoryWithinCapacity\|Terminal\|TransferHistory\|TransferRetention\|SessionCloseKeeps\|SFTPCloseKeeps)` 选择集，四包通过（session 2.402 秒、SFTP 1.525 秒、pool 1.712 秒、policy 1.014 秒） |
+| 新增取得重试/实际 revision/拨号引用回归 | 最终 `go test -race -count=20 -timeout=60s -run 'Test(Lease\|PoolShutdown\|ReviewPoolCloseEndsContextAwarePrompt)' ./pkg/sshpool` 通过（2.029 秒）。包含 caller 取消后 dial 持跳板 ref=1、身份旋转不替换、预算错误及实际结束后原条目 ref=0 |
+| 静态检查与构建 | `go vet ./...`、`git diff --check` 通过；六目标 `CGO_ENABLED=0 GOOS={linux,darwin,windows} GOARCH={amd64,arm64} go build -o /tmp/knot-b06-review-core-... ./cmd/core` 全部通过，Windows 为 `.exe` |
+| 裁剪 benchmark | 4096 条未超限历史的 `BenchmarkHistoryWithinCapacity` 约 17.6 µs/op、0 B/op、0 allocs/op；仅测 policy，不代表服务请求整体零分配 |
+| 变异验证 | 临时 overlay 删除 exact client 核对，`TestLeaseRetriesReplacementDuringAcquisition` 确定失败，报 `retry returned the closed client or disturbed the new owner`；工作区源码未变异 |
+
+覆盖工件 `/tmp/knot-b06-review-cover.out`、`/tmp/knot-b06-review-cover-functions.txt`。resourcepolicy 全部函数、SSH/SFTP retention 除 Shutdown 外的新函数仍 100%；lease `Release/AcquireClientContext/AcquireClientContextWithPrompt/getClientContext/retainClient/retainPrefixLocked` 均为 100%。session/SFTP Shutdown 仍 86.4% / 85.7%，未覆盖底层 Close 硬错误累积；旧 pool `runCreation` 整体为 90.6%，不把新增 lease 函数的 100% 描述为所有旧拨号错误路径已完整覆盖。
+
+变异工件为 `/tmp/knot-b06-review-lease-{overlay.json,mutation.go,mutation.log}`。Windows/macOS 原生运行和外部 SSH smoke 仍未执行；六目标构建仅作为编译证据。当前外部 observer 仍可长期阻塞，退出丢弃排队 observer 而不等待当前任意用户回调，业务/拨号/清理 worker 则独立等待。
+
+### B06 复审 N-1–N-4 修复后的验证
+
+逐项结论见 workspace `docs/running/B06-resource-lifecycle-plan.md` 的“复审 N-1–N-4 的处理”。原报告判断成立：N-1 的测试只把过期项放在末尾，不能证明原地压缩不改输入。本轮使 `Expired` 对所有输入保留内容和顺序，仅需要容量排序时复制存活项；prefix 释放加 once 和 defer；watcher 对 nil lease 防御；stop 显式禁止请求退出 disconnect 通知，与既定通知契约一致。pending cleanup 数量和最老待释放时长记录为 B07 候选，未提前增加 stats/event 字段。
+
+沿用 Linux amd64、Go 1.27.1 与 `GOWORK=off GOCACHE=/tmp/knot-plan-20261006-go-build`；module 保持 Go 1.26.2，无新增依赖，未 Git 提交。真实协议用例在已获准的 loopback 环境执行，无 skip。
+
+- 全量覆盖测试（沿用上节完整命令）通过：session 7.504 秒、SFTP 8.741 秒、pool 2.701 秒、integration 1.870 秒。结果另存 `/tmp/knot-b06-followup-cover.out`，函数级核查 `/tmp/knot-b06-followup-cover-functions.txt`；`Expired/retainPrefixLocked` 为 100%，原 watcher 整体 93.8%、runCreation 整体 91.2%，不声称所有旧分支覆盖完毕。
+- 完整受影响包及协议集成 race（沿用上节完整命令）通过，无 race：session 9.650 秒、SFTP 10.205 秒、pool 3.772 秒、core 1.148 秒、HTTP 1.899 秒、integration 2.912 秒、policy 1.014 秒。
+- `go test -race -count=20 -timeout=60s -run 'Test(History|PrefixRelease|CreationPanic|WatchInteractiveWithoutLease|Lease|PoolShutdown)' ./internal/resourcepolicy ./pkg/sshpool ./pkg/session` 通过（1.050 / 1.964 / 1.033 秒）。新增回归涵盖输入不变、20 个并发重复归还 prefix/idle 回收、异常 unwind 释放，以及无 lease 的有效 backend 实际收尾和终态诊断。
+- 四个 Go overlay 独立恢复旧压缩、去掉 prefix once、去掉 deferred release、去掉 nil 检查，对应回归均以退出码 1 确定失败。工件 `/tmp/knot-b06-followup-{n1,n2-once,n2-defer,n3}.{json,go}`，未修改工作区生产源码。
+- `go vet ./...`、`git diff --check`、六目标 `CGO_ENABLED=0 go build ./cmd/core` 通过。产物 `/tmp/knot-b06-followup-core-{linux,darwin,windows}-{amd64,arm64}`，Windows 带 `.exe`；Windows/macOS 原生运行及外部 SSH smoke 未执行。
+- `BenchmarkHistoryWithinCapacity` 的 4096 条未超限历史约 14.9 µs/op、0 B/op、0 allocs/op。容量压力分支有意复制存活项以保留输入；benchmark 仅测 policy 的未超限扫描，不作为服务整体吞吐或零分配声明。

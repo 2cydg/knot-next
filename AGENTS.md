@@ -169,6 +169,10 @@ When contributing:
 
 See [core/docs/migration.md](core/docs/migration.md) for migration guidance from the original knot version.
 
+B06 resource retention and cleanup are implemented: active capacity is separate from
+terminal history, subscribers are bounded, and shutdown waits for owned workers.
+See `core/docs/baseline-acceptance.md` for validation and platform boundaries.
+
 ## Known Issues
 
 The following issues are documented for future phases:
@@ -179,6 +183,5 @@ The following issues are documented for future phases:
 - **P1**: SFTP directory following
 - **P1**: Legacy config migration platform compatibility
 - **P1**: Windows Agent support
-- **P1**: Long-running service resource cleanup
 
 These will be addressed in M1-M2 phases. See project documentation for details.

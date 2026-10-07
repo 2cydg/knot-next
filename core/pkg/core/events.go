@@ -1,11 +1,15 @@
 package core
 
 import (
+	"errors"
 	"sync"
 	"time"
 )
 
 const defaultEventBuffer = 64
+const maxEventSubscribers = 64
+
+var ErrEventSubscription = errors.New("event subscription unavailable: service closed or subscriber limit reached")
 
 type Event struct {
 	Type       string         `json:"type"`
@@ -26,13 +30,13 @@ func NewEventBus() *EventBus {
 	return &EventBus{subscribers: map[chan Event]struct{}{}}
 }
 
-func (b *EventBus) Subscribe() (<-chan Event, func()) {
+func (b *EventBus) Subscribe() (<-chan Event, func(), error) {
 	ch := make(chan Event, defaultEventBuffer)
 	b.mu.Lock()
-	if b.closed {
+	if b.closed || len(b.subscribers) >= maxEventSubscribers {
 		close(ch)
 		b.mu.Unlock()
-		return ch, func() {}
+		return ch, func() {}, ErrEventSubscription
 	}
 	b.subscribers[ch] = struct{}{}
 	b.mu.Unlock()
@@ -48,7 +52,7 @@ func (b *EventBus) Subscribe() (<-chan Event, func()) {
 			b.mu.Unlock()
 		})
 	}
-	return ch, cancel
+	return ch, cancel, nil
 }
 
 func (b *EventBus) Publish(event Event) {

@@ -76,7 +76,7 @@ SSH 输入按 backend 串行写入。detach 取消旧 attachment 的排队输入
 例如，任务完成后才建立连接，首帧包含 `state=completed`，GET 确认结果后便可结束；无需等待另一个 completed 事件。
 如果终态通知因消费者缓慢而丢失，GET 仍可查询完成状态。关闭 session 可能先关闭事件流，关联任务收尾同样通过 GET 查询。
 
-任务仅保留在当前进程内，历史任务可能被清理。core 重启或任务被清理后，GET 返回 404 时应报告“结果已不可查询”，不能当作成功或继续无限等待。
+任务仅保留在当前进程内。已收尾 Transfer 默认从 completed_at 起保留 10 分钟、最多 4096 条；数量压力可提前裁剪最旧终态，运行中的任务不裁剪。core 重启或任务被清理后，GET 返回 404 时应报告“结果已不可查询”，不能当作成功或继续无限等待。
 
 ## 取消与后端关闭
 
@@ -93,3 +93,11 @@ DELETE `/v1/sftp/{id}/transfers/{transfer_id}` 返回取消时的快照，取消
 测试 WebSocket 辅助函数为拨号设置 2 秒超时，为握手、首帧和默认事件读写设置 5 秒期限；定向终态事件等待使用 2 秒 read deadline。
 循环检查墙钟只能限制循环次数，无法中断阻塞读取；需要在实际 net.Conn 上设置 deadline，并关闭连接、取消订阅。
 这些期限仅约束测试，不是生产 WebSocket 的自动关闭策略。
+
+## 订阅数量与退出
+
+全局 `/v1/events` 最多 64 个订阅，超限或服务已关闭时在 WebSocket 升级前返回 `409 EVENT_SUBSCRIPTION_UNAVAILABLE`。每个 SSH/SFTP session 的事件订阅最多 16 个，每个 SFTP session 的 transfer 订阅最多 16 个；超限返回 `409 CONFLICT`。取消可重复调用，并释放订阅名额。SSH CWD follower 最多 8 个，源或目标关闭会解除关联。
+
+session 终态关闭订阅并清空映射，保留的 session events 可再次读取终态快照后结束。全局事件总线在 core shutdown 时关闭。慢消费者不会阻塞业务锁，事件和回调是通知，最终状态以 GET 为准。
+
+服务内部回调在业务锁外通过有界队列串行调用，panic 不会阻断其他通知。每个 dispatcher 最多一个观察者调用与 256 条待处理通知，队列满时可丢通知。Shutdown 丢弃待处理的服务和连接池回调，不等待调用者提供的当前回调，以允许回调自己查询/关闭服务；这一边界不影响对业务 worker、pool ref、连接、follow 和清理 loop 的等待。

@@ -512,3 +512,13 @@ query：
 - `HEAD /files` 当前实现不是传统 HEAD 语义，而是返回 JSON body
 - `GET /files` 同时承载 list 与 stat，两者通过 query 切换
 - 当前没有单独的 list-all-sessions HTTP 接口，只有按 ID 的 session 资源和事件/transfer 子资源
+
+## 容量、历史与关闭
+
+活跃 SFTP session 最多 1024 个，累计关闭超过此数量后仍可新建。closed/failed/disconnected 历史在 backend、follow 和关联 worker 全部释放后可裁剪：从 `closed_at` 起保留 10 分钟，最多 1024 条，容量压力先删除最旧终态。GET/列表/订阅时清理，进程内每分钟也清理一次；重启或裁剪后 GET 返回 `404 NOT_FOUND`。仍有 worker 的终态不裁剪；释放中的 session 单独限为 1024 个，达到上限时新建返回 `409 CONFLICT`。这类记录代表实际收尾未完成；远端或底层 I/O 阻塞时可长期占用待释放额度。关闭响应超时后后台继续持有连接 lease，引用只在实际收尾结束后归还。
+
+每个 session 最多 16 个 session events 订阅、16 个 transfer events 订阅；超限返回 `409 CONFLICT`。取消幂等且释放名额，关闭/失败/传输层断开会关闭并清空订阅。对保留终态订阅 session events，只发送快照后结束；transfer events 仍要求 session 非终态。
+
+Transfer 最多 4096 个 queued/running/待收尾 worker。终态结果从 `completed_at` 起保留 10 分钟、最多 4096 条；容量压力可提前裁剪最旧已收尾任务。运行中的任务不会因 TTL 或数量裁剪。关闭 session 会先取消任务、释放 backend/follower；任务最终结果仍通过原 session ID + transfer ID 单项 GET 查询。单项 GET 的保留窗口独立于 session 历史，列表和重新订阅则要求所属 session 仍可查询。
+
+连接取得时通过 lease 一并持有整条链路的引用，由实际 backend/worker owner 幂等释放，释放绑定原条目而不是可复用的 pool key。连接断开由每个 SFTP client 自行观察，不依赖事件通知是否送达。关闭单个 SFTP session 不主动关闭共享 SSH transport，其他 subsystem 可继续使用；整个 SSH transport 断开时，关联 session 分别收尾。Shutdown 停止新建、并行关闭资源并等待实际 worker/清理 loop，超出预算返回错误，不把 `state=closed` 当作已完全释放。

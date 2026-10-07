@@ -106,7 +106,11 @@ func (s *Service) ExecContext(ctx context.Context, req ExecRequest) (Exec, error
 	}
 	now := time.Now().UTC()
 	s.mu.Lock()
-	if s.execCtx.Err() != nil {
+	if len(s.execActive) >= s.execPolicy.Active {
+		s.mu.Unlock()
+		return Exec{}, fmt.Errorf("%w: exec limit reached", ErrConflict)
+	}
+	if s.stopped || s.execCtx.Err() != nil {
 		s.mu.Unlock()
 		return Exec{}, fmt.Errorf("%w: exec service is shutting down", ErrConflict)
 	}
@@ -158,8 +162,8 @@ func (s *Service) ExecContext(ctx context.Context, req ExecRequest) (Exec, error
 		result, settled = runExec(runCtx, result, req, server, cfg, pool, dialOpts)
 	}
 	s.mu.Lock()
-	s.pruneExecsLocked()
 	s.execs[id] = result
+	s.pruneExecsLocked()
 	operation.result = result
 	s.mu.Unlock()
 	return result, nil
@@ -199,7 +203,7 @@ func failedExec(result Exec, err error, cfg config.RuntimeConfig) Exec {
 }
 
 func runExec(ctx context.Context, result Exec, req ExecRequest, server config.ServerProfile, cfg config.RuntimeConfig, pool *sshpool.Pool, dialOpts DialOptions) (Exec, <-chan struct{}) {
-	client, keys, _, err := pool.GetClientContext(ctx, server, cfg, nil, sshpool.DialOptions{
+	lease, err := pool.AcquireClientContext(ctx, server, cfg, nil, sshpool.DialOptions{
 		AgentSocket: dialOpts.AgentSocket, HostKeyPolicy: req.HostKeyPolicy, Timeout: dialOpts.Timeout,
 	})
 	if err != nil {
@@ -208,7 +212,7 @@ func runExec(ctx context.Context, result Exec, req ExecRequest, server config.Se
 		}
 		return failedExec(result, err, cfg), nil
 	}
-	pool.IncRef(keys...)
+	client := lease.Client
 	sshSession, err, settled := openExecSession(ctx, client)
 	if err != nil {
 		result = failedExec(result, err, cfg)
@@ -223,7 +227,7 @@ func runExec(ctx context.Context, result Exec, req ExecRequest, server config.Se
 	// Retain the reference until every worker has really exited, even if the
 	// bounded HTTP operation already returned a cleanup error.
 	released := make(chan struct{})
-	release := func() { pool.DecRef(keys...); close(released) }
+	release := func() { lease.Release(); close(released) }
 	select {
 	case <-settled:
 		release()
