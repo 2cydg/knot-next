@@ -91,3 +91,11 @@ go test ./...
 go build -o knot-core cmd/core/main.go
 go mod tidy
 ```
+
+Recent state, bounded OSC7 observation and explicit SFTP cd/pause/resume follow
+are implemented. Preserve success-only target history updates and raw PTY bytes.
+Agent authentication and forwarding share the platform dialing abstraction;
+Windows uses context-aware go-winio named pipes. File diagnostics have bounded
+rotation, redaction and explicit lifecycle ownership. For the B09–B11 batch the
+user explicitly deferred native non-Linux tests to CLI work; cross-build results
+must never be presented as native platform runtime validation.

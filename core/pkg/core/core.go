@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"runtime"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"knot-core/internal/logger"
 	"knot-core/pkg/config"
 	"knot-core/pkg/secret"
 	"knot-core/pkg/session"
@@ -41,6 +43,9 @@ type Service struct {
 	sshPool      *sshpool.Pool
 	events       *EventBus
 	shutdown     func()
+	logFile      *logger.File
+	probes       capabilityProbeCache
+	agentProbe   func(context.Context) (bool, string)
 }
 
 type statusCache struct {
@@ -53,19 +58,21 @@ func New(version string, startedAt time.Time) *Service {
 	if version == "" {
 		version = DefaultVersion
 	}
-	return &Service{version: version, startedAt: startedAt.UTC(), events: NewEventBus()}
+	return &Service{version: version, startedAt: startedAt.UTC(), events: NewEventBus(), agentProbe: sshpool.AgentCapability}
 }
 
 func (s *Service) UseConfig(configService *config.Service) {
 	s.capabilityMu.Lock()
 	defer s.capabilityMu.Unlock()
 	s.config = configService
+	s.invalidateCapabilityProbes()
 }
 
 func (s *Service) UseSecret(secretService *secret.Service) {
 	s.capabilityMu.Lock()
 	defer s.capabilityMu.Unlock()
 	s.secret = secretService
+	s.invalidateCapabilityProbes()
 }
 
 func (s *Service) UseSession(sessionService *session.Service) {
@@ -161,7 +168,35 @@ func (s *Service) SubscribeEvents() (<-chan Event, func(), error) {
 	return s.events.Subscribe()
 }
 
+func (s *Service) UseLogger(file *logger.File) {
+	s.capabilityMu.Lock()
+	defer s.capabilityMu.Unlock()
+	s.logFile = file
+}
 func (s *Service) PublishEvent(event Event) {
+	// Log only stable resource/state/error context; never event payloads.
+	state, _ := event.Data["state"].(string)
+	failure, _ := event.Data["error"].(string)
+	// SFTP historically carries a normal close cause in Event.Error.
+	normalClose := event.Type == "sftp.session.closed" && state == "closed"
+	failed := (failure != "" && !normalClose) || state == "failed" || state == "partial_failed"
+	if failure != "" || (!strings.Contains(event.Type, "progress") && !strings.Contains(event.Type, "cwd")) {
+		level := slog.LevelInfo
+		if failed {
+			level = slog.LevelWarn
+		}
+		args := []any{"resource", event.Resource, "resource_id", event.ResourceID, "state", state, "error", logger.Redact(failure)}
+		for _, key := range []string{"closed", "count", "active_sessions", "active_sftp_sessions"} {
+			if n, ok := event.Data[key]; ok {
+				args = append(args, key, n)
+			}
+		}
+		if failed || event.Type == "core.shutdown_started" {
+			logger.Diagnostic(level, event.Type, args...)
+		} else {
+			slog.Log(context.Background(), level, event.Type, args...)
+		}
+	}
 	s.events.Publish(event)
 }
 
@@ -389,9 +424,13 @@ type Health struct {
 }
 
 type HealthCheck struct {
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	Detail string `json:"detail,omitempty"`
+	Name        string   `json:"name"`
+	Supported   *bool    `json:"supported,omitempty"`
+	Available   *bool    `json:"available,omitempty"`
+	Reason      string   `json:"reason,omitempty"`
+	Limitations []string `json:"limitations,omitempty"`
+	Status      string   `json:"status"`
+	Detail      string   `json:"detail,omitempty"`
 }
 
 type HealthInput struct {
@@ -502,19 +541,47 @@ func checkSSHPool(pool *sshpool.Pool) HealthCheck {
 }
 
 type Capability struct {
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	Risk   string `json:"risk"`
+	Name        string   `json:"name"`
+	Supported   *bool    `json:"supported,omitempty"`
+	Available   *bool    `json:"available,omitempty"`
+	Reason      string   `json:"reason,omitempty"`
+	Limitations []string `json:"limitations,omitempty"`
+	Status      string   `json:"status"`
+	Risk        string   `json:"risk"`
 }
 
 func (s *Service) Capabilities() []Capability {
+	return s.CapabilitiesContext(context.Background())
+}
+
+func (s *Service) CapabilitiesContext(ctx context.Context) []Capability {
 	s.capabilityMu.RLock()
 	configAvailable := s.config != nil
 	secretAvailable := s.secret != nil
 	sessionAvailable := s.session != nil
 	sftpAvailable := s.sftp != nil
+	secretService := s.secret
+	configService := s.config
+	logFile := s.logFile
 	s.capabilityMu.RUnlock()
+	probe := s.capabilityProbes(ctx, configService, secretService)
+	agentAvailable, agentReason := probe.agentAvailable, probe.agentReason
+	supported := true
+	cryptoAvailable, cryptoReason := probe.cryptoAvailable, probe.cryptoReason
+	cryptoLimits := append([]string(nil), probe.cryptoLimits...)
+	logAvailable := logFile != nil && logFile.Err() == nil
+	logReason := ""
+	if logFile != nil && logFile.Redactor().Saturated() {
+		logAvailable = false
+		logReason = "redaction_saturated"
+	}
 	return []Capability{
+		{Name: "cwd_observe", Status: capabilityStatus(sessionAvailable), Risk: "READ_ONLY", Supported: &supported, Available: &sessionAvailable, Limitations: []string{"requires remote OSC7; no automatic shell hook"}},
+		{Name: "sftp_follow", Status: capabilityStatus(sftpAvailable && sessionAvailable), Risk: "REMOTE_READ", Limitations: []string{"explicit source session; manual cd pauses follow"}},
+		{Name: "ssh_agent", Status: "implemented", Risk: "READ_ONLY", Supported: &supported, Available: &agentAvailable, Reason: agentReason},
+		{Name: "agent_forwarding", Status: "implemented", Risk: "LONG_RUNNING", Supported: &supported, Available: &agentAvailable, Limitations: []string{"remote must accept forwarding; explicit setup failure fails session"}},
+		{Name: "crypto", Status: "implemented", Risk: "LOCAL_MUTATION", Available: &cryptoAvailable, Reason: cryptoReason, Limitations: cryptoLimits},
+		{Name: "file_log", Status: "implemented", Risk: "READ_ONLY", Available: &logAvailable, Reason: logReason},
 		{Name: "core", Status: "available", Risk: "READ_ONLY"},
 		{Name: "http_api", Status: "available", Risk: "READ_ONLY"},
 		{Name: "token_auth", Status: "available", Risk: "READ_ONLY"},

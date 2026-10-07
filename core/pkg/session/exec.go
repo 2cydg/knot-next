@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"knot-core/internal/keyutil"
+	"knot-core/internal/logger"
 	"knot-core/pkg/config"
 	"knot-core/pkg/sshpool"
 
@@ -168,7 +170,17 @@ func (s *Service) ExecContext(ctx context.Context, req ExecRequest) (Exec, error
 			key.Passphrase = req.Passphrase
 			cfg.Keys[server.KeyID] = key
 		}
-		result, settled = runExec(runCtx, result, req, server, cfg, pool, dialOpts)
+		result, settled = runExec(runCtx, result, req, server, cfg, pool, dialOpts, func() { recordUse(cfgProvider, server.ID) })
+	}
+	level := slog.LevelInfo
+	if result.FrameworkError != "" || result.ExitCode != 0 {
+		level = slog.LevelWarn
+	}
+	args := []any{"resource_id", id, "server_ref", req.ServerRef, "state", result.State, "reason", result.FrameworkCode, "error", result.FrameworkError, "exit_code", result.ExitCode}
+	if result.FrameworkError != "" || result.ExitCode != 0 {
+		logger.Diagnostic(level, "exec.finished", args...)
+	} else {
+		slog.Log(runCtx, level, "exec.finished", args...)
 	}
 	s.mu.Lock()
 	s.execs[id] = result
@@ -213,7 +225,7 @@ func failedExec(result Exec, err error, cfg config.RuntimeConfig) Exec {
 	return result
 }
 
-func runExec(ctx context.Context, result Exec, req ExecRequest, server config.ServerProfile, cfg config.RuntimeConfig, pool *sshpool.Pool, dialOpts DialOptions) (Exec, <-chan struct{}) {
+func runExec(ctx context.Context, result Exec, req ExecRequest, server config.ServerProfile, cfg config.RuntimeConfig, pool *sshpool.Pool, dialOpts DialOptions, onStarted ...func()) (Exec, <-chan struct{}) {
 	lease, err := pool.AcquireClientContext(ctx, server, cfg, nil, sshpool.DialOptions{
 		AgentSocket: dialOpts.AgentSocket, HostKeyPolicy: req.HostKeyPolicy, Timeout: dialOpts.Timeout,
 	})
@@ -233,7 +245,7 @@ func runExec(ctx context.Context, result Exec, req ExecRequest, server config.Se
 			result.CleanupError = "channel_open_pending"
 		}
 	} else {
-		result, settled = executeSSH(ctx, sshSession, result, cfg)
+		result, settled = executeSSH(ctx, sshSession, result, cfg, onStarted...)
 	}
 	// Retain the reference until every worker has really exited, even if the
 	// bounded HTTP operation already returned a cleanup error.
@@ -288,7 +300,7 @@ func openExecSession(ctx context.Context, client *ssh.Client) (*ssh.Session, err
 // after Run has drained both streams. Cancellation attempts a signal, then
 // closes this channel even when the server ignores signals. A stalled peer is
 // reported explicitly and the actual completion remains observable.
-func executeSSH(ctx context.Context, session *ssh.Session, result Exec, cfg config.RuntimeConfig) (Exec, <-chan struct{}) {
+func executeSSH(ctx context.Context, session *ssh.Session, result Exec, cfg config.RuntimeConfig, onStarted ...func()) (Exec, <-chan struct{}) {
 	stdout := &limitedWriter{limit: maxExecOutput}
 	stderr := &limitedWriter{limit: maxExecOutput}
 	session.Stdout, session.Stderr = stdout, stderr
@@ -298,7 +310,16 @@ func executeSSH(ctx context.Context, session *ssh.Session, result Exec, cfg conf
 			ran <- context.Cause(ctx)
 			return
 		}
-		ran <- session.Run(result.Command)
+		if err := session.Start(result.Command); err != nil {
+			ran <- err
+			return
+		}
+		for _, fn := range onStarted {
+			if fn != nil {
+				fn()
+			}
+		}
+		ran <- session.Wait()
 	}()
 	settled := make(chan struct{})
 	runErr, runReceived := waitExecResult(ctx, ran)

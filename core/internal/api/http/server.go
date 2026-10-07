@@ -176,7 +176,7 @@ func (s *Server) getCapabilities(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	if !requireMethod(w, r, stdhttp.MethodGet) {
 		return
 	}
-	response.JSON(w, stdhttp.StatusOK, s.core.Capabilities())
+	response.JSON(w, stdhttp.StatusOK, s.core.CapabilitiesContext(r.Context()))
 }
 
 func (s *Server) getRuntime(w stdhttp.ResponseWriter, r *stdhttp.Request) {

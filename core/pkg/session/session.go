@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -15,12 +14,12 @@ import (
 	"time"
 
 	"knot-core/internal/keyutil"
+	"knot-core/internal/logger"
 	"knot-core/internal/resourcepolicy"
 	"knot-core/pkg/config"
 	"knot-core/pkg/sshpool"
 
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
 )
 
 var (
@@ -137,6 +136,7 @@ type ListOptions struct {
 }
 
 type Resource struct {
+	ServerID        string            `json:"server_id,omitempty"`
 	ID              string            `json:"id"`
 	ServerRef       string            `json:"server_ref"`
 	Alias           string            `json:"alias,omitempty"`
@@ -155,6 +155,7 @@ type Resource struct {
 	ExitedAt        *time.Time        `json:"exited_at,omitempty"`
 	ExitCode        *int              `json:"exit_code,omitempty"`
 	FrameworkError  string            `json:"framework_error,omitempty"`
+	FrameworkCode   string            `json:"framework_code,omitempty"`
 	AttachURL       string            `json:"attach_url"`
 	EventsURL       string            `json:"events_url"`
 	HostKeyPending  bool              `json:"host_key_pending"`
@@ -976,6 +977,7 @@ func (s *Service) connectSession(ctx context.Context, id string, req CreateReque
 	s.mu.Lock()
 	if session, ok := s.sessions[id]; ok {
 		session.serverID = server.ID
+		session.ServerID = server.ID
 		if req.Alias != "" {
 			session.Alias = req.Alias
 		}
@@ -1027,6 +1029,8 @@ func (s *Service) attachBackend(id string, backend *interactiveBackend, poolKeys
 	}
 
 	s.publishSessionLocked(session, Event{Type: "session.connected", SessionID: id, State: session.State, Time: now})
+	provider, serverID := s.config, session.serverID
+	s.runLocked(session, func() { recordUse(provider, serverID) })
 }
 
 func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig, state string) {
@@ -1051,6 +1055,10 @@ func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig, st
 	session.UpdatedAt = now
 	session.ExitedAt = &now
 	session.FrameworkError = safeError(err, cfg)
+	if errors.Is(err, sshpool.ErrAgentForwarding) {
+		session.FrameworkCode = "agent_forwarding_unavailable"
+		session.ForwardAgent = false
+	}
 	// No credential candidate survives a failed connect attempt.
 	session.pendingCredentials = nil
 	session.hostKeyChallenge = nil
@@ -1160,8 +1168,12 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 		}
 		setSSHSessionEnvironment(sshSession, req.Env)
 		if req.ForwardAgent {
-			if err := setupAgentForwarding(client, sshSession, dialOpts.AgentSocket); err != nil {
-				s.publishError(sessionID, "agent forwarding setup failed: "+err.Error())
+			if err := sessionSetup(ownedCtx, sshSession, func() error {
+				return pool.ForwardAgent(ownedCtx, client, sshSession, dialOpts.AgentSocket, dialOpts.Timeout)
+			}); err != nil {
+				_ = sshSession.Close()
+				release()
+				return nil, nil, currentCfg, err
 			}
 		}
 		stdin, err := sshSession.StdinPipe()
@@ -1540,7 +1552,7 @@ func (s *Service) updateCurrentDir(id string, dir string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session, ok := s.sessions[id]
-	if !ok {
+	if !ok || isTerminalState(session.State) {
 		return
 	}
 	if session.CurrentDir == dir {
@@ -1649,6 +1661,8 @@ func (s *Service) commitOutcomeLocked(session *resource, outcome ExitOutcome) {
 }
 
 func (s *Service) publishSessionLocked(session *resource, event Event) {
+	event.Error = logger.Redact(event.Error)
+
 	if event.Time.IsZero() {
 		event.Time = s.policy.Now().UTC()
 	}
@@ -1668,6 +1682,18 @@ func (s *Service) publishSessionLocked(session *resource, event Event) {
 func (r *resource) snapshot() Resource {
 	out := r.Resource
 	out.Env = cloneEnv(out.Env)
+	if out.CWDUpdatedAt != nil {
+		t := *out.CWDUpdatedAt
+		out.CWDUpdatedAt = &t
+	}
+	if out.ExitedAt != nil {
+		t := *out.ExitedAt
+		out.ExitedAt = &t
+	}
+	if out.ExitCode != nil {
+		code := *out.ExitCode
+		out.ExitCode = &code
+	}
 	if r.hostKeyChallenge != nil {
 		out.HostKeyPending = r.hostKeyChallenge.Challenge.Pending
 	}
@@ -1961,7 +1987,7 @@ func safeError(err error, cfg any) string {
 	if err == nil {
 		return ""
 	}
-	msg := err.Error()
+	msg := logger.Redact(err.Error())
 	if runtimeCfg, ok := cfg.(config.RuntimeConfig); ok {
 		for _, secret := range runtimeSecrets(runtimeCfg) {
 			msg = strings.ReplaceAll(msg, secret, "[redacted]")
@@ -2079,92 +2105,63 @@ func hostKeyRisk(changed bool) string {
 	return "REMOTE_TRUST"
 }
 
-func setupAgentForwarding(client *ssh.Client, session *ssh.Session, agentSocket string) error {
-	socket := agentSocket
-	if socket == "" {
-		socket = os.Getenv("SSH_AUTH_SOCK")
-	}
-	if socket == "" {
-		return errors.New("SSH_AUTH_SOCK is not set")
-	}
-	conn, err := net.Dial("unix", socket)
-	if err != nil {
-		return err
-	}
-	keyring := agent.NewClient(conn)
-	if err := agent.ForwardToAgent(client, keyring); err != nil {
-		_ = conn.Close()
-		return err
-	}
-	if err := agent.RequestAgentForwarding(session); err != nil {
-		_ = conn.Close()
-		return err
-	}
-	return nil
-}
-
 const (
 	osc7Prefix    = "\x1b]7;"
 	osc7MaxBuffer = 4096
 )
 
 type osc7Parser struct {
-	buf []byte
+	buf     []byte
+	prefix  int
+	active  bool
+	escape  bool
+	discard bool
 }
 
 func (p *osc7Parser) Observe(data []byte) ([]byte, []string, int) {
-	if len(data) == 0 {
-		return nil, nil, -1
-	}
-	p.buf = append(p.buf, data...)
-	if len(p.buf) > osc7MaxBuffer {
-		copy(p.buf, p.buf[len(p.buf)-osc7MaxBuffer:])
-		p.buf = p.buf[:osc7MaxBuffer]
-	}
 	var paths []string
-	for {
-		start := strings.Index(string(p.buf), osc7Prefix)
-		if start < 0 {
-			return data, paths, -1
+	for _, b := range data {
+		if !p.active {
+			if b == osc7Prefix[p.prefix] {
+				p.prefix++
+			} else if b == osc7Prefix[0] {
+				p.prefix = 1
+			} else {
+				p.prefix = 0
+			}
+			if p.prefix == len(osc7Prefix) {
+				p.active = true
+				p.prefix = 0
+				p.buf = p.buf[:0]
+				p.escape = false
+				p.discard = false
+			}
+			continue
 		}
-		if start > 0 {
-			p.buf = p.buf[start:]
+		if b == '\a' || (p.escape && b == '\\') {
+			if !p.discard {
+				payload := p.buf
+				if p.escape && b == '\\' {
+					payload = payload[:len(payload)-1]
+				}
+				if dir := parseOSC7Payload(string(payload)); dir != "" {
+					paths = append(paths, dir)
+				}
+			}
+			p.active = false
+			p.escape = false
+			p.buf = p.buf[:0]
+			continue
 		}
-		payloadStart := len(osc7Prefix)
-		payloadEnd, terminatorLen, ok := findOSCTerminatorBytes(p.buf[payloadStart:])
-		if !ok {
-			return data, paths, -1
+		if len(p.buf) >= osc7MaxBuffer {
+			p.discard = true
 		}
-		payload := string(p.buf[payloadStart : payloadStart+payloadEnd])
-		if dir := parseOSC7Payload(payload); dir != "" {
-			paths = append(paths, dir)
+		if !p.discard {
+			p.buf = append(p.buf, b)
 		}
-		p.buf = p.buf[payloadStart+payloadEnd+terminatorLen:]
+		p.escape = b == '\x1b'
 	}
-}
-
-func findOSCTerminatorBytes(s []byte) (idx int, terminatorLen int, ok bool) {
-	bel := -1
-	st := -1
-	for i, b := range s {
-		if bel < 0 && b == '\a' {
-			bel = i
-		}
-		if st < 0 && b == '\x1b' && i+1 < len(s) && s[i+1] == '\\' {
-			st = i
-		}
-		if bel >= 0 || st >= 0 {
-			break
-		}
-	}
-	switch {
-	case bel < 0 && st < 0:
-		return 0, 0, false
-	case bel >= 0 && (st < 0 || bel < st):
-		return bel, 1, true
-	default:
-		return st, 2, true
-	}
+	return data, paths, -1
 }
 
 func parseOSC7Payload(payload string) string {
@@ -2175,7 +2172,7 @@ func parseOSC7Payload(payload string) string {
 	if err != nil {
 		return ""
 	}
-	if u.Scheme != "file" || u.Path == "" || !strings.HasPrefix(u.Path, "/") {
+	if u.Scheme != "file" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path == "" || !strings.HasPrefix(u.Path, "/") || strings.ContainsAny(u.Path, "\x00\x1b\r\n") {
 		return ""
 	}
 	return cleanSlashPath(u.Path)

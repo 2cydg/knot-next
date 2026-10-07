@@ -186,8 +186,8 @@ The following issues are documented for future phases:
 - **P0**: SSH/SFTP async session state handling
 - **P0**: SFTP transfer event completion detection
 - **P0**: exec command timeout alignment
-- **P1**: SFTP directory following
+- SFTP directory follow is implemented with explicit pause/resume and access validation.
 - **P1**: Legacy config migration platform compatibility
-- **P1**: Windows Agent support
+- Windows Agent code is implemented; native runtime testing is deferred to CLI integration.
 
 These will be addressed in M1-M2 phases. See project documentation for details.

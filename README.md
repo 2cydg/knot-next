@@ -92,3 +92,11 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Contributing
 
 See [AGENTS.md](AGENTS.md) for development guidelines and architecture details.
+
+Recent target history (`state.json`), bounded OSC7 observation and explicit SFTP
+follow control are available. SSH Agent supports Unix sockets and Windows named
+pipes; file logs use redaction and bounded rotation. Linux protocol/HTTP/process
+and race validation is complete for this batch. Native macOS/Windows Agent,
+credential-store and terminal validation is deferred to CLI integration under
+user authorization. See [API docs](core/docs/api/README.md) and
+[acceptance evidence](core/docs/baseline-acceptance.md).

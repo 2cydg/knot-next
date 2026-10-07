@@ -5,18 +5,19 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	stdhttp "net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	apihttp "knot-core/internal/api/http"
 	"knot-core/internal/auth"
 	"knot-core/internal/lifecycle"
+	"knot-core/internal/logger"
 	"knot-core/internal/paths"
 	coreruntime "knot-core/internal/runtime"
 	"knot-core/pkg/config"
@@ -39,7 +40,7 @@ const (
 
 func main() {
 	if err := run(); err != nil {
-		log.Fatal(err)
+		log.Fatal(logger.Redact(err.Error()))
 	}
 }
 
@@ -87,7 +88,7 @@ func run() error {
 	}
 
 	// Setup signal handling
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals()...)
 	defer stop()
 
 	// Start the service. Shutdown of the shared resources happens inside the
@@ -96,7 +97,7 @@ func run() error {
 		return fmt.Errorf("start service: %w", err)
 	}
 
-	log.Printf("knot-core started successfully")
+	logger.Diagnostic(slog.LevelInfo, "knot-core started successfully")
 
 	// Wait for the single teardown flow to finish. It is triggered by the
 	// authenticated shutdown API, by SIGINT/SIGTERM, or by a serve error, and it
@@ -107,7 +108,6 @@ func run() error {
 		return fmt.Errorf("shutdown: %w", err)
 	}
 
-	log.Printf("knot-core stopped")
 	return nil
 }
 
@@ -121,13 +121,38 @@ func prepareServices(
 	origins string,
 	runtimeInfo *coreruntime.Holder,
 	connTracker *apihttp.ConnTracker,
-) (stdhttp.Handler, error) {
+) (handler stdhttp.Handler, resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			logger.Diagnostic(slog.LevelError, "core.prepare_failed", "error", logger.Redact(resultErr.Error()))
+		}
+	}()
+	file, err := logger.Open(layout.LogPath, logger.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("initialize file logger: %w", err)
+	}
+	previous := slog.Default()
+	previousWriter, previousFlags := log.Writer(), log.Flags()
+	previousRedactor := logger.DefaultRedactor()
+	logger.UseRedactor(file.Redactor())
+	slog.SetDefault(file.Logger().With("instance_id", env.InstanceID))
+	logger.Diagnostic(slog.LevelInfo, "core.starting")
+	env.OnCleanup(func(context.Context) error {
+		logger.Diagnostic(slog.LevelInfo, "core.stopped")
+		err := file.Close()
+		slog.SetDefault(previous)
+		log.SetOutput(previousWriter)
+		log.SetFlags(previousFlags)
+		logger.UseRedactor(previousRedactor)
+		return err
+	})
 	token, err := auth.TokenStore{Path: layout.TokenPath}.LoadOrCreate()
 	if err != nil {
 		return nil, fmt.Errorf("load token: %w", err)
 	}
 	// Discovery reports the token that actually exists, not a placeholder.
 	env.SetTokenPresent(token != "")
+	file.Redactor().Add(token)
 
 	if err := config.RecoverBootstrap(layout); err != nil {
 		return nil, fmt.Errorf("recover crypto bootstrap: %w", err)
@@ -140,6 +165,15 @@ func prepareServices(
 	configService := config.NewService(layout, cryptoProvider)
 	if err := configService.Initialize(); err != nil {
 		return nil, fmt.Errorf("open configuration: %w", err)
+	}
+	settings, err := configService.RuntimeConfig()
+	if err != nil {
+		return nil, fmt.Errorf("load runtime configuration: %w", err)
+	}
+	var level slog.Level
+	if err = level.UnmarshalText([]byte(settings.Settings.LogLevel)); err == nil {
+		// The handler observes level changes through its shared LevelVar.
+		file.SetLevel(level)
 	}
 	secretService := secret.NewService(configService, cryptoProvider)
 	sharedPool := sshpool.NewPool()
@@ -155,6 +189,7 @@ func prepareServices(
 	sftpService.StartMaintenance(env.Context)
 
 	coreService := core.New(core.DefaultVersion, startedAt)
+	coreService.UseLogger(file)
 	coreService.UseConfig(configService)
 	coreService.UseSecret(secretService)
 	coreService.UseSession(sessionService)
@@ -174,6 +209,7 @@ func prepareServices(
 		return nil
 	})
 
+	logger.Diagnostic(slog.LevelInfo, "core.services_ready")
 	return apihttp.NewServer(
 		coreService,
 		runtimeInfo,

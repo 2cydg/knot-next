@@ -534,6 +534,7 @@ func TestReviewPoolCloseEndsInFlightAttempt(t *testing.T) {
 	server, _ := startSilentServer(t)
 	cfg := testRuntimeConfig(server)
 	pool := NewPool()
+	t.Cleanup(func() { pool.CloseAll() })
 
 	done := make(chan error, 1)
 	go func() {
@@ -544,7 +545,9 @@ func TestReviewPoolCloseEndsInFlightAttempt(t *testing.T) {
 		done <- err
 	}()
 
-	waitFor(t, 2*time.Second, func() bool {
+	// Allow scheduler headroom during parallel full-suite runs. This observes
+	// setup only; the shutdown completion budget below remains five seconds.
+	waitFor(t, 10*time.Second, func() bool {
 		pool.mu.Lock()
 		defer pool.mu.Unlock()
 		return len(pool.inflight) > 0

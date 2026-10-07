@@ -303,3 +303,13 @@ SSH/SFTP 终态历史默认各保留 10 分钟、最多 1024 条；Transfer/exec
 全局 `/v1/events` 最多 64 个订阅，超限或总线已关闭时返回 `409 EVENT_SUBSCRIPTION_UNAVAILABLE`。资源级订阅限额见 sessions/sftp 文档。
 
 关闭响应的预算只限制调用者等待时间，不强制结束后台收尾。远端或底层 I/O 阻塞时，终态记录可能长期占用待释放额度，连接 lease 的引用直到实际收尾结束才归还；超时不会提前归还引用，也不会把终态裁剪成已释放资源。统一 Shutdown 同时关闭 pooled transport 以促使协议等待退出，仍未退出的工作按预算报告错误。多个资源类别共享同一预算，某类报告预算耗尽不必然表示该类仍有资源存活。
+
+## 局部能力与文件诊断（2026-10-08）
+
+既有 capability 名称/status 含义保留；新增 `cwd_observe`、`sftp_follow`、`ssh_agent`、`agent_forwarding`、`crypto`、`file_log`。新增可选字段 `supported`、`available`、`reason`、`limitations`。新增 Agent/crypto/log 条目的 `status=implemented` 表示已有实现，当前可用性应读 `available`，不能只看 status 或服务对象是否非 nil。
+
+Agent 支持 Unix socket 和 Windows named pipe；`ssh_agent.available` 来自有界只读公钥列表探测，原因可为 `agent_unavailable`/`agent_empty`，不执行签名。Agent 和配置解密探测使用 1 秒 TTL 缓存，并发查询共享探测；HTTP 取消会结束 Agent I/O/等待且取消结果不入缓存。配置/secret service 替换立即使缓存失效；文件内容或默认 Agent endpoint 外部变化最多延迟一个 TTL 反映。同步配置解密已开始后无法被 context 中断。这个探测代表默认 endpoint 状态，指定其他 endpoint 或实际认证签名/远端请求仍可能失败。`agent_forwarding` 同时要求 session setup 成功与远端允许。Crypto 报告 provider/fallback 范围及当前配置解密健康；文件日志写入失败使 `file_log.available=false`。脱敏注册表达到 4096 个值或 4 MiB 预算后继续保守屏蔽全部自由文本，`file_log.available=false`、`reason=redaction_saturated`；后续写入的每条日志带固定 `redaction_status=saturated` 字段，重启实例重建注册表。CWD limitations 明确要求远端 OSC7，自动 hook 后置。
+
+runtime `log_path` 是实际文件日志，默认 `<StateDir>/log/core.log`，JSON lines；单文件 10 MiB，最多 `.1`–`.3` 三份历史。启动/就绪/关闭、资源状态和错误、配置/导入错误留有 instance ID/资源上下文；普通成功资源事件和成功 `exec.finished` 按启动配置 `log_level` 过滤；关键进程生命周期、资源/exec 失败和 API/config 错误诊断始终保留。因此 `log_level=error` 仍可能有最低生命周期 Info/失败 Warn 记录。修改 `log_level` 在下次 core 启动生效。
+
+日志不记录命令正文、PTY payload、文件内容或完整请求。token、password、passphrase、私钥、Authorization 和代理认证 URL统一脱敏。Unix 目录 0700/文件 0600；Windows 设置仅当前用户完整访问的 protected DACL。关闭先收尾业务资源，再 Sync/Close 日志；初始化日志失败会中止启动并释放单实例锁。日志 tail/follow API 后置。

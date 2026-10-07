@@ -526,3 +526,25 @@ Transfer 最多 4096 个 queued/running/待收尾 worker。终态结果从 `comp
 ## 有口令私钥（B07）
 
 SFTP 与 SSH 使用相同的 signer 构建和 attempt-only passphrase。`allow_auth_retry=true` 时，`GET /v1/sftp/{id}/challenges/auth` 的 `passphrase_required=true` 表示需要私钥口令；POST 到该地址可只传 `passphrase`。错误口令再次 challenge，正确口令完成 SSH 认证及 subsystem 打开后进入 open。`remember` 不持久化 passphrase。
+
+## CWD follow 与 control（2026-10-08）
+
+SFTP session 新增 `server_id`、`follow_state`、`follow_error`、`cwd_updated_at`。`current_dir` 是 SFTP 业务目录，SSH 的 OSC7 是独立来源状态；follow 通过 `follow_session_id` 显式关联，源与目标必须解析为相同服务器。多个 SSH 会话不会隐式选第一个。创建时 `current_dir=/` 是初始业务目录，`cwd_updated_at` 省略，表示尚未提交一次经访问校验的 cd/follow；来源目录要等 subsystem open 并校验成功后才提交。客户端结合 session state、`cwd_updated_at` 和 `follow_error` 判断是否已完成跟随，不把 connecting 阶段的 `/` 当成已验证的远端目录。
+
+新增 `POST /v1/sftp/{id}/control`，成功返回 session view：
+
+```json
+{"op":"cd","path":"/var/log"}
+```
+
+| op | 行为 |
+| --- | --- |
+| `cd` | 校验目录存在且可列出后更新 SFTP CWD，相对路径按当前 SFTP CWD 解析；有有效 follow 时自动暂停。即使目录验证失败，也暂停 follow，避免用户操作被旧观察覆盖。 |
+| `pause-follow` | 保留关联、最后目录和源订阅；后续观察不更新 SFTP CWD。 |
+| `resume-follow` | 从关联 SSH session GET 最新目录并重新验证，成功后立即跟随；源未知目录时保持旧值。 |
+
+无 follow 的暂停/恢复、已失效来源和未 open 的 session 返回 `409 CONFLICT`；无效 op/path、目录不可访问返回 `400 VALIDATION_FAILED`。不存在的 session 为 `404 NOT_FOUND`。
+
+`follow_state` 为 `active`、`paused` 或 `invalid`；未关联时省略。每次跟随先绕过目录缓存执行实际读取权限校验。本地测试后端读取至多一个条目；远端目前使用库的完整 `ReadDirContext`（取消随服务退出，关闭客户端也终止 I/O），省去 Entry 构造、排序和分页。`Stat` 只能确认路径类型，无法证明可列出；现有库未公开目录句柄或限量读取接口，因此远端大目录的全量读取开销仍保留。失败保留最后可用目录，`follow_error=directory_unavailable`，发布 `sftp.cwd.follow_error`；有效的新观察/恢复成功清除错误。关闭源会停止 follower，保持最后目录，`follow_state=invalid` 并发布 `sftp.follow.invalidated`，不能恢复该关联。
+
+相关事件：`sftp.cwd.changed`、`sftp.cwd.follow`、`sftp.cwd.follow_error`、`sftp.follow.paused`、`sftp.follow.invalidated`。事件有界，恢复以 session GET 为准。源停止时不会将目录重置到 `/`。本轮不自动注入 shell hook，也不使用客户端默认本地目录设置改变 core cwd。

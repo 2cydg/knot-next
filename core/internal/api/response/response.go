@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"time"
+
+	"knot-core/internal/logger"
 )
 
 type Risk string
@@ -49,6 +51,15 @@ func JSON(w http.ResponseWriter, status int, data any) {
 }
 
 func JSONError(w http.ResponseWriter, status int, err Error) {
+	err.Message = logger.Redact(err.Message)
+	err.SuggestedAction = logger.Redact(err.SuggestedAction)
+	if err.Details != nil {
+		details, ok := logger.DefaultRedactor().Value("details", err.Details).(map[string]any)
+		if !ok {
+			details = map[string]any{"reason": "details_unavailable"}
+		}
+		err.Details = details
+	}
 	if err.Risk == "" {
 		err.Risk = RiskReadOnly
 	}

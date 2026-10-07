@@ -92,6 +92,12 @@ func UnwrapBootstrapProvider(provider Provider) Provider {
 	return provider
 }
 
-func (p *BootstrapProvider) Available() bool       { return p.selected.Available() }
-func (p *BootstrapProvider) Limitations() []string { return p.selected.Limitations() }
-func (p *BootstrapProvider) Layout() paths.Layout  { return p.layout }
+func (p *BootstrapProvider) Available() bool { return p.selected.Available() }
+func (p *BootstrapProvider) Limitations() []string {
+	out := append([]string(nil), p.selected.Limitations()...)
+	if p.reason != "" {
+		out = append(out, "preferred platform credential store unavailable; using legacy fallback")
+	}
+	return out
+}
+func (p *BootstrapProvider) Layout() paths.Layout { return p.layout }

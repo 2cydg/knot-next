@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net/url"
 	"os"
@@ -16,8 +17,10 @@ import (
 
 	"knot-core/internal/fileutil"
 	"knot-core/internal/keyutil"
+	"knot-core/internal/logger"
 	"knot-core/internal/paths"
 	"knot-core/pkg/crypto"
+	"knot-core/pkg/recent"
 
 	"github.com/BurntSushi/toml"
 )
@@ -54,12 +57,14 @@ type Service struct {
 	revision       string
 	modified       time.Time
 	unknown        bool
+	recent         *recent.Service
 }
 
 func NewService(layout paths.Layout, provider crypto.Provider) *Service {
 	return &Service{
 		path:      filepath.Join(layout.ConfigDir, "config.toml"),
 		layout:    layout,
+		recent:    recent.New(layout, nil),
 		crypto:    provider,
 		writeFile: fileutil.AtomicWriteFile,
 	}
@@ -219,18 +224,19 @@ type SettingValue struct {
 }
 
 type ServerProfileView struct {
-	ID             string   `json:"id"`
-	Alias          string   `json:"alias"`
-	Host           string   `json:"host"`
-	Port           int      `json:"port"`
-	User           string   `json:"user"`
-	AuthMethod     string   `json:"auth_method,omitempty"`
-	PasswordSet    bool     `json:"password_set"`
-	KeyID          string   `json:"key_id,omitempty"`
-	KnownHostsPath string   `json:"known_hosts_path,omitempty"`
-	ProxyID        string   `json:"proxy_id,omitempty"`
-	JumpHostIDs    []string `json:"jump_host_ids,omitempty"`
-	Tags           []string `json:"tags,omitempty"`
+	LastUsed       *time.Time `json:"last_used"`
+	ID             string     `json:"id"`
+	Alias          string     `json:"alias"`
+	Host           string     `json:"host"`
+	Port           int        `json:"port"`
+	User           string     `json:"user"`
+	AuthMethod     string     `json:"auth_method,omitempty"`
+	PasswordSet    bool       `json:"password_set"`
+	KeyID          string     `json:"key_id,omitempty"`
+	KnownHostsPath string     `json:"known_hosts_path,omitempty"`
+	ProxyID        string     `json:"proxy_id,omitempty"`
+	JumpHostIDs    []string   `json:"jump_host_ids,omitempty"`
+	Tags           []string   `json:"tags,omitempty"`
 }
 
 type ProxyProfileView struct {
@@ -319,7 +325,9 @@ func (s *Service) Summary() (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
-	return summaryFromConfig(cfg, s.metadataFor(cfg)), nil
+	out := summaryFromConfig(cfg, s.metadataFor(cfg))
+	out.Servers = s.serverViewsWithRecent(cfg)
+	return out, nil
 }
 
 func (s *Service) Metadata() (Metadata, error) {
@@ -406,7 +414,7 @@ func (s *Service) ListServers() ([]ServerProfileView, error) {
 	if err != nil {
 		return nil, err
 	}
-	return serverViews(cfg), nil
+	return s.serverViewsWithRecent(cfg), nil
 }
 
 func (s *Service) ListServersPage(opts ServerListOptions) (Page[ServerProfileView], error) {
@@ -414,7 +422,8 @@ func (s *Service) ListServersPage(opts ServerListOptions) (Page[ServerProfileVie
 	if err != nil {
 		return Page[ServerProfileView]{}, err
 	}
-	items := filterServerViews(serverViews(cfg), opts)
+	views := s.serverViewsWithRecent(cfg)
+	items := filterServerViews(views, opts)
 	total := len(items)
 	limit := opts.Limit
 	if limit <= 0 {
@@ -451,7 +460,7 @@ func (s *Service) GetServer(id string) (ServerProfileView, error) {
 	if !ok {
 		return ServerProfileView{}, ErrNotFound
 	}
-	return serverView(server), nil
+	return s.serverViewWithRecent(cfg, server), nil
 }
 
 func (s *Service) CreateServer(server ServerProfile) (ServerProfileView, error) {
@@ -507,7 +516,7 @@ func (s *Service) UpdateServer(id string, server ServerProfile) (ServerProfileVi
 }
 
 func (s *Service) DeleteServer(id string) error {
-	return s.withConfig(func(cfg *Config) error {
+	err := s.withConfig(func(cfg *Config) error {
 		if _, ok := cfg.Servers[id]; !ok {
 			return ErrNotFound
 		}
@@ -521,6 +530,19 @@ func (s *Service) DeleteServer(id string) error {
 		delete(cfg.Servers, id)
 		return nil
 	})
+
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err = s.loadLocked(); err != nil {
+		return err
+	}
+	if err = s.recent.Prune(validServers(s.cfg), s.cfg.Settings.RecentLimit); err != nil {
+		logger.Diagnostic(slog.LevelWarn, "recent history prune failed", "resource_id", id, "error", err)
+	}
+	return nil
 }
 
 func (s *Service) ResolveServer(ref string) (ServerProfileView, error) {
@@ -529,11 +551,12 @@ func (s *Service) ResolveServer(ref string) (ServerProfileView, error) {
 		return ServerProfileView{}, err
 	}
 	if server, ok := cfg.Servers[ref]; ok {
-		return serverView(server), nil
+		return s.serverViewWithRecent(cfg, server), nil
 	}
-	for _, server := range cfg.Servers {
-		if server.Alias == ref {
-			return serverView(server), nil
+	// Stable alias order, while an exact ID always wins over an alias collision.
+	for _, view := range serverViews(cfg) {
+		if view.Alias == ref {
+			return s.serverViewWithRecent(cfg, cfg.Servers[view.ID]), nil
 		}
 	}
 	return ServerProfileView{}, ErrNotFound
@@ -542,9 +565,11 @@ func (s *Service) ResolveServer(ref string) (ServerProfileView, error) {
 func (s *Service) RuntimeConfig() (RuntimeConfig, error) {
 	cfg, err := s.snapshot()
 	if err != nil {
+		logger.RegisterSecrets(cfg)
 		return RuntimeConfig{}, err
 	}
 	if err := s.decryptRuntimeSecrets(&cfg); err != nil {
+		logger.RegisterSecrets(cfg)
 		return RuntimeConfig{}, err
 	}
 	for id, server := range cfg.Servers {
@@ -553,6 +578,7 @@ func (s *Service) RuntimeConfig() (RuntimeConfig, error) {
 			cfg.Servers[id] = server
 		}
 	}
+	logger.RegisterSecrets(cfg)
 	return RuntimeConfig{
 		Settings:      cfg.Settings,
 		Servers:       cfg.Servers,
@@ -1189,6 +1215,7 @@ func (s *Service) loadLocked() error {
 		cfg.UpdatedAt = info.ModTime().UTC()
 	}
 
+	logger.RegisterSecrets(cfg)
 	s.cfg = cfg
 	s.modified = cfg.UpdatedAt
 	s.loaded = true
@@ -1508,6 +1535,9 @@ func serverViews(cfg Config) []ServerProfileView {
 		views = append(views, serverView(server))
 	}
 	sort.Slice(views, func(i, j int) bool {
+		if views[i].Alias == views[j].Alias {
+			return views[i].ID < views[j].ID
+		}
 		return views[i].Alias < views[j].Alias
 	})
 	return views
@@ -1652,6 +1682,23 @@ func filterServerViews(items []ServerProfileView, opts ServerListOptions) []Serv
 		out = append(out, item)
 	}
 	switch opts.Sort {
+	case "recent":
+		sort.SliceStable(out, func(i, j int) bool {
+			a, b := out[i].LastUsed, out[j].LastUsed
+			if a == nil && b != nil {
+				return false
+			}
+			if a != nil && b == nil {
+				return true
+			}
+			if a != nil && b != nil && !a.Equal(*b) {
+				return a.After(*b)
+			}
+			if out[i].Alias == out[j].Alias {
+				return out[i].ID < out[j].ID
+			}
+			return out[i].Alias < out[j].Alias
+		})
 	case "host":
 		sort.SliceStable(out, func(i, j int) bool {
 			if out[i].Host == out[j].Host {
@@ -1662,7 +1709,12 @@ func filterServerViews(items []ServerProfileView, opts ServerListOptions) []Serv
 	case "created", "id":
 		sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	default:
-		sort.SliceStable(out, func(i, j int) bool { return out[i].Alias < out[j].Alias })
+		sort.SliceStable(out, func(i, j int) bool {
+			if out[i].Alias == out[j].Alias {
+				return out[i].ID < out[j].ID
+			}
+			return out[i].Alias < out[j].Alias
+		})
 	}
 	return out
 }

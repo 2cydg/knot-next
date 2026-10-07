@@ -92,6 +92,7 @@ type DialOptions struct {
 }
 
 type Pool struct {
+	forwardAgents      map[*ssh.Client]string
 	workers            resourcepolicy.Group
 	callbacks          resourcepolicy.Callbacks
 	mu                 sync.Mutex
@@ -1000,7 +1001,7 @@ func dial(ctx context.Context, server config.ServerProfile, cfg config.RuntimeCo
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	auth, closer, err := authMethods(server, cfg, opts)
+	auth, closer, err := authMethodsContext(ctx, server, cfg, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -1042,7 +1043,7 @@ func dial(ctx context.Context, server config.ServerProfile, cfg config.RuntimeCo
 	ncc, chans, reqs, err := ssh.NewClientConn(conn, addr, clientConfig)
 	if err != nil {
 		_ = conn.Close()
-		if strings.Contains(err.Error(), "ssh: unable to authenticate") {
+		if strings.Contains(err.Error(), "ssh: unable to authenticate") || (server.AuthMethod == config.AuthMethodAgent && strings.Contains(err.Error(), "failed to sign")) {
 			return nil, &AuthError{
 				FailedMethod:   server.AuthMethod,
 				AllowedMethods: nil,
@@ -1064,6 +1065,9 @@ func dial(ctx context.Context, server config.ServerProfile, cfg config.RuntimeCo
 }
 
 func authMethods(server config.ServerProfile, cfg config.RuntimeConfig, opts DialOptions) ([]ssh.AuthMethod, io.Closer, error) {
+	return authMethodsContext(context.Background(), server, cfg, opts)
+}
+func authMethodsContext(ctx context.Context, server config.ServerProfile, cfg config.RuntimeConfig, opts DialOptions) ([]ssh.AuthMethod, io.Closer, error) {
 	switch server.AuthMethod {
 	case config.AuthMethodPassword:
 		if server.Password == "" {
@@ -1115,21 +1119,21 @@ func authMethods(server config.ServerProfile, cfg config.RuntimeConfig, opts Dia
 				Err:            fmt.Errorf("%w: SSH_AUTH_SOCK is not set", ErrAuthFailed),
 			}
 		}
-		conn, err := dialAgent(socket)
+		conn, err := openAgent(ctx, socket, opts.Timeout)
 		if err != nil {
 			return nil, nil, &AuthError{
 				FailedMethod:   config.AuthMethodAgent,
 				AllowedMethods: []string{config.AuthMethodPassword, config.AuthMethodKey, config.AuthMethodAgent},
-				Err:            fmt.Errorf("%w: connect ssh agent: %v", ErrAuthFailed, err),
+				Err:            fmt.Errorf("%w: ssh agent unavailable", ErrAuthFailed),
 			}
 		}
 		signers, err := agent.NewClient(conn).Signers()
-		if err != nil {
+		if err != nil || len(signers) == 0 {
 			_ = conn.Close()
 			return nil, nil, &AuthError{
 				FailedMethod:   config.AuthMethodAgent,
 				AllowedMethods: []string{config.AuthMethodPassword, config.AuthMethodKey, config.AuthMethodAgent},
-				Err:            fmt.Errorf("%w: list ssh agent signers: %v", ErrAuthFailed, err),
+				Err:            fmt.Errorf("%w: ssh agent has no usable signers", ErrAuthFailed),
 			}
 		}
 		return []ssh.AuthMethod{ssh.PublicKeys(signers...)}, conn, nil

@@ -314,3 +314,15 @@ go vet ./...
 完整测试通过，受影响包一次完整 race 及新增用例五次 race 通过，无 race 报告；最终 metadata/presence/SourcePath/已有 provider 启动只读/recent_limit 默认值与整数校验检查另跑 config/crypto/paths race，通过。`git diff --check` 和 Linux/macOS/Windows × amd64/arm64 的六目标 `CGO_ENABLED=0 go build ./cmd/core` 通过。日志在 `/tmp/knot-b07-b08-{delivery-all,race,final-race,followup-race}.log`，构建产物在 `/tmp/knot-b07-b08-core-*`。
 
 按本轮用户许可，macOS Keychain / Windows DPAPI 原生同账号互操作未运行；交叉构建不替代 B10/B12 平台验收。JSON 显式导入未实现，明确拒绝且保留来源。原 state.json/ID/trust 已复用；recent 成功回调在 B09 接入，额外 TOML 导入不自动搬移或合并历史和信任。SourcePath/fingerprint/encrypted 扩展可由新 core 保存，旧 loader 忽略字段，旧版不能使用 SourcePath-only key。forwards 仍 planned，客户端偏好未提前拆分。无新增依赖，旧项目未修改，未 Git 提交。
+
+## B09–B11：客户端数据、Agent 与日志（2026-10-08）
+
+本轮实现与 Linux 受控验收完成；完整证据见 [完成报告](../../../docs/running/B09-B11-completion-report.md)，开工前计划见 [实施计划](../../../docs/running/B09-B11-implementation-plan.md)。工作区基线 `2c6e1b82cfcf70463857c679717d1e81b7b240fd`，未提交。
+
+最近使用沿用旧 state.json，真实目标成功节点更新、跳板/失败不更新；last_used/排序和 server_id 候选可供客户端使用。OSC7 有界旁路观察保留 PTY bytes；SFTP control 明确 cd/pause/resume，目录访问校验和源关闭失效可查询。Unix/Windows Agent 共用 context 拨号，认证连接临时持有、forwarding handler 按共享 client 持有，显式 setup 失败有 typed 状态。文件日志实际落盘、权限、脱敏、有限历史与明确关闭已接入。
+
+Linux 全量测试、相关 race/跨包 cover（profile 合计 79.9%，重点函数单独审阅）、两组定向 20 次 race、vet 和六目标构建均通过。实际进程日志检测了 runtime LogPath、instance ID、最低生命周期记录、配置/导入失败和 token/password sentinel；Agent 验证真实远端签名与资源回收；follow 通过公开 API 和真实 SSH/SFTP 验证。
+
+用户本轮明确不要求其他平台原生单元测试，Windows/macOS 代码逻辑审核与交叉构建完成，原生 Agent/凭据库/ACL/终端测试留到 CLI。用户明确授权后，两个真实 SSH 端点的显式 OSC7、strict SFTP follow、暂停/恢复与源关闭失效均通过；默认 shell 在 cd 后未观察到自动 OSC7，未修改登录脚本。首次审批拒绝及后续授权结果、接收 bytes/hash 见完成报告。不能把交叉编译宣称为其他平台原生运行通过。
+
+自动 hook、客户端配置拆分、默认本地目录行为和日志 tail/follow 后置；本轮不宣布 B12 完整基线验收通过。

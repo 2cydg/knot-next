@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -188,6 +189,11 @@ func configFiles(t *testing.T, layout paths.Layout) map[string]string {
 			if entry.IsDir() {
 				continue
 			}
+			// History is independently updated by successful connection workers.
+			// Exclude its atomic-write window before reading (the temp may vanish).
+			if dir == layout.StateDir && (entry.Name() == "state.json" || strings.HasPrefix(entry.Name(), ".state.json.tmp-")) {
+				continue
+			}
 			raw, err := os.ReadFile(filepath.Join(dir, entry.Name()))
 			if err != nil {
 				t.Fatal(err)
@@ -214,8 +220,24 @@ func TestLegacyInstallationConnectsWithoutApply(t *testing.T) {
 	if result.State != "completed" || result.Stdout != "legacy-key-authenticated" {
 		t.Fatalf("legacy key/trust did not authenticate: %+v", result)
 	}
-	if !reflect.DeepEqual(before, configFiles(t, fixture.layout)) {
-		t.Fatal("read/connect mutated legacy installation")
+	after := configFiles(t, fixture.layout)
+	// A successful exec now updates state.json (B09); configuration, keys and
+	// known_hosts must still remain byte-for-byte unchanged.
+	statePath := filepath.Join(fixture.layout.StateDir, "state.json")
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("connect mutated legacy config/crypto/trust")
+	}
+	var history struct {
+		Recent []struct {
+			ServerID string `json:"server_id"`
+		}
+	}
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(raw, &history); err != nil || len(history.Recent) != 1 {
+		t.Fatalf("recent history not saved: %s (%v)", raw, err)
 	}
 	// Trust remains enforced after the key changes in the file, even if a pool
 	// connection was used before; a new SFTP session uses the known-hosts policy.
@@ -303,8 +325,19 @@ func TestEncryptedPrivateKeyChallengesThroughHTTP(t *testing.T) {
 				}
 				waitKeyState(t, c, route, resource.ID, wanted)
 				c.call(t, http.MethodDelete, route+"/"+resource.ID, nil, http.StatusOK, nil)
-				if !reflect.DeepEqual(before, configFiles(t, fixture.layout)) {
-					t.Fatal("passphrase-only remember mutated persistent files")
+				after := configFiles(t, fixture.layout)
+				if !reflect.DeepEqual(before, after) {
+					for p, sum := range after {
+						if before[p] != sum {
+							t.Logf("changed file: %s", p)
+						}
+					}
+					for p := range before {
+						if _, ok := after[p]; !ok {
+							t.Logf("removed file: %s", p)
+						}
+					}
+					t.Fatal("passphrase-only remember mutated config/crypto/trust")
 				}
 			})
 		}
@@ -447,5 +480,37 @@ func TestExplicitTOMLImportThroughHTTP(t *testing.T) {
 	target, _ := os.ReadFile(filepath.Join(fixture.layout.ConfigDir, "config.toml"))
 	if bytes.Contains(target, []byte("import-secret-sentinel")) {
 		t.Fatal("HTTP import persisted plaintext")
+	}
+}
+
+func TestConfigSnapshotIgnoresOnlyHistoryWriteFiles(t *testing.T) {
+	root := t.TempDir()
+	layout := paths.NewLayout(filepath.Join(root, "config"), filepath.Join(root, "state"))
+	for _, dir := range []string{layout.ConfigDir, layout.StateDir} {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"state.json", ".state.json.tmp-123", ".salt", ".crypto-state", "known_hosts", ".other.tmp-123"} {
+		if err := os.WriteFile(filepath.Join(layout.StateDir, name), []byte(name), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A similarly named file outside StateDir is still part of the invariant.
+	configTemp := filepath.Join(layout.ConfigDir, ".state.json.tmp-123")
+	if err := os.WriteFile(configTemp, []byte("config sentinel"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got := configFiles(t, layout)
+	if len(got) != 5 {
+		t.Fatalf("snapshot lost invariant files or captured history: %+v", got)
+	}
+	for _, name := range []string{".salt", ".crypto-state", "known_hosts", ".other.tmp-123"} {
+		if _, ok := got[filepath.Join(layout.StateDir, name)]; !ok {
+			t.Fatalf("lost %s", name)
+		}
+	}
+	if _, ok := got[configTemp]; !ok {
+		t.Fatal("excluded ConfigDir file")
 	}
 }

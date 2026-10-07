@@ -15,9 +15,11 @@ import (
 	"time"
 
 	"knot-core/internal/fileutil"
+	"knot-core/internal/logger"
 	"knot-core/internal/paths"
 	coreruntime "knot-core/internal/runtime"
 	"knot-core/internal/transport"
+	"log/slog"
 )
 
 const (
@@ -282,6 +284,7 @@ func (r *Runner) Start(ctx context.Context) error {
 		r.cfg.Runtime.Set(r.info)
 	}
 
+	logger.Diagnostic(slog.LevelInfo, "core.ready", "instance_id", r.instanceID, "port", r.port, "log_path", r.cfg.Layout.LogPath)
 	go r.supervise(ctx, errCh)
 	return nil
 }
@@ -385,6 +388,7 @@ func (r *Runner) teardown() {
 }
 
 func (r *Runner) runTeardown() {
+	logger.Diagnostic(slog.LevelInfo, "core.stopping", "instance_id", r.instanceID)
 	// Signal service-level workers first so pending connections and relays start
 	// winding down while the HTTP server drains.
 	if r.cancelService != nil {
@@ -446,6 +450,7 @@ func runCleanup(ctx context.Context, fn Cleanup) error {
 // abortStartup unwinds a partial start: it cancels service work, runs whatever
 // cleanups were registered before the failure, and releases the lock.
 func (r *Runner) abortStartup() {
+	logger.Diagnostic(slog.LevelError, "core.startup_aborted", "instance_id", r.instanceID)
 	if r.cancelService != nil {
 		r.cancelService()
 	}
@@ -512,7 +517,7 @@ func (r *Runner) recordError(err error) {
 	if r.shutdownErr == nil {
 		r.shutdownErr = err
 	}
-	r.cfg.Logf("knot-core: %v", err)
+	r.cfg.Logf("knot-core: %s", logger.Redact(err.Error()))
 }
 
 func listenerPort(ln net.Listener, fallback int) int {

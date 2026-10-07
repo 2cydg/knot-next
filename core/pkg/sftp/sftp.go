@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"knot-core/internal/keyutil"
+	"knot-core/internal/logger"
 	"knot-core/internal/resourcepolicy"
 	"knot-core/pkg/config"
 	"knot-core/pkg/session"
@@ -84,6 +85,9 @@ type resource struct {
 	client           *pkgsftp.Client
 	poolKeys         []string
 	followCancel     func()
+	followGeneration uint64
+	cwdGeneration    uint64
+	followPath       string
 	hostKeyChallenge *pendingChallenge
 	authChallenge    *pendingChallenge
 	authRetryCount   int
@@ -184,6 +188,7 @@ type CreateRequest struct {
 }
 
 type Session struct {
+	ServerID          string     `json:"server_id,omitempty"`
 	ID                string     `json:"id"`
 	ServerRef         string     `json:"server_ref"`
 	Alias             string     `json:"alias,omitempty"`
@@ -191,6 +196,9 @@ type Session struct {
 	Backend           string     `json:"backend"`
 	Root              string     `json:"root,omitempty"`
 	CurrentDir        string     `json:"current_dir,omitempty"`
+	FollowState       string     `json:"follow_state,omitempty"`
+	FollowError       string     `json:"follow_error,omitempty"`
+	CWDUpdatedAt      *time.Time `json:"cwd_updated_at,omitempty"`
 	FollowSessionID   string     `json:"follow_session_id,omitempty"`
 	HostKeyPolicy     string     `json:"host_key_policy,omitempty"`
 	HostKeyPending    bool       `json:"host_key_pending"`
@@ -411,12 +419,28 @@ func (s *Service) Create(req CreateRequest) (Session, error) {
 		if err != nil {
 			return Session{}, err
 		}
-		if followed.ServerRef != req.ServerRef && followed.Alias != req.ServerRef {
+		if isSourceTerminal(followed.State) {
+			return Session{}, fmt.Errorf("%w: follow source is closed", ErrConflict)
+		}
+		if !testMode && cfgProvider != nil {
+			cfg, err := cfgProvider.RuntimeConfig()
+			if err != nil {
+				return Session{}, err
+			}
+			target, err := resolveServer(cfg, req.ServerRef)
+			if err != nil {
+				return Session{}, err
+			}
+			if followed.ServerID != "" && followed.ServerID != target.ID {
+				return Session{}, fmt.Errorf("%w: follow session does not match sftp server", ErrValidation)
+			}
+			if followed.ServerID == "" && followed.ServerRef != target.ID && followed.ServerRef != target.Alias {
+				return Session{}, fmt.Errorf("%w: follow session does not match sftp server", ErrValidation)
+			}
+		} else if followed.ServerRef != req.ServerRef && followed.Alias != req.ServerRef {
 			return Session{}, fmt.Errorf("%w: follow session does not match sftp server", ErrValidation)
 		}
-		if followed.CurrentDir != "" {
-			currentDir = followed.CurrentDir
-		}
+
 	}
 
 	now := s.policy.Now().UTC()
@@ -536,11 +560,12 @@ func (s *Service) beginFollow(id string, followID string) error {
 		cancel()
 		return ErrNotFound
 	}
-	if followed.CurrentDir != "" {
-		res.CurrentDir = followed.CurrentDir
-	}
+	res.followPath = followed.CurrentDir
+	res.FollowState = "active"
+	res.followGeneration++
+	generation := res.followGeneration
 	res.followCancel = cancel
-	s.runLocked(res, func() { s.followSessionCWD(id, ch) })
+	s.runLocked(res, func() { s.followSessionCWD(id, generation, ch) })
 	s.mu.Unlock()
 	return nil
 }
@@ -562,6 +587,7 @@ func (s *Service) connectSession(ctx context.Context, id string, req CreateReque
 	s.mu.Lock()
 	if res, ok := s.sessions[id]; ok {
 		res.serverID = server.ID
+		res.ServerID = server.ID
 		if req.Alias != "" {
 			res.Alias = req.Alias
 		}
@@ -608,6 +634,9 @@ func (s *Service) connectSession(ctx context.Context, id string, req CreateReque
 		}
 	}
 	s.publishSessionLocked(res, Event{Type: "sftp.session.opened", SessionID: id, State: res.State, Time: now})
+	provider, serverID := s.config, res.serverID
+	s.runLocked(res, func() { recordUse(provider, serverID) })
+	s.runLocked(res, func() { s.refreshFollow(id) })
 	s.runLocked(res, func() { s.watchRemote(res, client, finalCfg) })
 }
 
@@ -2810,47 +2839,9 @@ func (s *Service) dependencies() (configProvider, sessionProvider, *sshpool.Pool
 	return s.config, s.session, s.pool, s.testMode
 }
 
-func (s *Service) followSessionCWD(id string, ch <-chan session.CWDNotify) {
-	defer func() {
-		s.mu.Lock()
-		if res := s.sessions[id]; res != nil {
-			s.cancelFollowLocked(res)
-		}
-		s.mu.Unlock()
-	}()
-	for notify := range ch {
-		now := notify.Time
-		if now.IsZero() {
-			now = s.policy.Now().UTC()
-		}
-		s.mu.Lock()
-		res, ok := s.sessions[id]
-		if !ok {
-			s.mu.Unlock()
-			return
-		}
-		if notify.Closed {
-			s.cancelFollowLocked(res)
-			res.followCancel = nil
-			s.mu.Unlock()
-			return
-		}
-		if notify.Path == "" || res.State == "closed" || res.State == "failed" || res.State == "disconnected" {
-			s.mu.Unlock()
-			continue
-		}
-		if res.CurrentDir == notify.Path {
-			s.mu.Unlock()
-			continue
-		}
-		res.CurrentDir = notify.Path
-		res.UpdatedAt = now
-		s.publishSessionLocked(res, Event{Type: "sftp.cwd.follow", SessionID: id, State: res.State, Path: notify.Path, Time: now})
-		s.mu.Unlock()
-	}
-}
-
 func (s *Service) publishSessionLocked(res *resource, event Event) {
+	event.Error = logger.Redact(event.Error)
+
 	if event.Time.IsZero() {
 		event.Time = s.policy.Now().UTC()
 	}
@@ -2910,6 +2901,14 @@ func (s *Service) publishTransferLocked(transfer *transferState, typ string, now
 
 func (r *resource) snapshot() Session {
 	out := r.Session
+	if out.CWDUpdatedAt != nil {
+		t := *out.CWDUpdatedAt
+		out.CWDUpdatedAt = &t
+	}
+	if out.ClosedAt != nil {
+		t := *out.ClosedAt
+		out.ClosedAt = &t
+	}
 	if r.hostKeyChallenge != nil {
 		out.HostKeyPending = r.hostKeyChallenge.Challenge.Pending
 	}
@@ -3234,7 +3233,7 @@ func safeError(err error, cfg any) string {
 	if err == nil {
 		return ""
 	}
-	msg := err.Error()
+	msg := logger.Redact(err.Error())
 	if runtimeCfg, ok := cfg.(config.RuntimeConfig); ok {
 		for _, secret := range runtimeSecrets(runtimeCfg) {
 			msg = strings.ReplaceAll(msg, secret, "[redacted]")

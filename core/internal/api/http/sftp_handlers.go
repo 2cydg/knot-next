@@ -43,6 +43,16 @@ func (s *Server) handleSFTP(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		default:
 			requireMethod(w, r, stdhttp.MethodGet)
 		}
+	case len(parts) == 2 && parts[1] == "control":
+		if !requireMethod(w, r, stdhttp.MethodPost) {
+			return
+		}
+		var body sftp.ControlRequest
+		if !decodeJSON(w, r, &body) {
+			return
+		}
+		data, err := sftpService.Control(parts[0], body)
+		writeSFTPResult(w, stdhttp.StatusOK, response.RiskRemoteRead, "sftp/"+parts[0]+"/control", data, err)
 	case len(parts) == 2 && parts[1] == "events":
 		if !requireMethod(w, r, stdhttp.MethodGet) {
 			return

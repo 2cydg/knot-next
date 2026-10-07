@@ -481,3 +481,17 @@ query 说明：
 - 首次加载配置页时优先请求 `GET /v1/config`，而不是分别拉取多个子资源
 - 需要增量编辑单个设置时使用 `/settings/{key}`，需要结构校验时使用 `/validate`
 - 对 server、proxy、key、sync provider 的 secret 字段，始终走 `secrets.md` 中的接口
+
+## 最近使用（2026-10-08）
+
+服务器 view 新增 `last_used`（UTC RFC3339；未使用或超出历史保留上限时为 `null`）。`GET /v1/config`、服务器列表、单项 GET 和 resolve 返回同一历史视图。普通创建/更新的响应不代表一次成功连接，不应据此刷新最近使用；需要最新历史时重新 GET。
+
+`GET /v1/config/servers?sort=recent` 返回分页对象，已使用目标按时间降序，时间相同按 alias、ID 排序，未使用目标排在最后。`sort=alias` 和默认排序按 alias、ID；继续支持 `host`、`created`/`id`。`started_at` 是会话创建时间，不能代替 `last_used`。
+
+历史沿用 `<StateDir>/state.json` 的 `recent: [{server_id,last_used}]` 模型。SSH backend 就绪、SFTP subsystem open、exec 请求被远端接受时才记录**用户选择的目标**；跳板不记录，连接/认证/exec 请求拒绝不记录。exec 已开始后退出码非 0 或取消，仍算成功使用目标。SSH/SFTP 更新由所属 worker 原子保存，GET 可稍后观察到；正常退出等待这些 worker 收尾。
+
+`recent_limit` 加载时 `<=0` 沿用默认 5；历史服务防御非法 limit，并将最大保存数量限制为 1024。按 ID 去重、并发读改写串行、失败写入不提交。删除服务器会裁剪历史，读取也过滤已删除 ID；历史是可选数据：读取发现非法 JSON 时，先把原件隔离为 `state.json.corrupt.1`–`.3` 中第一个空位，并记录 `recent.state.quarantined` 诊断，然后按空历史继续；查询不会制造一次成功使用，下一次成功回调保存新的 `state.json`；删除服务器的 prune 也可保存空的已过滤历史。隔离文件不自动删除或覆盖；三个空位用尽或隔离失败时，保留损坏原件并拒绝历史写入，配置摘要、列表、单项及 resolve 仍正常返回，`last_used=null`，诊断记录具体失败。保存或移走备份、恢复目录权限后可再次自动恢复。此降级只作用于历史；`config.toml` 解析/解密错误仍报错。历史写入失败不影响已成功的连接。
+
+隔离先以 `O_CREATE|O_EXCL` 创建空占位文件，再 rename 原件；进程若在两步之间终止，可能留下空的 `.corrupt.N` 并占用一个备份位，损坏原件仍在 `state.json`。此类空位也不自动清理；确认并保存所需证据后可手动移走或删除以释放位置。
+
+`default_sftp_local_path` 等客户端偏好保持旧字段兼容，core 不据此改变本地进程 cwd。独立客户端配置在 CLI 阶段承接。

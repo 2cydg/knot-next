@@ -72,6 +72,9 @@ func TestCreateFollowSessionUpdatesCurrentDir(t *testing.T) {
 	if sftpSession.CurrentDir != "/" {
 		t.Fatalf("initial current dir = %q, want /", sftpSession.CurrentDir)
 	}
+	if _, err := sftpSvc.Mkdir(sftpSession.ID, "/var/www", true); err != nil {
+		t.Fatal(err)
+	}
 	followEvents <- session.CWDNotify{SessionID: "1", Path: "/var/www", Time: time.Now().UTC()}
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {

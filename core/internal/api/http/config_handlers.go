@@ -10,7 +10,9 @@ import (
 
 	"knot-core/internal/api/response"
 	"knot-core/internal/keyutil"
+	"knot-core/internal/logger"
 	"knot-core/pkg/config"
+	"log/slog"
 )
 
 const maxJSONBody = 1 << 20
@@ -508,6 +510,7 @@ func decodeJSON(w stdhttp.ResponseWriter, r *stdhttp.Request, dst any) bool {
 		writeAPIError(w, stdhttp.StatusBadRequest, response.RiskReadOnly, r.URL.Path, "INVALID_JSON", "request body must contain a single JSON object")
 		return false
 	}
+	logger.RegisterSecrets(dst)
 	return true
 }
 
@@ -536,6 +539,7 @@ func writeDeletedResult(w stdhttp.ResponseWriter, risk response.Risk, resource s
 }
 
 func writeMappedError(w stdhttp.ResponseWriter, risk response.Risk, resource string, err error) {
+	logger.Diagnostic(slog.LevelWarn, "configuration operation failed", "resource", resource, "error", logger.Redact(err.Error()))
 	switch {
 	case errors.Is(err, config.ErrNotFound):
 		writeAPIError(w, stdhttp.StatusNotFound, risk, resource, "NOT_FOUND", "resource was not found")
@@ -551,6 +555,7 @@ func writeMappedError(w stdhttp.ResponseWriter, risk response.Risk, resource str
 }
 
 func writeAPIError(w stdhttp.ResponseWriter, status int, risk response.Risk, resource string, code string, message string) {
+	logger.Diagnostic(slog.LevelWarn, "API request failed", "resource", resource, "reason", code, "error", logger.Redact(message))
 	response.JSONError(w, status, response.Error{
 		Code:      code,
 		Message:   message,
