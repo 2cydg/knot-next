@@ -22,7 +22,7 @@
   "server_ref": "prod",
   "alias": "prod",
   "state": "open",
-  "backend": "ssh",
+  "backend": "ssh-sftp",
   "root": "/",
   "current_dir": "/var/log",
   "follow_session_id": "session_1",
@@ -48,7 +48,7 @@
 - `disconnected`
 - `failed`
 
-`backend` 表示该 SFTP session 当前使用的后端实现。正常 SSH 连接通常为 `ssh`；测试环境也可能出现其他内部后端值，例如 `local-sandbox`。
+`backend` 表示该 SFTP session 的后端类型。真实 SSH/SFTP 会话创建时即为 `ssh-sftp`，在 `connecting` 阶段即可见；是否已经打开 subsystem 由 `state=open` 判定。内部测试环境也可能使用 `local-sandbox`。
 
 ### Entry
 
@@ -193,6 +193,10 @@
 ```
 
 返回 `201` 和 `SFTP Session`。
+
+创建是异步的，`201` 返回 `connecting` 资源，不表示 subsystem 已就绪。
+客户端通过 GET 或 session 事件流等待 `open` 后再调用文件及传输接口；
+尚未 open 时这些操作返回 `409 CONFLICT`。连接失败可通过 GET 查询 `failed` 终态。
 
 `host_key_policy` 允许值与 `sessions.md` 中的 session 创建接口一致：
 

@@ -105,7 +105,7 @@ GOWORK=off go test -count=40 -run TestAttachReportsTruncated ./internal/api/http
 - `go vet ./...`、`go build -o /tmp/knot-b04-core ./cmd/core`：通过。
 - `GOOS=windows GOARCH=amd64 go test -c` 分别编译 `./pkg/session` 和 `./internal/api/http`：通过，不构成 Windows 原生验证。
 
-不改为全量 skip、不写入真实服务器地址/密码、不提交临时 smoke 配置。B05/B06 未开始，历史 B01–B03 缺口继续保留。
+不改为全量 skip、不写入真实服务器地址/密码、不提交临时 smoke 配置。此条是 B04 当时记录；B05 后续进度见下方子批次，B06 及历史 B01–B03 缺口继续保留。
 
 
 ### B04 审阅逐项修复与证据（2026-10-07）
@@ -135,3 +135,56 @@ GOWORK=off go test -count=40 -run TestAttachReportsTruncated ./internal/api/http
 - 旧行为 overlay：barrier/裁剪/完成竞争的三个回归预期失败，日志 `/tmp/knot-b04-review-{barrier,prune,completion}-before.log`；不改工作区生产代码。
 - `go test -count=1 -timeout=75s ./...`：环境失败（监听被拒绝，进程 readiness 无法完成），日志 `/tmp/knot-b04-review-full.log`，不 skip 后声称通过。
 - `go test -run '^$' ./...`、`go vet ./...`、Linux core 构建与 Windows amd64 session/HTTP 测试编译：通过；编译不构成 Windows 原生或 TCP 运行验收。
+
+## B05 子批次：真实 SFTP 传输与事件恢复（2026-10-07）
+
+本次完成 F02、F03、F04 的非取消批量结果和 F07 的双会话隔离部分。**整个 B05 尚未完成**；F01、F05/F06、F07 慢消费者及并发快照、F08/F09 等组合验收留待下一批。
+
+| 字段 | 内容 |
+| --- | --- |
+| 基线与变更 | `f7bb150` 之后未提交 diff；新增 `tests/integration/sftp_{fixture,client,transfer}_test.go`；扩展 `internal/testutil/sshserver/server.go`；修正 `docs/api/sftp.md` |
+| 来源 | 参考当前基线 HTTP transfer snapshot、SFTP backend close 与 cancel 测试；复用现有受控 SSH fixture。未从旧仓库另复制实现，未新增依赖 |
+| 层级 | 真实 loopback TCP SSH、密码认证、SFTP subsystem 和 SFTP 协议 request server、真实 HTTP/WS；没有启用 core 的 local-sandbox。受控远端使用 `github.com/pkg/sftp` 的内存文件处理器；不是外部 OpenSSH/操作系统文件权限验收 |
+| 客户端 | 独立 JSON 模型，只通过公开 HTTP/WS 创建 profile、写 secret、创建会话、传输、GET/DELETE、订阅和恢复；内部服务对象仅用于 fixture 装配与清理 |
+| 环境 | Linux amd64、Go 1.27.1；静态测试 crypto，临时 Layout 与人工密码；HTTP bearer 认证，WS 使用已有 `golang.org/x/net/websocket` 标准客户端，测试 Origin 显式允许 |
+| 结果 | 初版 11 个真实协议叶用例 race ×20 通过；审阅修复后另含 2 个 WS 客户端期限用例，合计 13 个叶用例 race ×20 与 core 全量测试通过；vet、core build 与 diff 检查通过 |
+| 限制 | 未进行外部 SSH smoke 或 Windows 原生运行；普通取消/永久阻塞 I/O 下显式 session 关闭的完整隔离与 worker 回收、路径/缓存及历史裁剪仍未在本批组合验收。此 fixture 未绑定进程生命周期 context、未接 API shutdown 回调、runtime holder 为 nil；只在 cleanup 直接调用 service Shutdown，不作为进程/API shutdown 中止 in-flight 连接、readiness 或 discovery 的证据 |
+
+### 场景与断言
+
+| 编号 | 测试 | 证据 |
+| --- | --- | --- |
+| F02/F03 | `TestSFTPProtocolFileRoundTrip`（empty/small/large） | 每种文件上传与下载，逐字节核对 NUL、无效 UTF-8、中文等内容；大文件超过 32 KiB 复制缓冲。GET 进度不越界，终态 total/copied/files_done 与时间正确；先订阅再 POST 的 completed 事件与 GET 一致；完成后订阅直接得到两个完整终态快照 |
+| F03/F07 | `TestSFTPProtocolTransferRecoveryAndIsolation` | 远端 write barrier 到达后断开 WS；原 ID GET 仍 running，重新订阅得到相同快照。两个 session 的快照隔离，错误组合的 GET/DELETE 返回 404；另一个 session 在阻塞期间传输成功；status 确认单个 SSH entry、引用数为 2。放行后恢复 completed、远端仅打开文件一次、任务列表只有原 ID。审阅修复后连续两次 DELETE，每次再 GET 与完整 final 比对，并重订阅核对快照，验证保留状态和完成时间不变；下载内容准确 |
+| F04 | `TestSFTPProtocolBatchResults`（upload/download × completed/partial_failed/failed） | 全成功为两项，部分失败先失败再成功验证继续执行，全失败保留两项错误；HTTP 202 后 GET 返回正确终态，逐项 Source/State/Error 和成功文件计数正确；已规划文件的 aggregate total/copied 一致，completed/partial_failed/failed 事件类型/数值与 GET 一致，晚订阅保留 items，成功项目内容可核对 |
+| fixture 关闭 | `TestSFTPProtocolFixtureCloseReleasesWriteGate` | 不释放 write barrier，直接关闭 SSH fixture；protocol worker 在 5 秒内结束，传输收敛 failed/canceled、copied=0、files_done=0，没有误报 completed |
+| WS 客户端期限 | `TestSFTPProtocolTerminalEventDeadline`（idle/continuous_progress） | 独立 WS helper 回归，不包含 SSH/SFTP。无消息或持续 progress 时，等待仍使用同一个 60 ms deadline，返回可识别的 timeout 原因与 transfer ID；避免每次读取重置成新的 5 秒 |
+
+事件与 GET 数值一致的组合证据仅覆盖已完成/已失败路径（包括 partial_failed），不证明 worker 私有进度尚未发布时的“最终进度先合并、再发布终态”顺序。生产 `finishTransferFromWorker` 当前顺序正确；下一批 F05/F06 需控制中途取消，让 worker 私有进度领先最后一次公开 progress，再同时断言 canceled 事件和 GET 的最终数值。本批 fixture 关闭用例未核对 canceled 事件，不能补足此缺口。
+
+### 实际命令与结果
+
+执行目录 `knot-next/core`，设置 `GOWORK=off GOCACHE=/tmp/knot-plan-20261006-go-build`。
+
+- `go test -count=1 -timeout=60s -run '^TestSFTPProtocol' ./tests/integration`：初版 10 个场景通过（0.829 秒）；最终 11 个场景见下述 race 和全量。
+- `go test -race -count=20 -timeout=90s -run '^TestSFTPProtocol' ./tests/integration`：通过（20.283 秒），包括新增 fixture 关闭回归及双项批量全成功。
+- `go test ./...`：全部通过（其中 `pkg/session` 7.155 秒、`pkg/sftp` 8.401 秒、`tests/integration` 1.477 秒）。
+- `go vet ./...`、`go build -o /tmp/knot-b05-core ./cmd/core`：通过，无错误输出。
+- `git diff --check`：通过。
+
+普通沙箱第一次执行新增测试被 `listen tcp 127.0.0.1:0: socket: operation not permitted` 阻止；随后授权在允许 loopback 监听的环境运行，实际协议与全量验收通过，没有 skip 用例。首次可监听运行还发现测试按旧文档错误断言 `backend=ssh`，实际为 `ssh-sftp`，已核查并修正测试和文档；没有以更改生产返回值掩盖差异。
+
+本批没有发现需要修改 `pkg/sftp` 传输业务逻辑的问题；保留原 worker 私有进度、不可变后端视图、快照深拷贝和终态保护。下一批补真实 challenge/subsystem 失败与取消/关闭组合，再进入 B06 回收。
+
+### 审阅修复后的验证
+
+逐项结论见 workspace `docs/running/B05-transfer-recovery-plan.md` 的“审阅报告逐项核查与处理”。初版命令结果保留在上节；修复版使用同一环境与 Go 参数执行：
+
+- `go test -count=1 -timeout=60s -run '^TestSFTPProtocol' ./tests/integration`：通过（0.959 秒）。
+- `go test -race -count=20 -timeout=90s -run '^TestSFTPProtocol' ./tests/integration`：13 个叶用例全部通过（22.651 秒），无 race。
+- `go test ./...`：全部通过（session 7.148 秒、sftp 8.396 秒、integration 1.630 秒）。
+- `go vet ./...`、`go build -o /tmp/knot-b05-review-core ./cmd/core`、`git diff --check`：通过。
+- 临时取消 overlay：在返回旧 snapshot 后改写共享终态和 CompletedAt，`TestSFTPProtocolTransferRecoveryAndIsolation` 预期失败，错误为 `late cancel rewrote retained terminal result`。日志 `/tmp/knot-b05-review-cancel-mutation.log`。
+- 临时期限制 overlay：每次读取重新使用 `now + 5s`，`TestSFTPProtocolTerminalEventDeadline/idle` 预期失败，60 ms 预算被拖到 5.002 秒。日志 `/tmp/knot-b05-review-deadline-mutation.log`。
+
+两个 overlay 位于 `/tmp/knot-b05-review-overlays/`，仅供 Go 测试临时替换源码，没有修改生产工作区文件。未新增依赖、未 Git 提交。`backend` 文档已改为创建时即为 `ssh-sftp`，createSession helper 同时检查 connecting 响应的 backend。

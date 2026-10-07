@@ -50,8 +50,9 @@ type Server struct {
 	// instead of keeping Wait blocked forever.
 	closing chan struct{}
 
-	// sftpRoot enables the SFTP subsystem when non-empty.
-	sftpRoot string
+	// Either a working directory or protocol handlers enable the subsystem.
+	sftpRoot     string
+	sftpHandlers *sftp.Handlers
 
 	// Control barriers for deterministic testing
 	beforeHandshake chan struct{}
@@ -152,9 +153,15 @@ type Config struct {
 	Password          string
 	PublicKeyCallback func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error)
 	// SFTPRoot, when set, enables a real SFTP subsystem whose working directory
-	// is that path. Without it the subsystem request is refused, so a client
-	// cannot be tested past the point where it opens the subsystem.
+	// is that path. With neither SFTPRoot nor SFTPHandlers, subsystem requests
+	// are refused, letting tests exercise subsystem setup failures.
 	SFTPRoot string
+	// SFTPHandlers enables a request-based subsystem instead of the filesystem
+	// server. Tests can wrap protocol handlers to control individual I/O calls;
+	// remote paths then stay independent of the host OS filesystem.
+	// Configure handlers before starting clients. Each subsystem copies the
+	// interfaces but shares the referenced implementations (and remote files).
+	SFTPHandlers *sftp.Handlers
 }
 
 // New creates a new test SSH server listening on a random loopback port.
@@ -183,14 +190,15 @@ func newServer(t *testing.T, cfg Config, listener net.Listener) *Server {
 	serverConfig.AddHostKey(signer)
 
 	srv := &Server{
-		t:           t,
-		listener:    listener,
-		config:      serverConfig,
-		hostKey:     signer,
-		connections: make(map[*ssh.ServerConn]struct{}),
-		transports:  make(map[net.Conn]struct{}),
-		closing:     make(chan struct{}),
-		sftpRoot:    cfg.SFTPRoot,
+		t:            t,
+		listener:     listener,
+		config:       serverConfig,
+		hostKey:      signer,
+		connections:  make(map[*ssh.ServerConn]struct{}),
+		transports:   make(map[net.Conn]struct{}),
+		closing:      make(chan struct{}),
+		sftpRoot:     cfg.SFTPRoot,
+		sftpHandlers: cfg.SFTPHandlers,
 	}
 
 	// The auth callbacks consult the server's barrier, so they are installed
@@ -641,7 +649,7 @@ func (h *sessionHandler) handleSubsystem(req *ssh.Request) error {
 	}
 
 	if subsys.Name == "sftp" {
-		if h.server.sftpRoot == "" {
+		if h.server.sftpRoot == "" && h.server.sftpHandlers == nil {
 			return fmt.Errorf("sftp subsystem is not enabled on this test server")
 		}
 		// Hold the reply so a client that gives up waiting for the subsystem can
@@ -853,6 +861,13 @@ func writeExecChunks(w io.Writer, data []byte, size int, firstChunk chan struct{
 
 func (h *sessionHandler) runSFTP() {
 	defer h.server.goroutines.Done()
+	defer h.channel.Close()
+	if h.server.sftpHandlers != nil {
+		server := sftp.NewRequestServer(h.channel, *h.server.sftpHandlers)
+		defer server.Close()
+		_ = server.Serve()
+		return
+	}
 
 	// A real SFTP subsystem, so a client that opens one is exercised against the
 	// actual protocol instead of a stub that only accepts the request.
@@ -860,9 +875,14 @@ func (h *sessionHandler) runSFTP() {
 	if err != nil {
 		return
 	}
+	defer server.Close()
 	// Serve returns when the client closes the channel or the subsystem stops.
 	_ = server.Serve()
 }
+
+// Done closes when the fixture shuts down. Custom blocking SFTP handlers must
+// observe it so Close followed by Wait cannot leave a protocol worker parked.
+func (s *Server) Done() <-chan struct{} { return s.closing }
 
 // waitBarrier blocks until a gate opens or Close stops the fixture. False means
 // setup must stop. A test may install a gate after startup, so read it under mu.
