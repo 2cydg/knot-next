@@ -144,6 +144,8 @@ Currently empty (`.gitkeep` placeholder). Will be populated in M7 with the new T
 
 ## Contributing
 
+Read [MEMORY.md](MEMORY.md) for persistent project-specific preferences.
+
 When contributing:
 1. Follow existing code style and patterns
 2. Add tests for new functionality

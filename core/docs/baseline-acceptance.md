@@ -63,3 +63,75 @@ GOWORK=off go test -count=40 -run TestAttachReportsTruncated ./internal/api/http
 | 限制 | 单端点、单会话冒烟；未覆盖真实环境下的慢客户端与断网场景（这些由受控测试覆盖）；远端实际 shell 的 OSC7 行为未单独断言 |
 
 记录中不含密码、token 或私钥。驱动脚本与临时配置均位于仓库外，不会提交。`<endpoint>` 结果不替代受控测试：受控测试覆盖 P01–P08 全部矩阵，真实环境只补充真实 PTY 的证据。
+
+
+## B04：exec context、期限与输出收尾（2026-10-07）
+
+本批次实现已落地，**B04 尚未完整验收**。2026-10-07 审阅确认并修复 fixture 挂起、待收尾结果被裁剪、完成/取消竞争；测试及文档建议同时落实。TCP 可运行的审阅环境已提供 E01/E02/E07/E08 证据，当前修复环境仍拒绝监听，两次环境与代码状态分别记录。极端协议等待、代理/跳板 exec 组合与外部 smoke 仍有缺口；不据此宣布基线完成。
+
+| 字段 | 内容 |
+| --- | --- |
+| 基线与变更 | `55e19c2` 之后工作区 diff，未提交；新增 `pkg/session/exec.go`，接入 HTTP request context、lifecycle service context 与 core shutdown；扩展受控 SSH exec fixture 和内存 transport |
+| 来源 | 参考旧 `knot/pkg/daemon/handler_exec.go`（`e0b4d51eea6647e192371059381039b99fb301a2`）的双流限长规则，未复制其取消实现；内存 transport 参考当前 `pkg/sftp/review_transport_test.go` buffered pipe，新模块内适配，无新依赖 |
+| 环境 | Linux amd64，Go 1.27.1；静态测试 crypto，人工测试凭据；真实 SSH/SFTP 协议在内存 transport 执行，另保留随机 loopback 的服务/HTTP 测试 |
+| 实现 | `ExecContext`；全链路 timeout/非负与溢出验证；15 秒 channel open 阶段期限；KILL 尝试 + channel close + 有界等待 Run/close/signal；实际 worker/ref 跟踪；独立 512 KiB 双流同步快照；framework_code/cleanup_error |
+| 通过 | 内存真实 SSH 双流/退出/取消/共享 shell+SFTP；50 次输出中取消；定向 race ×20；无监听 HTTP context/参数测试 race ×20；全包测试编译；vet；Linux build；Windows amd64 session/HTTP 测试编译 |
+| 未通过/未执行 | 初次执行和本次修复环境的 TCP/TCP6 监听被拒绝；审阅环境允许监听，其全量失败另有 fixture barrier 挂起（已修复）。TCP 跨层审阅证据见下节；本修复状态下未重跑成功。真实 OpenSSH >30 秒、真实远端停止与 Windows 原生未运行 |
+| 协议边界 | x/crypto/ssh 无法撤回未确认 channel open，也无法本地完成永久不回应 channel close 的 Wait；返回 cleanup_error，继续持有 ref 并跟踪 worker，transport 退出后才能最终收尾。已验证预算和迟到清理，尚未达到 E06 的“任何阶段无遗留”完整要求 |
+
+### 场景与正式测试
+
+| 编号 | 测试与结果 |
+| --- | --- |
+| E01 | `TestExecStreamsAndExitStatus`（真实内存 SSH，0/7、双流逐字节）通过；`TestServerExecReturnsRemoteExitSeven`（TCP SSH + HTTP）审阅环境通过，当前修复环境未重跑成功 |
+| E02/E03 | `TestExecCancelWaitsForRunAndKeepsSharedChannels`（真实内存 SSH/SFTP、忽略 signal、取消与期限、worker settled、另一个 shell/SFTP 可用）通过；`TestExecServiceCancellationReleasesReference`、`TestServerExecHTTPDisconnectClosesRemoteChannel` 审阅环境通过，当前修复环境受监听限制 |
+| E04 | `TestExecCancelWhileWritingOutput` 首次写成功后取消，50 次，远端 worker done + 本地 settled + 输出上限，race ×20 通过 |
+| E05 | `TestExecTruncatesEachStreamAtBoundary`：每流 512 KiB、+1、2 MiB；前缀完整、独立截断、Writer 返回原长度，race ×20 通过 |
+| E06 | `TestExecCanceledChannelOpenClosesLateResult`、`TestExecChannelOpenHasStageDeadline`、`TestExecCancelDuringStartWaitsForWorker` 通过；`TestExecConnectionDeadlineDoesNotStartCommand` 的原 fixture 在可监听环境 cleanup 挂起（已修复）；审阅通过可释放 barrier 复跑确认 timeout/未启动 command；修复版 TCP 用例当前受监听限制；代理/跳板完整组合未补齐 |
+| E07 | `TestExecContextValidationAndShutdown`、`TestExecCleanupTimeoutTracksActualWorker` 通过；`TestExecServiceShutdownStopsUnlimitedCommand`（完整 service/lifecycle ctx）审阅环境通过，当前修复环境受监听限制，完整进程退出仍待验收 |
+| E08 | `TestExecMissingExitStatus`、参数/溢出验证通过；`TestExecTrustAndAuthenticationFailures` 审阅环境通过，当前修复环境受监听限制 |
+| HTTP 回归 | `TestServerExecUsesRequestContext`、`TestServerExecRejectsInvalidTimeout`、原 `TestServerSessionExecValidation` race ×20 通过；overlay 恢复旧 `Exec(body)` 后 request context 测试确定失败 |
+
+### 实际命令与结果
+
+执行目录 `knot-next/core`，均设置 `GOWORK=off GOCACHE=/tmp/knot-plan-20261006-go-build`。
+
+- `go test -race -count=20 -timeout=90s -run '^TestExec(Streams|Truncates|Cancel|Missing|Context|Cleanup)' ./pkg/session`：通过；日志 `/tmp/knot-b04-exec-race20.log`。
+- `go test -race -count=20 -timeout=60s -run '^TestExecChannelOpenHasStageDeadline$' ./pkg/session`：通过。
+- `go test -race -count=20 -timeout=90s -run 'TestServerExecUses|TestServerExecRejects|TestServerSessionExecValidation' ./internal/api/http`：通过。
+- `go test -overlay=/tmp/knot-b04-handler-overlay.json -count=1 -run '^TestServerExecUsesRequestContext$' ./internal/api/http`：预期失败；仅 overlay 改回旧调用，不修改工作区；日志 `/tmp/knot-b04-handler-regression.log`。
+- `go test -count=1 -timeout=60s ./...`：环境失败，不作为通过证据；日志 `/tmp/knot-b04-full-test.log`。
+- `go test -run '^$' ./...`：全部编译通过，仅编译，不构成运行验收。
+- `go vet ./...`、`go build -o /tmp/knot-b04-core ./cmd/core`：通过。
+- `GOOS=windows GOARCH=amd64 go test -c` 分别编译 `./pkg/session` 和 `./internal/api/http`：通过，不构成 Windows 原生验证。
+
+不改为全量 skip、不写入真实服务器地址/密码、不提交临时 smoke 配置。B05/B06 未开始，历史 B01–B03 缺口继续保留。
+
+
+### B04 审阅逐项修复与证据（2026-10-07）
+
+审阅来源：workspace `docs/running/B04-implementation-plan.md` 第 56 行起。原始日志 `/tmp/knot-b04-full-test.log` 明确含 `socket: operation not permitted`；审阅日志 `/tmp/b04-fullsuite.log` 明确含 `TestExecConnectionDeadlineDoesNotStartCommand` 的 barrier 清理挂起。因此“所有失败只是权限问题”的归纳不完整；“历史权限错误不存在，全部替换为单测挂起”也与原日志不符。保留两类事实，当前修复环境复跑依然拒绝监听，不将其他环境的通过冒充本次修复后的运行结果。
+
+| 审阅项 | 判定与处理 | 回归证据 |
+| --- | --- | --- |
+| 2.1 fixture barrier 挂起 | 存在，已修复。`waitBarrier` 同时观察 Close，返回 false 后 handshake/auth/subsystem 停止；Close 跟踪并关闭未握手 transport，避免解除 barrier 后仍阻塞于握手。E06 用例另加 LIFO barrier cleanup | `TestServerCloseReleasesEveryStageBarrier`（3 阶段）、`TestServerCloseReleasesPendingHandshakeTransport`，race ×20；恢复旧 waitBarrier 时前者确定失败 |
+| 2.2 验收归因 | 部分采纳：追加允许监听的审阅证据和真实 fixture 缺陷，保留初次及本轮权限失败事实 | 初次 `/tmp/knot-b04-full-test.log`；审阅 `/tmp/b04-fullsuite.log`、`/tmp/b04-skip.log`；本轮 `/tmp/knot-b04-review-full.log` |
+| 3.1 pending 记录裁剪 | 存在，已修复。裁剪跳过活跃 exec；shutdown 快照持有 `execOperation` 的结果，worker settled 后即使记录被裁剪也不丢诊断 | `TestExecPrunePreservesPendingCleanup`、`TestExecShutdownKeepsResultAfterHistoryPrune`，race ×20；恢复旧裁剪条件时前者确定失败 |
+| 3.2 完成/取消竞争 | 存在，已修复。取消分支复查 Run 结果，已发布结果优先；只对未完成的执行尝试 signal | `TestExecCompletedResultWinsConcurrentCancellation`：1000 次双就绪，race ×20；恢复随机选择时确定失败 |
+| 3.3 goroutine 内 Fatal | 存在，已修复。SSH channel setup 移到测试 goroutine，后台只执行并回传结果；Start 收尾断言也移回测试 goroutine | 内存协议取消和收尾回归 |
+| 3.3 包级期限 override | 串行测试下无 race，补显式禁止 t.Parallel 的注释，保留短预算以确定性验证真实分支 | 定向 race ×20 |
+| 3.3 内存 deadline | 无需实现 socket deadline：此 fixture 验证协议和控制点；补充三种 SetDeadline 都无效的注释，不将其算作 TCP 期限证据 | `NewMemory` 注释，TCP 与内存场景分开 |
+| 3.3 未使用 exec/exit gate | 两个 setter 已存在于基线，但确实没有用例；保留通用控制点并新增 gate 覆盖 | `TestExecFixtureGlobalGates`：放行 exec 前不 started、放行 exit 前不完成，exit 7 |
+| 四 Exec 示例/id | 已补失败示例包含 framework_code/cleanup_error，成功示例按 omitempty；说明 id 仅诊断/关联，无 GET 查询 | `docs/api/sessions.md` |
+| 四/五 正确契约与设计 | timeout 上限、阶段期限、输出限长、context、HTTP 状态、ref 所有权保留；没有证据要求改动。收尾跟踪补强诊断保存 | 原回归及本轮 race |
+| 六 剩余外部/极端场景 | 是验收缺口，继续如实保留，不用本次修复宣称完整 B04 | 真实 >30 秒、代理/跳板 exec、Windows 原生、永久不响应 channel open/close 的回收未闭环 |
+
+允许监听的审阅环境（修复前代码）已通过：`TestExecServiceCancellationReleasesReference`、`TestExecServiceShutdownStopsUnlimitedCommand`、`TestExecTrustAndAuthenticationFailures`、`TestServerExecHTTPDisconnectClosesRemoteChannel`、`TestServerExecReturnsRemoteExitSeven`；审阅的可释放 E06 barrier 场景也通过。跳过挂起用例的全量通过仅用于定位，不作为 B04 全量验收完成。
+
+本轮修复验证（Linux amd64 / Go 1.27.1，`GOWORK=off GOPROXY=off GOCACHE=/tmp/knot-plan-20261006-go-build`）：
+
+- 定向 session + fixture `go test -race -count=20`：通过，日志 `/tmp/knot-b04-review-race20.log`。
+- 无监听 HTTP context/validation `go test -race -count=20`：通过，日志 `/tmp/knot-b04-review-http-race20.log`。
+- 旧行为 overlay：barrier/裁剪/完成竞争的三个回归预期失败，日志 `/tmp/knot-b04-review-{barrier,prune,completion}-before.log`；不改工作区生产代码。
+- `go test -count=1 -timeout=75s ./...`：环境失败（监听被拒绝，进程 readiness 无法完成），日志 `/tmp/knot-b04-review-full.log`，不 skip 后声称通过。
+- `go test -run '^$' ./...`、`go vet ./...`、Linux core 构建与 Windows amd64 session/HTTP 测试编译：通过；编译不构成 Windows 原生或 TCP 运行验收。

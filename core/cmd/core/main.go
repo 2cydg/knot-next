@@ -140,6 +140,7 @@ func prepareServices(
 	sessionService := session.NewService()
 	sessionService.UseConfig(configService)
 	sessionService.UsePool(sharedPool)
+	sessionService.UseContext(env.Context)
 	sftpService := sftp.NewService(filepath.Join(layout.StateDir, "sftp"))
 	sftpService.UseConfig(configService)
 	sftpService.UseSession(sessionService)

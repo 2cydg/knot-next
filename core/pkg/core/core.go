@@ -242,6 +242,8 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	}
 
 	if sessionService != nil {
+		sessionService.CancelExec()
+		release("exec", sessionService.ShutdownExec)
 		release("session", func(ctx context.Context) error {
 			var errs []error
 			for _, res := range sessionService.List() {

@@ -29,6 +29,7 @@ type Server struct {
 
 	mu           sync.Mutex
 	connections  map[*ssh.ServerConn]struct{}
+	transports   map[net.Conn]struct{}
 	goroutines   sync.WaitGroup
 	closed       bool
 	forwardCount atomic.Int32
@@ -42,6 +43,8 @@ type Server struct {
 	envRequests   []EnvRequest
 	signals       []string
 	shell         ShellBehavior
+	exec          ExecBehavior
+	execCommands  []string
 
 	// closing is closed by Close so a scripted shell blocked on a gate exits
 	// instead of keeping Wait blocked forever.
@@ -113,6 +116,34 @@ type ScriptedWrite struct {
 	ChunkSize int
 	// Gate, when non-nil, is waited on before this write is sent.
 	Gate chan struct{}
+	// FirstChunkSent closes after the first successful write of an exec stream.
+	FirstChunkSent chan struct{}
+}
+
+// ExecBehavior scripts one command. Done closes after the remote worker exits;
+// Started closes once exec has been accepted. IgnoreSignal exercises channel
+// close as the cancellation path rather than relying on process signals.
+type ExecBehavior struct {
+	Scripted       bool
+	Writes         []ScriptedWrite
+	ExitCode       int
+	SendExitStatus bool
+	Started        chan struct{}
+	Done           chan struct{}
+	BeforeExit     chan struct{}
+	IgnoreSignal   bool
+}
+
+func (s *Server) SetExecBehavior(behavior ExecBehavior) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.exec = behavior
+}
+
+func (s *Server) ExecCommands() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.execCommands...)
 }
 
 // Config holds server configuration.
@@ -129,6 +160,15 @@ type Config struct {
 // New creates a new test SSH server listening on a random loopback port.
 func New(t *testing.T, cfg Config) *Server {
 	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	return newServer(t, cfg, listener)
+}
+
+func newServer(t *testing.T, cfg Config, listener net.Listener) *Server {
+	t.Helper()
 
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -142,17 +182,13 @@ func New(t *testing.T, cfg Config) *Server {
 	serverConfig := &ssh.ServerConfig{}
 	serverConfig.AddHostKey(signer)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
-
 	srv := &Server{
 		t:           t,
 		listener:    listener,
 		config:      serverConfig,
 		hostKey:     signer,
 		connections: make(map[*ssh.ServerConn]struct{}),
+		transports:  make(map[net.Conn]struct{}),
 		closing:     make(chan struct{}),
 		sftpRoot:    cfg.SFTPRoot,
 	}
@@ -162,7 +198,9 @@ func New(t *testing.T, cfg Config) *Server {
 	// hold a connection in the authentication stage and then release it.
 	if cfg.Password != "" {
 		serverConfig.PasswordCallback = func(meta ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
-			srv.waitBarrier(func(s *Server) chan struct{} { return s.beforeAuth })
+			if !srv.waitBarrier(func(s *Server) chan struct{} { return s.beforeAuth }) {
+				return nil, net.ErrClosed
+			}
 			if meta.User() != cfg.User || string(pass) != cfg.Password {
 				return nil, fmt.Errorf("unauthorized")
 			}
@@ -173,7 +211,9 @@ func New(t *testing.T, cfg Config) *Server {
 	if cfg.PublicKeyCallback != nil {
 		accept := cfg.PublicKeyCallback
 		serverConfig.PublicKeyCallback = func(meta ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			srv.waitBarrier(func(s *Server) chan struct{} { return s.beforeAuth })
+			if !srv.waitBarrier(func(s *Server) chan struct{} { return s.beforeAuth }) {
+				return nil, net.ErrClosed
+			}
 			return accept(meta, key)
 		}
 	}
@@ -280,8 +320,15 @@ func (s *Server) Close() {
 	for conn := range s.connections {
 		conns = append(conns, conn)
 	}
+	transports := make([]net.Conn, 0, len(s.transports))
+	for conn := range s.transports {
+		transports = append(transports, conn)
+	}
 	s.mu.Unlock()
 
+	for _, conn := range transports {
+		_ = conn.Close()
+	}
 	for _, conn := range conns {
 		_ = conn.Close()
 	}
@@ -323,8 +370,24 @@ func (s *Server) serve() {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.goroutines.Done()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	s.transports[conn] = struct{}{}
+	s.mu.Unlock()
+	defer func() {
+		_ = conn.Close()
+		s.mu.Lock()
+		delete(s.transports, conn)
+		s.mu.Unlock()
+	}()
 
-	s.waitBarrier(func(s *Server) chan struct{} { return s.beforeHandshake })
+	if !s.waitBarrier(func(s *Server) chan struct{} { return s.beforeHandshake }) {
+		return
+	}
 
 	serverConn, chans, reqs, err := ssh.NewServerConn(conn, s.config)
 	if err != nil {
@@ -434,7 +497,9 @@ func (s *Server) handleSession(newCh ssh.NewChannel) {
 	sess := &sessionHandler{
 		server:  s,
 		channel: channel,
+		closed:  make(chan struct{}),
 	}
+	defer close(sess.closed)
 
 	for req := range requests {
 		switch req.Type {
@@ -478,8 +543,9 @@ func (s *Server) handleSession(newCh ssh.NewChannel) {
 			}
 			s.mu.Lock()
 			s.signals = append(s.signals, signalReq.Signal)
+			ignore := s.exec.IgnoreSignal
 			s.mu.Unlock()
-			_ = req.Reply(true, nil)
+			_ = req.Reply(!ignore, nil)
 		case "subsystem":
 			if err := sess.handleSubsystem(req); err != nil {
 				_ = req.Reply(false, nil)
@@ -495,6 +561,7 @@ func (s *Server) handleSession(newCh ssh.NewChannel) {
 type sessionHandler struct {
 	server  *Server
 	channel ssh.Channel
+	closed  chan struct{}
 
 	mu     sync.Mutex
 	pty    *ptyRequest
@@ -579,7 +646,9 @@ func (h *sessionHandler) handleSubsystem(req *ssh.Request) error {
 		}
 		// Hold the reply so a client that gives up waiting for the subsystem can
 		// be exercised without a real stalled network.
-		h.server.waitBarrier(func(s *Server) chan struct{} { return s.beforeSubsystem })
+		if !h.server.waitBarrier(func(s *Server) chan struct{} { return s.beforeSubsystem }) {
+			return net.ErrClosed
+		}
 		h.server.goroutines.Add(1)
 		go h.runSFTP()
 		return nil
@@ -696,6 +765,15 @@ type execRequest struct {
 
 func (h *sessionHandler) runExec(req *ssh.Request) {
 	defer h.server.goroutines.Done()
+	defer h.channel.Close()
+	h.server.mu.Lock()
+	behavior := h.server.exec
+	beforeExec := h.server.beforeExec
+	beforeExit := h.server.beforeExit
+	h.server.mu.Unlock()
+	if behavior.Done != nil {
+		defer close(behavior.Done)
+	}
 
 	var execReq execRequest
 	if err := ssh.Unmarshal(req.Payload, &execReq); err != nil {
@@ -703,14 +781,74 @@ func (h *sessionHandler) runExec(req *ssh.Request) {
 		return
 	}
 
-	// Simple command execution for testing
-	// Just echo the command back
-	_, _ = h.channel.Write([]byte(execReq.Command + "\n"))
+	if !h.waitExecGate(beforeExec) {
+		return
+	}
+	h.server.mu.Lock()
+	h.server.execCommands = append(h.server.execCommands, execReq.Command)
+	h.server.mu.Unlock()
+	if behavior.Started != nil {
+		close(behavior.Started)
+	}
+	if !behavior.Scripted {
+		_, _ = h.channel.Write([]byte(execReq.Command + "\n"))
+		behavior.SendExitStatus = true
+	} else {
+		for _, write := range behavior.Writes {
+			if !h.waitExecGate(write.Gate) {
+				return
+			}
+			writer := io.Writer(h.channel)
+			if write.Stderr {
+				writer = h.channel.Stderr()
+			}
+			if !writeExecChunks(writer, write.Data, write.ChunkSize, write.FirstChunkSent) {
+				return
+			}
+		}
+	}
+	if !h.waitExecGate(behavior.BeforeExit) {
+		return
+	}
+	if !h.waitExecGate(beforeExit) {
+		return
+	}
+	if behavior.SendExitStatus {
+		_, _ = h.channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{Status: uint32(behavior.ExitCode)}))
+	}
+}
 
-	h.server.waitBarrier(func(s *Server) chan struct{} { return s.beforeExit })
+func (h *sessionHandler) waitExecGate(gate <-chan struct{}) bool {
+	if gate == nil {
+		return true
+	}
+	select {
+	case <-gate:
+		return true
+	case <-h.closed:
+		return false
+	case <-h.server.closing:
+		return false
+	}
+}
 
-	// Send exit status 0
-	_, _ = h.channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{Status: 0}))
+func writeExecChunks(w io.Writer, data []byte, size int, firstChunk chan struct{}) bool {
+	if size <= 0 {
+		size = len(data)
+	}
+	for len(data) > 0 {
+		n := min(size, len(data))
+		written, err := w.Write(data[:n])
+		if err != nil || written != n {
+			return false
+		}
+		if firstChunk != nil {
+			close(firstChunk)
+			firstChunk = nil
+		}
+		data = data[n:]
+	}
+	return true
 }
 
 func (h *sessionHandler) runSFTP() {
@@ -726,15 +864,27 @@ func (h *sessionHandler) runSFTP() {
 	_ = server.Serve()
 }
 
-// waitBarrier blocks until the test releases one stage barrier, if it installed
-// one. A test may set a barrier after the server started listening, so the field
-// is read under the server lock rather than directly.
-func (s *Server) waitBarrier(pick func(*Server) chan struct{}) {
+// waitBarrier blocks until a gate opens or Close stops the fixture. False means
+// setup must stop. A test may install a gate after startup, so read it under mu.
+func (s *Server) waitBarrier(pick func(*Server) chan struct{}) bool {
 	s.mu.Lock()
 	barrier := pick(s)
+	closed := s.closed
 	s.mu.Unlock()
-	if barrier != nil {
-		<-barrier
+	if closed {
+		return false
+	}
+	if barrier == nil {
+		return true
+	}
+	select {
+	case <-barrier:
+		// A released gate must not resume setup after Close won the race.
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return !s.closed
+	case <-s.closing:
+		return false
 	}
 }
 

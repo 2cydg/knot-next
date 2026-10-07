@@ -48,22 +48,29 @@ type configWriter interface {
 }
 
 type Service struct {
-	mu       sync.RWMutex
-	nextID   int64
-	sessions map[string]*resource
-	execs    map[string]Exec
-	config   configWriter
-	pool     *sshpool.Pool
-	dial     DialOptions
-	testMode bool
-	onEvent  func(Event)
+	mu         sync.RWMutex
+	nextID     int64
+	sessions   map[string]*resource
+	execs      map[string]Exec
+	execCtx    context.Context
+	execCancel context.CancelCauseFunc
+	execActive map[string]*execOperation
+	config     configWriter
+	pool       *sshpool.Pool
+	dial       DialOptions
+	testMode   bool
+	onEvent    func(Event)
 }
 
 func NewService() *Service {
+	execCtx, execCancel := context.WithCancelCause(context.Background())
 	return &Service{
-		nextID:   1,
-		sessions: map[string]*resource{},
-		execs:    map[string]Exec{},
+		nextID:     1,
+		sessions:   map[string]*resource{},
+		execs:      map[string]Exec{},
+		execCtx:    execCtx,
+		execCancel: execCancel,
+		execActive: map[string]*execOperation{},
 	}
 }
 
@@ -244,6 +251,8 @@ type Exec struct {
 	Stdout         string    `json:"stdout"`
 	Stderr         string    `json:"stderr"`
 	FrameworkError string    `json:"framework_error,omitempty"`
+	FrameworkCode  string    `json:"framework_code,omitempty"`
+	CleanupError   string    `json:"cleanup_error,omitempty"`
 	Truncated      bool      `json:"truncated"`
 	StartedAt      time.Time `json:"started_at"`
 	CompletedAt    time.Time `json:"completed_at"`
@@ -797,44 +806,6 @@ func (s *Service) SubscribeCWD(id string) (<-chan CWDNotify, func(), Resource, e
 	return ch, cancel, session.snapshot(), nil
 }
 
-func (s *Service) Exec(req ExecRequest) (Exec, error) {
-	if strings.TrimSpace(req.ServerRef) == "" {
-		return Exec{}, fmt.Errorf("%w: server_ref is required", ErrValidation)
-	}
-	if strings.TrimSpace(req.Command) == "" {
-		return Exec{}, fmt.Errorf("%w: command is required", ErrValidation)
-	}
-	now := time.Now().UTC()
-	cfgProvider, pool, dialOpts, testMode := s.dependencies()
-	if testMode {
-		return s.recordTestExec(req, now), nil
-	}
-	if cfgProvider == nil {
-		return Exec{}, fmt.Errorf("%w: config service is not available", ErrConflict)
-	}
-	runtimeCfg, err := cfgProvider.RuntimeConfig()
-	if err != nil {
-		return Exec{}, err
-	}
-	server, err := resolveServer(runtimeCfg, req.ServerRef)
-	if err != nil {
-		return Exec{}, err
-	}
-	s.mu.Lock()
-	if len(s.execs) >= maxExecs {
-		s.pruneExecsLocked()
-	}
-	id := "exec_" + strconv.FormatInt(s.nextID, 10)
-	s.nextID++
-	s.mu.Unlock()
-	exec := Exec{ID: id, ServerRef: req.ServerRef, Command: req.Command, State: "running", StartedAt: now}
-	exec = runExec(exec, req, server, runtimeCfg, pool, dialOpts)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.execs[id] = exec
-	return exec, nil
-}
-
 func (s *Service) pruneExecsLocked() {
 	if len(s.execs) < maxExecs {
 		return
@@ -845,12 +816,18 @@ func (s *Service) pruneExecsLocked() {
 	}
 	items := make([]item, 0, len(s.execs))
 	for id, exec := range s.execs {
+		// Pending cleanup is live work, even though its caller has received a
+		// terminal result. Keep its diagnostic record until all workers settle.
+		if _, active := s.execActive[id]; active {
+			continue
+		}
 		items = append(items, item{id: id, t: exec.CompletedAt})
 	}
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].t.Before(items[j].t)
 	})
-	for i := 0; i <= len(items)-maxExecs/2; i++ {
+	remove := min(len(items), len(s.execs)-maxExecs/2+1)
+	for i := 0; i < remove; i++ {
 		delete(s.execs, items[i].id)
 	}
 }
@@ -1659,95 +1636,6 @@ func resolveServer(cfg config.RuntimeConfig, ref string) (config.ServerProfile, 
 	return config.ServerProfile{}, ErrNotFound
 }
 
-func runExec(exec Exec, req ExecRequest, server config.ServerProfile, cfg config.RuntimeConfig, pool *sshpool.Pool, dialOpts DialOptions) Exec {
-	// The exec deadline bounds the whole operation, connection included, so a
-	// cancelled attempt cannot leave a dial or a handshake running behind it.
-	runCtx := context.Background()
-	if req.TimeoutMS > 0 {
-		var cancel context.CancelFunc
-		runCtx, cancel = context.WithTimeout(runCtx, time.Duration(req.TimeoutMS)*time.Millisecond)
-		defer cancel()
-	}
-	client, poolKeys, _, err := pool.GetClientContext(runCtx, server, cfg, nil, sshpool.DialOptions{
-		AgentSocket:   dialOpts.AgentSocket,
-		HostKeyPolicy: req.HostKeyPolicy,
-		Timeout:       dialOpts.Timeout,
-	})
-	if err != nil {
-		exec.State = "failed"
-		exec.ExitCode = -1
-		exec.FrameworkError = safeError(err, cfg)
-		exec.CompletedAt = time.Now().UTC()
-		return exec
-	}
-	pool.IncRef(poolKeys...)
-	defer pool.DecRef(poolKeys...)
-	session, err := openSSHSession(runCtx, client)
-	if err != nil {
-		exec.State = "failed"
-		exec.ExitCode = -1
-		exec.FrameworkError = safeError(err, cfg)
-		exec.CompletedAt = time.Now().UTC()
-		return exec
-	}
-	defer session.Close()
-	stdout := &limitedWriter{limit: 512 * 1024}
-	stderr := &limitedWriter{limit: 512 * 1024}
-	session.Stdout = stdout
-	session.Stderr = stderr
-	done := make(chan error, 1)
-	go func() {
-		done <- session.Run(req.Command)
-	}()
-	var runErr error
-	select {
-	case runErr = <-done:
-	case <-runCtx.Done():
-		_ = session.Signal(ssh.SIGKILL)
-		runErr = runCtx.Err()
-	}
-	exec.CompletedAt = time.Now().UTC()
-	exec.Stdout = stdout.String()
-	exec.Stderr = stderr.String()
-	exec.Truncated = stdout.truncated || stderr.truncated
-	if runErr == nil {
-		exec.State = "completed"
-		exec.ExitCode = 0
-		return exec
-	}
-	var exitErr *ssh.ExitError
-	if errors.As(runErr, &exitErr) {
-		exec.State = "completed"
-		exec.ExitCode = exitErr.ExitStatus()
-		return exec
-	}
-	exec.State = "failed"
-	exec.ExitCode = -1
-	exec.FrameworkError = safeError(runErr, cfg)
-	return exec
-}
-
-func (s *Service) recordTestExec(req ExecRequest, now time.Time) Exec {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.execs) >= maxExecs {
-		s.pruneExecsLocked()
-	}
-	id := "exec_" + strconv.FormatInt(s.nextID, 10)
-	s.nextID++
-	exec := Exec{
-		ID:          id,
-		ServerRef:   req.ServerRef,
-		Command:     req.Command,
-		State:       "completed",
-		ExitCode:    0,
-		StartedAt:   now,
-		CompletedAt: now,
-	}
-	s.execs[id] = exec
-	return exec
-}
-
 // newSessionBackend builds the backend of a session created in test mode. It is a
 // variable so tests can supply a backend whose I/O they control.
 var newSessionBackend = newLocalInteractiveBackend
@@ -1779,31 +1667,6 @@ func newLocalInteractiveBackend() *interactiveBackend {
 		pump:       pump,
 		exitResult: exitResult,
 	}
-}
-
-type limitedWriter struct {
-	buf       strings.Builder
-	limit     int
-	truncated bool
-}
-
-func (w *limitedWriter) Write(p []byte) (int, error) {
-	if w.buf.Len() < w.limit {
-		remaining := w.limit - w.buf.Len()
-		if len(p) > remaining {
-			_, _ = w.buf.Write(p[:remaining])
-			w.truncated = true
-			return len(p), nil
-		}
-		_, _ = w.buf.Write(p)
-		return len(p), nil
-	}
-	w.truncated = true
-	return len(p), nil
-}
-
-func (w *limitedWriter) String() string {
-	return w.buf.String()
 }
 
 func readByteStream(ctx context.Context, r io.Reader, out chan<- []byte) {

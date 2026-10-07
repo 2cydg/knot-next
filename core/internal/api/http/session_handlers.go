@@ -71,7 +71,7 @@ func (s *Server) handleSessions(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		data, err := sessionService.Exec(body)
+		data, err := sessionService.ExecContext(r.Context(), body)
 		writeSessionResult(w, response.RiskLongRunning, "sessions/exec", data, err)
 	case len(parts) == 1:
 		id := parts[0]
