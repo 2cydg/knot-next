@@ -37,6 +37,12 @@ The future CLI client will:
 - Bridge native terminal for SSH connections
 - Not directly modify configuration files
 
+The new client does not migrate legacy shell/Cobra completion or SFTP REPL
+completion. TUI search, resource selection, file browsing, and any input
+suggestions are designed in the client phase. Core retains generic resource
+queries, directory listing, glob matching, and directory caching through its API;
+it should not implement legacy command syntax or completion display formatting.
+
 This design is planned but not yet implemented. The current phase focuses on completing the core service capabilities.
 
 ## Building

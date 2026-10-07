@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"knot-core/pkg/sshpool"
 
 	pkgsftp "github.com/pkg/sftp"
+	"golang.org/x/crypto/ssh"
 )
 
 var (
@@ -74,6 +76,14 @@ type resource struct {
 	authRetryCount   int
 	cancel           context.CancelFunc
 	cache            *remoteDirCache
+
+	// serverID is the resolved profile ID this session authenticates against.
+	// It is display-independent: a client-supplied Alias never changes it.
+	serverID string
+	// pendingCredentials holds the candidate to persist once the SFTP subsystem
+	// is actually open. It is bound to the attempt that produced it, so a
+	// rejected attempt can never leave a candidate behind for a later success.
+	pendingCredentials *ChallengeResponse
 }
 
 // backendView is captured under Service.mu and remains immutable during I/O.
@@ -201,20 +211,21 @@ type ChallengeResponse struct {
 }
 
 type Event struct {
-	Type        string     `json:"type"`
-	SessionID   string     `json:"session_id"`
-	State       string     `json:"state,omitempty"`
-	Path        string     `json:"path,omitempty"`
-	Error       string     `json:"error,omitempty"`
-	TransferID  string     `json:"transfer_id,omitempty"`
-	Direction   string     `json:"direction,omitempty"`
-	BytesTotal  int64      `json:"bytes_total,omitempty"`
-	BytesCopied int64      `json:"bytes_copied,omitempty"`
-	FilesTotal  int        `json:"files_total,omitempty"`
-	FilesDone   int        `json:"files_done,omitempty"`
-	CurrentPath string     `json:"current_path,omitempty"`
-	Challenge   *Challenge `json:"challenge,omitempty"`
-	Time        time.Time  `json:"time"`
+	Type        string           `json:"type"`
+	SessionID   string           `json:"session_id"`
+	State       string           `json:"state,omitempty"`
+	Path        string           `json:"path,omitempty"`
+	Error       string           `json:"error,omitempty"`
+	TransferID  string           `json:"transfer_id,omitempty"`
+	Direction   string           `json:"direction,omitempty"`
+	BytesTotal  int64            `json:"bytes_total,omitempty"`
+	BytesCopied int64            `json:"bytes_copied,omitempty"`
+	FilesTotal  int              `json:"files_total,omitempty"`
+	FilesDone   int              `json:"files_done,omitempty"`
+	CurrentPath string           `json:"current_path,omitempty"`
+	Challenge   *Challenge       `json:"challenge,omitempty"`
+	Warning     *session.Warning `json:"warning,omitempty"`
+	Time        time.Time        `json:"time"`
 }
 
 type Entry struct {
@@ -437,8 +448,9 @@ func (s *Service) Create(req CreateRequest) (Session, error) {
 		if current, ok := s.sessions[id]; ok {
 			current.UpdatedAt = now
 			s.publishSessionLocked(current, Event{Type: "sftp.session.opened", SessionID: id, State: current.State, Time: now})
+			opened := current.snapshot()
 			s.mu.Unlock()
-			return current.snapshot(), nil
+			return opened, nil
 		}
 		s.mu.Unlock()
 		return Session{}, ErrNotFound
@@ -448,8 +460,14 @@ func (s *Service) Create(req CreateRequest) (Session, error) {
 		s.cleanupCreateFailure(id)
 		return Session{}, err
 	}
+	// Snapshot before handing the session to the connect goroutine. The returned
+	// resource describes the accepted creation, and taking it under the lock
+	// keeps it from racing with the fields connectSession resolves.
+	s.mu.Lock()
+	created := res.snapshot()
+	s.mu.Unlock()
 	go s.connectSession(ctx, id, req, cfgProvider, pool)
-	return res.snapshot(), nil
+	return created, nil
 }
 
 func (s *Service) cleanupCreateFailure(id string) {
@@ -509,12 +527,15 @@ func (s *Service) connectSession(ctx context.Context, id string, req CreateReque
 	}
 	if req.Alias == "" {
 		req.Alias = server.Alias
-		s.mu.Lock()
-		if res, ok := s.sessions[id]; ok {
-			res.Alias = server.Alias
-		}
-		s.mu.Unlock()
 	}
+	s.mu.Lock()
+	if res, ok := s.sessions[id]; ok {
+		res.serverID = server.ID
+		if req.Alias != "" {
+			res.Alias = req.Alias
+		}
+	}
+	s.mu.Unlock()
 	client, poolKeys, finalCfg, err := s.openRemoteClient(ctx, id, req, server, runtimeCfg, pool)
 	if err != nil {
 		s.failSession(id, err, finalCfg)
@@ -522,23 +543,32 @@ func (s *Service) connectSession(ctx context.Context, id string, req CreateReque
 	}
 	now := time.Now().UTC()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	res, ok := s.sessions[id]
-	if !ok {
-		_ = client.Close()
+	if !ok || res.State == "closed" || res.State == "disconnected" || res.State == "failed" {
+		// Nothing will publish this client. The lock is released before closing
+		// it: a subsystem close on a stalled remote must not hold the service
+		// lock, which every other request and teardown needs.
+		s.mu.Unlock()
+		_ = boundedSubsystemClose(client.Close)
 		pool.DecRef(poolKeys...)
 		return
 	}
-	if res.State == "closed" || res.State == "disconnected" || res.State == "failed" {
-		_ = client.Close()
-		pool.DecRef(poolKeys...)
-		return
-	}
+	defer s.mu.Unlock()
 	res.client = client
 	res.poolKeys = cloneStrings(poolKeys)
 	res.cache = newRemoteDirCache(client, remoteDirCacheTTL)
 	res.State = "open"
 	res.UpdatedAt = now
+	// The SFTP subsystem is open and authenticated: this is the first point at
+	// which the candidate may be persisted, and only if the attempt that just
+	// succeeded asked for it.
+	if res.pendingCredentials != nil {
+		candidate := *res.pendingCredentials
+		res.pendingCredentials = nil
+		if candidate.Remember {
+			go s.saveCredentials(id, res.serverID, candidate)
+		}
+	}
 	s.publishSessionLocked(res, Event{Type: "sftp.session.opened", SessionID: id, State: res.State, Time: now})
 }
 
@@ -550,10 +580,10 @@ func (s *Service) openRemoteClient(ctx context.Context, sessionID string, req Cr
 			return nil, nil, currentCfg, ctx.Err()
 		default:
 		}
-		confirm := func(prompt sshpool.HostKeyPrompt) bool {
-			return s.waitHostKeyResponse(ctx, sessionID, server, prompt)
+		confirm := func(attemptCtx context.Context, prompt sshpool.HostKeyPrompt) bool {
+			return s.waitHostKeyResponse(attemptCtx, sessionID, server, prompt)
 		}
-		client, poolKeys, _, err := pool.GetClient(server, currentCfg, confirm, sshpool.DialOptions{
+		client, poolKeys, _, err := pool.GetClientContextWithPrompt(ctx, server, currentCfg, confirm, sshpool.DialOptions{
 			AgentSocket:   req.AgentSocket,
 			HostKeyPolicy: req.HostKeyPolicy,
 		})
@@ -573,14 +603,158 @@ func (s *Service) openRemoteClient(ctx context.Context, sessionID string, req Cr
 			return nil, nil, currentCfg, err
 		}
 		pool.IncRef(poolKeys...)
-		sftpClient, err := pkgsftp.NewClient(client)
+		sftpClient, err := openSFTPSubsystem(ctx, client)
 		if err != nil {
+			// The attempt is over, so the pool reference it just took is released
+			// here: a cancelled creation must not keep a shared connection alive.
 			pool.DecRef(poolKeys...)
 			return nil, nil, currentCfg, err
 		}
 		return sftpClient, poolKeys, currentCfg, nil
 	}
 	return nil, nil, currentCfg, fmt.Errorf("%w: retry limit reached", ErrConflict)
+}
+
+// sftpTransport retains the SSH session and a locally cancellable reader.
+// Closing stdin alone sends EOF; closing this transport also sends channel close
+// and interrupts local SFTP reads even when the peer never sends EOF back.
+type sftpTransport struct {
+	session *ssh.Session
+	stdin   io.WriteCloser
+	reader  *io.PipeReader
+	output  *io.PipeWriter
+	once    sync.Once
+	err     error
+}
+
+var subsystemGrace = 2 * time.Second
+var subsystemTimeout = 15 * time.Second
+
+func (p *sftpTransport) Write(data []byte) (int, error) { return p.stdin.Write(data) }
+func (p *sftpTransport) Close() error {
+	p.once.Do(func() {
+		_ = p.reader.Close()
+		_ = p.output.Close()
+		p.err = boundedSubsystemClose(p.session.Close)
+	})
+	return p.err
+}
+
+func boundedSubsystemClose(close func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- close() }()
+	timer := time.NewTimer(subsystemGrace)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
+		return err
+	case <-timer.C:
+		return fmt.Errorf("SFTP close: %w", session.ErrTeardownTimeout)
+	}
+}
+
+// openSFTPSubsystem publishes the session handle before any subsystem/version
+// wait. Cancellation closes that handle immediately instead of waiting for the
+// constructor result. A late channel open is closed without starting SFTP.
+func openSFTPSubsystem(ctx context.Context, client *ssh.Client) (*pkgsftp.Client, error) {
+	ctx, cancel := context.WithTimeout(ctx, subsystemTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type opened struct {
+		client *pkgsftp.Client
+		err    error
+	}
+	var mu sync.Mutex
+	var transport *sftpTransport
+	cancelled := false
+	abort := func() {
+		mu.Lock()
+		cancelled = true
+		owned := transport
+		mu.Unlock()
+		if owned != nil {
+			_ = owned.Close()
+		}
+	}
+	stop := context.AfterFunc(ctx, abort)
+	defer stop()
+	done := make(chan opened, 1)
+	go func() {
+		sub, err := client.NewSession()
+		if err != nil {
+			done <- opened{err: err}
+			return
+		}
+		stdin, err := sub.StdinPipe()
+		if err != nil {
+			_ = boundedSubsystemClose(sub.Close)
+			done <- opened{err: err}
+			return
+		}
+		stdout, err := sub.StdoutPipe()
+		if err != nil {
+			_ = boundedSubsystemClose(sub.Close)
+			done <- opened{err: err}
+			return
+		}
+		stderr, err := sub.StderrPipe()
+		if err != nil {
+			_ = boundedSubsystemClose(sub.Close)
+			done <- opened{err: err}
+			return
+		}
+		reader, output := io.Pipe()
+		owned := &sftpTransport{session: sub, stdin: stdin, reader: reader, output: output}
+		mu.Lock()
+		transport = owned
+		stopped := cancelled || ctx.Err() != nil
+		mu.Unlock()
+		if stopped {
+			_ = owned.Close()
+			done <- opened{err: ctx.Err()}
+			return
+		}
+		go func() { _, err := io.Copy(output, stdout); _ = output.CloseWithError(err) }()
+		go func() { _, _ = io.Copy(io.Discard, stderr) }()
+		if err := sub.RequestSubsystem("sftp"); err != nil {
+			_ = owned.Close()
+			done <- opened{err: err}
+			return
+		}
+		c, err := pkgsftp.NewClientPipe(reader, owned)
+		if err != nil {
+			_ = owned.Close()
+			done <- opened{err: err}
+			return
+		}
+		if ctx.Err() != nil {
+			_ = boundedSubsystemClose(c.Close)
+			done <- opened{err: ctx.Err()}
+			return
+		}
+		done <- opened{client: c}
+	}()
+	select {
+	case result := <-done:
+		if err := ctx.Err(); err != nil {
+			abort()
+			if result.client != nil {
+				_ = boundedSubsystemClose(result.client.Close)
+			}
+			return nil, err
+		}
+		return result.client, result.err
+	case <-ctx.Done():
+		// Mark cancellation ourselves as well: stopping an AfterFunc that has not
+		// started must never suppress cleanup. This does not wait for constructor.
+		abort()
+		return nil, ctx.Err()
+	}
 }
 
 func (s *Service) waitHostKeyResponse(ctx context.Context, sessionID string, server config.ServerProfile, prompt sshpool.HostKeyPrompt) bool {
@@ -607,9 +781,19 @@ func (s *Service) waitHostKeyResponse(ctx context.Context, sessionID string, ser
 		s.mu.Unlock()
 		return false
 	}
+	// The attempt may already be over: a cancelled or otherwise finished session
+	// keeps its terminal state, so registering a challenge here would move it
+	// back to pending and let the cancellation branch rewrite the outcome.
+	if isTerminalSessionState(res.State) {
+		s.mu.Unlock()
+		return false
+	}
 	res.hostKeyChallenge = challenge
 	res.HostKeyPending = true
-	res.State = "connecting"
+	// The state names the wait the client is in, matching the SSH contract: the
+	// pending flag, the snapshot and the event are all computed from this same
+	// commit, so they can never disagree.
+	res.State = "host_key_pending"
 	res.UpdatedAt = now
 	s.publishSessionLocked(res, Event{
 		Type:      "sftp.host_key.challenge",
@@ -661,10 +845,16 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 		s.mu.Unlock()
 		return cfg, ErrNotFound
 	}
+	// Same terminal-state guard as the host key wait: a retry challenge for an
+	// attempt that is already over must not reopen it as pending.
+	if isTerminalSessionState(res.State) {
+		s.mu.Unlock()
+		return cfg, fmt.Errorf("%w: session %s no longer accepts challenge responses", ErrConflict, sessionID)
+	}
 	res.authRetryCount = retryCount
 	res.authChallenge = challenge
 	res.AuthPending = true
-	res.State = "connecting"
+	res.State = "auth_pending"
 	res.UpdatedAt = now
 	s.publishSessionLocked(res, Event{
 		Type:      "sftp.auth.challenge",
@@ -682,6 +872,22 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 		if resp.Abort {
 			return cfg, fmt.Errorf("%w: authentication retry aborted", ErrConflict)
 		}
+		// The candidate belongs to this attempt only: it replaces whatever an
+		// earlier rejected attempt stored, or clears it when this attempt is not
+		// to be remembered. Nothing is persisted here.
+		s.mu.Lock()
+		if res, ok := s.sessions[sessionID]; ok && !isTerminalSessionState(res.State) {
+			// The session may have been closed while the challenge was pending; a
+			// terminal one must not take a new candidate that a later attempt
+			// could still persist.
+			if resp.Remember {
+				candidate := resp
+				res.pendingCredentials = &candidate
+			} else {
+				res.pendingCredentials = nil
+			}
+		}
+		s.mu.Unlock()
 		return s.runtimeConfigForAuthResponse(cfg, server, resp)
 	case <-timer.C:
 		s.failPendingChallenge(sessionID, "auth", "authentication retry timed out")
@@ -692,44 +898,26 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 	}
 }
 
+// runtimeConfigForAuthResponse builds the config for the next authentication
+// attempt. It is pure: the subsystem is not open yet, so the candidate cannot
+// be shown to work and must not be written to the configuration. Persisting
+// happens in connectSession once the SFTP subsystem is actually open.
 func (s *Service) runtimeConfigForAuthResponse(cfg config.RuntimeConfig, server config.ServerProfile, resp ChallengeResponse) (config.RuntimeConfig, error) {
 	next := cloneRuntimeConfig(cfg)
 	profile := next.Servers[server.ID]
+
 	if resp.Password != "" {
 		profile.AuthMethod = config.AuthMethodPassword
 		profile.Password = resp.Password
-		if resp.Remember {
-			if _, err := s.config.SetServerPassword(server.ID, resp.Password); err != nil {
-				return cfg, err
-			}
-			saved, err := s.config.RuntimeConfig()
-			if err != nil {
-				return cfg, err
-			}
-			next = saved
-			profile = next.Servers[server.ID]
-		}
 	}
 	if resp.KeyID != "" {
 		profile.AuthMethod = config.AuthMethodKey
 		profile.KeyID = resp.KeyID
-		if resp.Remember {
-			savedProfile := profile
-			savedProfile.Password = ""
-			if _, err := s.config.UpdateServer(server.ID, savedProfile); err != nil {
-				return cfg, err
-			}
-			saved, err := s.config.RuntimeConfig()
-			if err != nil {
-				return cfg, err
-			}
-			next = saved
-			profile = next.Servers[server.ID]
-		}
 	}
 	if resp.Password == "" && resp.KeyID == "" {
 		profile.AuthMethod = config.AuthMethodAgent
 	}
+
 	next.Servers[server.ID] = profile
 	return next, nil
 }
@@ -778,6 +966,12 @@ func (s *Service) respondChallenge(id string, typ string, resp ChallengeResponse
 		s.mu.Unlock()
 		return Challenge{}, ErrNotFound
 	}
+	// Once terminal a challenge is no longer submittable: answering one would
+	// move the session back out of the outcome that was recorded for it.
+	if isTerminalSessionState(res.State) {
+		s.mu.Unlock()
+		return Challenge{}, fmt.Errorf("%w: session %s no longer accepts challenge responses", ErrConflict, id)
+	}
 	var pending *pendingChallenge
 	if typ == "host_key" {
 		pending = res.hostKeyChallenge
@@ -792,9 +986,15 @@ func (s *Service) respondChallenge(id string, typ string, resp ChallengeResponse
 	if typ == "host_key" {
 		res.hostKeyChallenge = nil
 		res.HostKeyPending = false
+		if res.State == "host_key_pending" {
+			res.State = "connecting"
+		}
 	} else {
 		res.authChallenge = nil
 		res.AuthPending = false
+		if res.State == "auth_pending" {
+			res.State = "connecting"
+		}
 	}
 	res.UpdatedAt = time.Now().UTC()
 	s.publishSessionLocked(res, Event{Type: "sftp.challenge.resolved", SessionID: id, State: res.State, Challenge: &challenge, Time: res.UpdatedAt})
@@ -816,6 +1016,11 @@ func (s *Service) failPendingChallenge(sessionID string, typ string, message str
 	if !ok {
 		return
 	}
+	// A cancelled or already failed session keeps its terminal state, time and
+	// cause; this late failure report is only noise.
+	if isTerminalSessionState(res.State) {
+		return
+	}
 	if typ == "host_key" {
 		res.hostKeyChallenge = nil
 		res.HostKeyPending = false
@@ -827,6 +1032,7 @@ func (s *Service) failPendingChallenge(sessionID string, typ string, message str
 	res.DisconnectCause = message
 	res.ClosedAt = &now
 	res.UpdatedAt = now
+	res.pendingCredentials = nil
 	s.publishSessionLocked(res, Event{Type: "sftp.error", SessionID: sessionID, State: res.State, Error: message, Time: now})
 }
 
@@ -838,6 +1044,9 @@ func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig) {
 	if !ok {
 		return
 	}
+	if isTerminalSessionState(res.State) {
+		return
+	}
 	if res.followCancel != nil {
 		res.followCancel()
 		res.followCancel = nil
@@ -846,7 +1055,92 @@ func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig) {
 	res.DisconnectCause = safeError(err, cfg)
 	res.ClosedAt = &now
 	res.UpdatedAt = now
+	res.pendingCredentials = nil
+	res.hostKeyChallenge = nil
+	res.authChallenge = nil
+	res.HostKeyPending = false
+	res.AuthPending = false
 	s.publishSessionLocked(res, Event{Type: "sftp.error", SessionID: id, State: res.State, Error: res.DisconnectCause, Time: now})
+}
+
+// isTerminalSessionState reports whether an SFTP session state is final. The
+// outcome, its time and its cause are recorded once and never rewritten.
+func isTerminalSessionState(state string) bool {
+	return state == "closed" || state == "failed" || state == "disconnected"
+}
+
+// saveCredentials persists a verified credential candidate after the SFTP
+// subsystem opened. It runs off the request path, and a failure never disturbs
+// the working connection: the client is told through a sanitized warning.
+func (s *Service) saveCredentials(sessionID string, serverID string, resp ChallengeResponse) {
+	if serverID == "" {
+		return
+	}
+	if resp.Password != "" {
+		if _, err := s.config.SetServerPassword(serverID, resp.Password); err != nil {
+			s.publishWarning(sessionID, session.WarningCredentialSaveFailed, "password was not saved")
+		}
+		return
+	}
+	if resp.KeyID != "" {
+		cfg, err := s.config.RuntimeConfig()
+		if err != nil {
+			s.publishWarning(sessionID, session.WarningCredentialSaveFailed, "key was not saved")
+			return
+		}
+		profile, ok := cfg.Servers[serverID]
+		if !ok {
+			return
+		}
+		profile.AuthMethod = config.AuthMethodKey
+		profile.KeyID = resp.KeyID
+		profile.Password = ""
+		if _, err := s.config.UpdateServer(serverID, profile); err != nil {
+			s.publishWarning(sessionID, session.WarningCredentialSaveFailed, "key was not saved")
+		}
+	}
+}
+
+// publishWarning emits a sanitized, observable warning about a non-fatal
+// condition. Secrets handed to it are removed from the message first, so a
+// config-writer error that echoes a credential cannot leak it.
+func (s *Service) publishWarning(sessionID string, kind string, message string, secrets ...string) {
+	safe := sanitizeWarning(message, secrets...)
+	now := time.Now().UTC()
+	event := Event{
+		Type:      "sftp.warning",
+		SessionID: sessionID,
+		Warning:   &session.Warning{Kind: kind, Message: safe},
+		Time:      now,
+	}
+
+	s.mu.Lock()
+	if res, ok := s.sessions[sessionID]; ok {
+		event.State = res.State
+		s.publishSessionLocked(res, event)
+		s.mu.Unlock()
+		return
+	}
+	callback := s.onEvent
+	s.mu.Unlock()
+	if callback != nil {
+		callback(cloneEvent(event))
+	}
+}
+
+// redacted replaces every occurrence of a credential with a fixed marker.
+const redacted = "[redacted]"
+
+// sanitizeWarning removes all occurrences of supplied secrets. Credential-save
+// warnings additionally use fixed messages instead of arbitrary writer errors.
+func sanitizeWarning(message string, secrets ...string) string {
+	out := message
+	for _, secret := range secrets {
+		if secret != "" {
+			out = strings.ReplaceAll(out, secret, redacted)
+		}
+	}
+	return out
 }
 
 func (s *Service) Get(id string) (Session, error) {
@@ -874,17 +1168,23 @@ func (s *Service) ListSessions() []Session {
 
 func (s *Service) Close(id string) (Session, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	res, ok := s.sessions[id]
 	if !ok {
+		s.mu.Unlock()
 		return Session{}, ErrNotFound
 	}
 	if res.State == "closed" {
-		return res.snapshot(), nil
+		snapshot := res.snapshot()
+		s.mu.Unlock()
+		return snapshot, nil
 	}
 	now := time.Now().UTC()
-	s.closeSessionLocked(res, "closed", "client requested close", now)
-	return res.snapshot(), nil
+	client, poolKeys := s.closeSessionLocked(res, "closed", "client requested close", now)
+	snapshot := res.snapshot()
+	s.mu.Unlock()
+
+	err := s.releaseDetached(client, poolKeys)
+	return snapshot, err
 }
 
 func (s *Service) CloseByPoolKey(poolKey string) []Session {
@@ -893,19 +1193,39 @@ func (s *Service) CloseByPoolKey(poolKey string) []Session {
 	}
 	now := time.Now().UTC()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	closed := make([]Session, 0)
+	detached := make([]*pkgsftp.Client, 0)
+	detachedKeys := make([][]string, 0)
 	for _, res := range s.sessions {
 		if (res.State == "closed" || res.State == "failed" || res.State == "disconnected") || !containsString(res.poolKeys, poolKey) {
 			continue
 		}
-		s.closeSessionLocked(res, "disconnected", "ssh pool disconnected", now)
+		client, poolKeys := s.closeSessionLocked(res, "disconnected", "ssh pool disconnected", now)
+		detached = append(detached, client)
+		detachedKeys = append(detachedKeys, poolKeys)
 		closed = append(closed, res.snapshot())
+	}
+	s.mu.Unlock()
+
+	// The remote subsystems are released after the lock is dropped, so one
+	// stalled close cannot hold the service lock against every other session.
+	for i, client := range detached {
+		s.releaseDetached(client, detachedKeys[i])
 	}
 	return closed
 }
 
-func (s *Service) closeSessionLocked(res *resource, state string, cause string, now time.Time) {
+// closeSessionLocked records a session's terminal outcome and detaches the
+// resources that must be released outside the service lock. Closing the remote
+// subsystem is a network operation that can block on a stalled remote, so it is
+// returned to the caller instead of performed here, where it would hold the
+// lock against every other request and against teardown.
+func (s *Service) closeSessionLocked(res *resource, state string, cause string, now time.Time) (*pkgsftp.Client, []string) {
+	// A session that already reached a terminal state keeps its recorded
+	// outcome, time and cause; closing it again must not rewrite them.
+	if isTerminalSessionState(res.State) {
+		return nil, nil
+	}
 	if res.cancel != nil {
 		res.cancel()
 	}
@@ -916,18 +1236,22 @@ func (s *Service) closeSessionLocked(res *resource, state string, cause string, 
 	// Signal transfer cancellation before closing the transport: pending I/O may
 	// return immediately with a connection error once the client is closed.
 	s.cancelSessionTransfersLocked(res.ID)
-	if res.client != nil {
-		_ = res.client.Close()
-		res.client = nil
-	}
-	if len(res.poolKeys) > 0 && s.pool != nil {
-		s.pool.DecRef(res.poolKeys...)
-		res.poolKeys = nil
-	}
+	client := res.client
+	res.client = nil
+	poolKeys := res.poolKeys
+	res.poolKeys = nil
 	res.State = state
 	res.DisconnectCause = cause
 	res.UpdatedAt = now
 	res.ClosedAt = &now
+	// Clear pending markers and the credential candidate so a late challenge,
+	// retry or connect failure cannot revive the session or leave a secret
+	// waiting to be persisted.
+	res.hostKeyChallenge = nil
+	res.authChallenge = nil
+	res.HostKeyPending = false
+	res.AuthPending = false
+	res.pendingCredentials = nil
 	eventType := "sftp.session.closed"
 	if state == "disconnected" {
 		eventType = "sftp.session.disconnected"
@@ -941,6 +1265,21 @@ func (s *Service) closeSessionLocked(res *resource, state string, cause string, 
 		close(ch)
 	}
 	delete(s.transferSubs, res.ID)
+	return client, poolKeys
+}
+
+// releaseDetached closes a session's remote subsystem and returns its pool
+// references. It runs outside the service lock: both steps touch the network,
+// and Close must stay responsive when the remote has stopped answering.
+func (s *Service) releaseDetached(client *pkgsftp.Client, poolKeys []string) error {
+	var err error
+	if client != nil {
+		err = boundedSubsystemClose(client.Close)
+	}
+	if len(poolKeys) > 0 && s.pool != nil {
+		s.pool.DecRef(poolKeys...)
+	}
+	return err
 }
 
 func (s *Service) cancelSessionTransfersLocked(sessionID string) {
@@ -1032,7 +1371,7 @@ func (s *Service) SessionCount() int {
 	defer s.mu.RUnlock()
 	count := 0
 	for _, res := range s.sessions {
-		if res.State == "connecting" || res.State == "open" {
+		if !isTerminalSessionState(res.State) {
 			count++
 		}
 	}
@@ -2845,6 +3184,10 @@ func cloneChallengePtr(ch *Challenge) *Challenge {
 func cloneEvent(event Event) Event {
 	out := event
 	out.Challenge = cloneChallengePtr(out.Challenge)
+	if event.Warning != nil {
+		warning := *event.Warning
+		out.Warning = &warning
+	}
 	return out
 }
 

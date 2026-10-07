@@ -3,6 +3,27 @@
 core 使用 HTTP/JSON 管理资源，使用 WebSocket 订阅变化或承载交互字节流。连接需要与 HTTP 相同的 Bearer token；浏览器连接还受 Origin 策略约束。
 SSH attach 的 PTY 字节流直接转发，不应用以下 JSON 事件处理规则。
 
+## SSH attach 的字节和顺序保证
+
+`GET /v1/sessions/{id}/attach` 的 binary frame 是远端 PTY 的原始字节，服务端不解释内容：不修改 CR/LF、不解析或吞掉 ANSI/OSC7 序列、不改写 NUL 或非法 UTF-8，也不在这些字节中插入 JSON。允许重新分帧，把一次远端写入拆到多个 frame，但拼接后的字节必须与远端发送的完全一致。
+
+顺序保证的范围：
+
+- 同一流内部有序：`stdout` 追加的字节按顺序到达；`stderr` 同理。
+- 两个流之间没有全局顺序承诺。PTY 会话通常由远端把两者合流，此时按远端真实到达顺序转发，但客户端不应假设跨流的因果顺序。
+- `text` frame 与 `binary` frame 之间没有顺序承诺，除了下面的结束规则。客户端必须按 opcode 分流，不能把 JSON 事件当作终端输出。
+
+结束规则（客户端可以依赖）：
+
+1. 远端退出后，服务端先把已经收到的输出字节全部发出，再发送唯一的 `session.exit`。
+2. `session.exit` 之后不再有任何输出；随后服务端关闭连接。
+3. `session.exit` 的 `exit_code` 与同一时刻 `GET /v1/sessions/{id}` 的 `exit_code` 一致。
+4. 如果客户端自己没有读取，服务端会在有界队列写满或写入超时时结束 attach 并关闭连接；这种情况不保证送达 `session.exit`，客户端必须把它当作截断，并可通过 `GET /v1/sessions/{id}` 获取真实终态。
+
+未附着时产生的输出保存在有界缓冲中，attach 建立后先补发，超出上限时丢弃最旧的字节并发送 `session.attach.truncated` 通知。已发送给前一个 attach 的字节不会重放。
+
+SSH 输入按 backend 串行写入。detach 取消旧 attachment 的排队输入，已经进入传输层的字节可能继续送达。新 attachment 的输入在旧写入完成之前保持背压；持续阻塞时实际写入者数量不会随 attach/detach 次数增长。
+
 ## SFTP 传输快照和事件
 
 连接 `GET /v1/sftp/{session_id}/transfers/events` 后，第一个 text frame 是：

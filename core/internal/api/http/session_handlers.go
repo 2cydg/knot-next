@@ -8,8 +8,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"net"
 	stdhttp "net/http"
 	"strings"
 	"sync"
@@ -20,6 +20,21 @@ import (
 )
 
 const maxWSFrameSize = 1 << 20
+
+const (
+	// attachQueueDepth bounds server->client frames queued but not yet written.
+	// A client that cannot keep up is disconnected rather than buffered without
+	// limit.
+	attachQueueDepth = 64
+	// attachDrainTimeout bounds waiting for queued frames to flush on a terminal
+	// path. It is a failure bound, not a tail-flush delay.
+	attachDrainTimeout = 5 * time.Second
+)
+
+// attachWriteTimeout bounds a single frame write. A client that stops reading
+// must not be able to block a writer forever; the zero value disables the bound
+// and is only used by tests.
+var attachWriteTimeout = 30 * time.Second
 
 func (s *Server) handleSessions(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	sessionService := s.core.Session()
@@ -101,43 +116,9 @@ func (s *Server) handleSessions(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	}
 }
 
-func relayAttachOutput(ctx context.Context, cancel context.CancelFunc, writeFrame func(int, []byte) error, ch <-chan []byte, opcode int) {
-	defer cancel()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case payload, ok := <-ch:
-			if !ok {
-				return
-			}
-			if len(payload) > 0 {
-				if err := writeFrame(opcode, payload); err != nil {
-					return
-				}
-			}
-		}
-	}
-}
-
-func relayAttachInput(ctx context.Context, cancel context.CancelFunc, input io.Writer, in <-chan []byte) {
-	defer cancel()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case payload := <-in:
-			if len(payload) == 0 {
-				continue
-			}
-			if _, err := input.Write(payload); err != nil {
-				return
-			}
-		}
-	}
-}
-
-func pingAttach(ctx context.Context, cancel context.CancelFunc, writeFrame func(int, []byte) error) {
+// pingAttach keeps a WebSocket connection alive. send reports whether the frame
+// was accepted; on failure the connection is closed so blocked readers return.
+func pingAttach(ctx context.Context, conn io.Closer, send func(opcode int, payload []byte) bool) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -145,8 +126,8 @@ func pingAttach(ctx context.Context, cancel context.CancelFunc, writeFrame func(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := writeFrame(wsOpcodePing, nil); err != nil {
-				cancel()
+			if !send(wsOpcodePing, nil) {
+				_ = conn.Close()
 				return
 			}
 		}
@@ -229,75 +210,253 @@ func writeSessionError(w stdhttp.ResponseWriter, risk response.Risk, resource st
 }
 
 func (s *Server) attachSessionWS(w stdhttp.ResponseWriter, r *stdhttp.Request, sessionService *session.Service, id string) {
-	conn, err := upgradeWebSocket(w, r)
+	// Claim the attachment before upgrading: a conflict is then a plain HTTP
+	// status the client can act on, and a failed upgrade leaves no ownership
+	// behind for the next attempt to trip over.
+	stream, data, err := sessionService.AttachStream(id)
 	if err != nil {
+		writeSessionError(w, response.RiskLongRunning, "sessions/"+id+"/attach", err)
+		return
+	}
+	conn, err := s.upgradeWebSocket(w, r)
+	if err != nil {
+		stream.Cancel()
+		stream.Release()
 		writeAPIError(w, stdhttp.StatusBadRequest, response.RiskLongRunning, "sessions/"+id+"/attach", "WEBSOCKET_UPGRADE_FAILED", err.Error())
 		return
 	}
 	defer conn.Close()
-	stream, data, err := sessionService.AttachStream(id)
-	if err != nil {
-		_ = conn.WriteFrame(wsOpcodeText, []byte(fmt.Sprintf(`{"type":"error","code":"ATTACH_FAILED","message":%q}`, err.Error())))
-		return
-	}
+
 	events, cancelEvents, _, err := sessionService.Subscribe(id)
 	if err != nil {
-		_ = conn.WriteFrame(wsOpcodeText, []byte(fmt.Sprintf(`{"type":"error","code":"ATTACH_FAILED","message":%q}`, err.Error())))
+		stream.Cancel()
+		stream.Release()
+		_ = conn.WriteFrame(wsOpcodeText, errorFrame("ATTACH_FAILED", err.Error()))
 		return
 	}
 	defer cancelEvents()
 	defer stream.Cancel()
-	defer func() {
-		_, _ = sessionService.Detach(id)
-	}()
+	defer stream.Release()
+
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	writeFrame := func(opcode int, payload []byte) error {
-		return conn.WriteFrame(opcode, payload)
+
+	writer := newWSFrameWriter(conn, attachQueueDepth)
+	defer writer.close()
+
+	// An attachment ends in exactly one of two ways: a normal completion that
+	// flushes the exit message first, or a failure that drops the connection. The
+	// lifecycle mutex makes the two mutually exclusive, so a late failure (a
+	// relay noticing a full queue while the exit message is being flushed) cannot
+	// cut the final message off mid-write.
+	// attachAbortFlush bounds delivering an abort reason before the connection is
+	// dropped. A client that stopped reading will not receive it; for those cases
+	// the connection close is the authoritative signal and the session state is
+	// still accurate.
+	const attachAbortFlush = time.Second
+
+	var lifecycleMu sync.Mutex
+	finishing := false
+	terminated := false
+	closeNow := func() {
+		cancel()
+		_ = conn.Close()
 	}
-	snapshotPayload, _ := json.Marshal(map[string]any{
+	terminate := func(reason string) {
+		lifecycleMu.Lock()
+		defer lifecycleMu.Unlock()
+		if finishing || terminated {
+			return
+		}
+		terminated = true
+		// Best effort: tell a still-reading client why its attachment ended.
+		if writer.enqueue(wsOpcodeText, errorFrame("ATTACH_ABORTED", reason)) {
+			writer.close()
+			writer.wait(attachAbortFlush)
+		}
+		closeNow()
+	}
+	// beginFinish takes over the connection for a normal completion. It reports
+	// false when the attachment was already torn down.
+	beginFinish := func() bool {
+		lifecycleMu.Lock()
+		defer lifecycleMu.Unlock()
+		if terminated {
+			return false
+		}
+		finishing = true
+		return true
+	}
+
+	enqueueOrTerminate := func(opcode int, payload []byte) bool {
+		if writer.enqueue(opcode, payload) {
+			return true
+		}
+		terminate("client is not reading")
+		return false
+	}
+
+	if !enqueueOrTerminate(wsOpcodeText, mustMarshal(map[string]any{
 		"type":    "session.snapshot",
 		"session": data,
-	})
-	_ = writeFrame(wsOpcodeText, snapshotPayload)
-	attachedPayload, _ := json.Marshal(map[string]any{
+	})) {
+		return
+	}
+	if !enqueueOrTerminate(wsOpcodeText, mustMarshal(map[string]any{
 		"type":       "session.attached",
 		"session_id": data.ID,
 		"state":      data.State,
-	})
-	_ = writeFrame(wsOpcodeText, attachedPayload)
+	})) {
+		return
+	}
+	// Output produced before this attachment may have been dropped when the
+	// retained backlog overflowed; the client is told before it sees the rest.
+	if stream.BacklogTruncated {
+		if !enqueueOrTerminate(wsOpcodeText, mustMarshal(map[string]any{
+			"type":       "session.attach.truncated",
+			"session_id": data.ID,
+			"detail":     "pre-attach output exceeded the retained backlog",
+		})) {
+			return
+		}
+	}
+
 	stdinWrites := make(chan []byte, 32)
-	go relayAttachInput(ctx, cancel, stream.Input, stdinWrites)
-	go relayAttachOutput(ctx, cancel, writeFrame, stream.Stdout, wsOpcodeBinary)
-	go relayAttachOutput(ctx, cancel, writeFrame, stream.Stderr, wsOpcodeBinary)
-	go relayAttachEvents(ctx, cancel, writeFrame, events)
-	go pingAttach(ctx, cancel, writeFrame)
+	go func() {
+		input := stream.Input
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case chunk := <-stdinWrites:
+				if len(chunk) == 0 {
+					continue
+				}
+				if _, err := input.Write(chunk); err != nil {
+					if errors.Is(err, session.ErrAttachmentClosed) {
+						// This attachment no longer owns the session; the reason is
+						// reported by the revocation or exit path, so end quietly.
+						return
+					}
+					terminate("stdin write failed: " + err.Error())
+					return
+				}
+			}
+		}
+	}()
+
+	// The attachment can lose ownership under us: an explicit detach, or a newer
+	// client taking over. The old connection must stop sending and receiving and
+	// end, rather than lingering as a second owner of the same session.
 	go func() {
 		select {
-		case err := <-stream.Done:
-			current, getErr := sessionService.Get(id)
-			payload := map[string]any{
-				"type":       "session.exit",
-				"session_id": data.ID,
-			}
-			if getErr == nil {
-				payload["exit_code"] = current.ExitCode
-				if current.FrameworkError != "" {
-					payload["error"] = current.FrameworkError
-				}
-			} else if err != nil {
-				payload["error"] = err.Error()
-			}
-			encoded, _ := json.Marshal(payload)
-			_ = writeFrame(wsOpcodeText, encoded)
 		case <-ctx.Done():
+		case <-stream.Revoked:
+			terminate("attachment was detached")
 		}
-		cancel()
 	}()
+
+	// A failure writing to the remote's stdin is terminal for this attachment:
+	// reporting it keeps the client from typing into a stream that no longer
+	// reaches anything.
+	go func() {
+		select {
+		case <-ctx.Done():
+		case err := <-stream.InputError:
+			if err != nil {
+				terminate("stdin write failed: " + err.Error())
+			}
+		}
+	}()
+
+	// Output relays. A relay ends when its stream ends; if the stream ended
+	// because this attachment fell behind, the attachment is terminated with an
+	// explicit reason instead of pretending the output was complete.
+	var outputs sync.WaitGroup
+	outputs.Add(2)
+	relayOutput := func(ch <-chan []byte) {
+		defer outputs.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case chunk, ok := <-ch:
+				if !ok {
+					if isClosed(stream.Overflow) {
+						terminate("attach output truncated: client fell behind")
+					}
+					return
+				}
+				if len(chunk) == 0 {
+					continue
+				}
+				if !enqueueOrTerminate(wsOpcodeBinary, chunk) {
+					return
+				}
+			}
+		}
+	}
+	go relayOutput(stream.Stdout)
+	go relayOutput(stream.Stderr)
+
+	go relayAttachEvents(ctx, terminate, writer, events)
+	go pingAttach(ctx, conn, writer.enqueue)
+
+	// Exit watcher: deliver trailing output, then the single final exit message,
+	// then close. Waiting for the output relays is what guarantees the client
+	// sees every received byte before session.exit.
+	go func() {
+		var outcome session.ExitOutcome
+		select {
+		case <-ctx.Done():
+			return
+		case got, ok := <-stream.Exit:
+			if !ok {
+				return
+			}
+			outcome = got
+		}
+
+		drained := make(chan struct{})
+		go func() {
+			outputs.Wait()
+			close(drained)
+		}()
+		select {
+		case <-drained:
+		case <-time.After(attachDrainTimeout):
+			terminate("output drain timed out")
+			return
+		case <-ctx.Done():
+			return
+		}
+
+		// Take over the connection for a normal completion: from here on the exit
+		// message is flushed and then the connection is closed.
+		if !beginFinish() {
+			return
+		}
+		if !writer.enqueue(wsOpcodeText, mustMarshal(exitPayload(data.ID, outcome))) {
+			// The client stopped reading, so the final message cannot be
+			// delivered: end the attachment instead of pretending it completed.
+			closeNow()
+			return
+		}
+		_ = writer.enqueue(wsOpcodeClose, nil)
+		writer.close()
+		if !writer.wait(attachDrainTimeout) {
+			closeNow()
+			return
+		}
+		// Closing the connection ends the reader loop below so the handler
+		// returns and the attachment is released for the next client.
+		closeNow()
+	}()
+
 	for {
 		opcode, payload, err := conn.ReadFrame()
 		if err != nil {
-			return
+			break
 		}
 		switch opcode {
 		case wsOpcodeBinary:
@@ -306,21 +465,25 @@ func (s *Server) attachSessionWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 			}
 			chunk := make([]byte, len(payload))
 			copy(chunk, payload)
+			// Blocking here is deliberate backpressure for stdin: the client is
+			// the producer, and output delivery runs on separate goroutines.
 			select {
 			case stdinWrites <- chunk:
 			case <-ctx.Done():
-				return
+				break
 			}
 		case wsOpcodeText:
 			if err := handleAttachControl(sessionService, id, payload); err != nil {
-				_ = writeFrame(wsOpcodeText, []byte(fmt.Sprintf(`{"type":"error","code":"CONTROL_FAILED","message":%q}`, err.Error())))
+				if !enqueueOrTerminate(wsOpcodeText, errorFrame("CONTROL_FAILED", err.Error())) {
+					return
+				}
 			}
 		case wsOpcodePing:
-			if err := writeFrame(wsOpcodePong, payload); err != nil {
+			if !enqueueOrTerminate(wsOpcodePong, payload) {
 				return
 			}
 		case wsOpcodeClose:
-			_ = writeFrame(wsOpcodeClose, nil)
+			_ = writer.enqueue(wsOpcodeClose, nil)
 			return
 		}
 		select {
@@ -329,10 +492,46 @@ func (s *Server) attachSessionWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 		default:
 		}
 	}
+
+	// The reader loop only exits once the connection is closed or the client sent
+	// a close frame; flush whatever is queued so trailing bytes and session.exit
+	// are not cut off.
+	writer.close()
+	writer.wait(attachDrainTimeout)
 }
 
-func relayAttachEvents(ctx context.Context, cancel context.CancelFunc, writeFrame func(int, []byte) error, events <-chan session.Event) {
-	defer cancel()
+func errorFrame(code, message string) []byte {
+	return mustMarshal(map[string]any{"type": "error", "code": code, "message": message})
+}
+
+func exitPayload(sessionID string, outcome session.ExitOutcome) map[string]any {
+	payload := map[string]any{
+		"type":       "session.exit",
+		"session_id": sessionID,
+	}
+	if outcome.Code != nil {
+		payload["exit_code"] = *outcome.Code
+	} else {
+		payload["exit_code"] = nil
+	}
+	if outcome.FrameworkError != "" {
+		payload["error"] = outcome.FrameworkError
+	}
+	if outcome.DisconnectCause != "" {
+		payload["disconnect_cause"] = outcome.DisconnectCause
+	}
+	return payload
+}
+
+func mustMarshal(value any) []byte {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return []byte(`{"type":"error","code":"ENCODE_FAILED"}`)
+	}
+	return encoded
+}
+
+func relayAttachEvents(ctx context.Context, terminate func(string), writer *wsFrameWriter, events <-chan session.Event) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -341,11 +540,8 @@ func relayAttachEvents(ctx context.Context, cancel context.CancelFunc, writeFram
 			if !ok {
 				return
 			}
-			payload, err := json.Marshal(event)
-			if err != nil {
-				return
-			}
-			if err := writeFrame(wsOpcodeText, payload); err != nil {
+			if !writer.enqueue(wsOpcodeText, mustMarshal(event)) {
+				terminate("client is not reading")
 				return
 			}
 		}
@@ -359,7 +555,7 @@ func (s *Server) sessionEventsWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 		return
 	}
 	defer cancel()
-	conn, err := upgradeWebSocket(w, r)
+	conn, err := s.upgradeWebSocket(w, r)
 	if err != nil {
 		writeAPIError(w, stdhttp.StatusBadRequest, response.RiskReadOnly, "sessions/"+id+"/events", "WEBSOCKET_UPGRADE_FAILED", err.Error())
 		return
@@ -402,11 +598,28 @@ const (
 
 type websocketConn struct {
 	rw      *bufio.ReadWriter
-	c       io.Closer
+	c       net.Conn
 	writeMu sync.Mutex
+	// tracker is the registry this connection was handed to at upgrade, so
+	// Close removes it and teardown never closes it twice.
+	tracker *ConnTracker
 }
 
-func upgradeWebSocket(w stdhttp.ResponseWriter, r *stdhttp.Request) (*websocketConn, error) {
+// SetWriteDeadline bounds a single frame write so a client that stops reading
+// cannot block a writer forever. The deadline is per write, not per connection.
+func (c *websocketConn) SetWriteDeadline(t time.Time) error {
+	return c.c.SetWriteDeadline(t)
+}
+
+// upgradeWebSocket hijacks the connection and, when a tracker is configured,
+// registers it so service teardown can close it. A connection that arrives
+// after teardown began is closed instead of served.
+func (s *Server) upgradeWebSocket(w stdhttp.ResponseWriter, r *stdhttp.Request) (*websocketConn, error) {
+	// Refuse before the upgrade when teardown has begun: an upgraded connection
+	// would already have received a 101 that teardown is about to invalidate.
+	if s.tracker != nil && !s.tracker.accepting() {
+		return nil, errServerShuttingDown
+	}
 	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 		return nil, errors.New("missing websocket upgrade header")
 	}
@@ -438,8 +651,21 @@ func upgradeWebSocket(w stdhttp.ResponseWriter, r *stdhttp.Request) (*websocketC
 		_ = conn.Close()
 		return nil, err
 	}
-	return &websocketConn{rw: rw, c: conn}, nil
+	ws := &websocketConn{rw: rw, c: conn}
+	if s.tracker != nil {
+		// Publish the back-reference before the connection becomes reachable
+		// through the tracker, so a concurrent CloseAll can never observe a
+		// tracked connection that does not yet know how to deregister itself.
+		ws.tracker = s.tracker
+		if !s.tracker.track(ws) {
+			_ = conn.Close()
+			return nil, errServerShuttingDown
+		}
+	}
+	return ws, nil
 }
+
+var errServerShuttingDown = errors.New("server is shutting down")
 
 func websocketAccept(key string) string {
 	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
@@ -447,6 +673,9 @@ func websocketAccept(key string) string {
 }
 
 func (c *websocketConn) Close() error {
+	if c.tracker != nil {
+		c.tracker.release(c)
+	}
 	return c.c.Close()
 }
 

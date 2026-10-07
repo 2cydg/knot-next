@@ -47,7 +47,7 @@ func (s *Server) handleSFTP(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if !requireMethod(w, r, stdhttp.MethodGet) {
 			return
 		}
-		handleSFTPSessionEvents(w, r, sftpService, parts[0])
+		s.handleSFTPSessionEvents(w, r, sftpService, parts[0])
 	case len(parts) == 2 && parts[1] == "files":
 		handleSFTPFiles(w, r, sftpService, parts[0])
 	case len(parts) == 2 && parts[1] == "dirs":
@@ -116,7 +116,7 @@ func (s *Server) handleSFTP(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	case len(parts) == 3 && parts[1] == "challenges" && parts[2] == "auth":
 		handleSFTPAuthChallenge(w, r, sftpService, parts[0])
 	case len(parts) == 3 && parts[1] == "transfers" && parts[2] == "events":
-		handleSFTPTransferEvents(w, r, sftpService, parts[0])
+		s.handleSFTPTransferEvents(w, r, sftpService, parts[0])
 	case len(parts) == 2 && parts[1] == "transfers":
 		if !requireMethod(w, r, stdhttp.MethodGet) {
 			return
@@ -197,14 +197,14 @@ func handleSFTPDirs(w stdhttp.ResponseWriter, r *stdhttp.Request, sftpService *s
 	}
 }
 
-func handleSFTPSessionEvents(w stdhttp.ResponseWriter, r *stdhttp.Request, sftpService *sftp.Service, sessionID string) {
+func (s *Server) handleSFTPSessionEvents(w stdhttp.ResponseWriter, r *stdhttp.Request, sftpService *sftp.Service, sessionID string) {
 	events, cancel, data, err := sftpService.Subscribe(sessionID)
 	if err != nil {
 		writeSFTPError(w, response.RiskReadOnly, "sftp/"+sessionID+"/events", err)
 		return
 	}
 	defer cancel()
-	conn, err := upgradeWebSocket(w, r)
+	conn, err := s.upgradeWebSocket(w, r)
 	if err != nil {
 		writeAPIError(w, stdhttp.StatusBadRequest, response.RiskReadOnly, "sftp/"+sessionID+"/events", "WEBSOCKET_UPGRADE_FAILED", err.Error())
 		return
@@ -237,14 +237,14 @@ func handleSFTPSessionEvents(w stdhttp.ResponseWriter, r *stdhttp.Request, sftpS
 	}
 }
 
-func handleSFTPTransferEvents(w stdhttp.ResponseWriter, r *stdhttp.Request, sftpService *sftp.Service, sessionID string) {
+func (s *Server) handleSFTPTransferEvents(w stdhttp.ResponseWriter, r *stdhttp.Request, sftpService *sftp.Service, sessionID string) {
 	events, cancel, snapshot, err := sftpService.SubscribeTransfersWithSnapshot(sessionID)
 	if err != nil {
 		writeSFTPError(w, response.RiskReadOnly, "sftp/"+sessionID+"/transfers/events", err)
 		return
 	}
 	defer cancel()
-	conn, err := upgradeWebSocket(w, r)
+	conn, err := s.upgradeWebSocket(w, r)
 	if err != nil {
 		writeAPIError(w, stdhttp.StatusBadRequest, response.RiskReadOnly, "sftp/"+sessionID+"/transfers/events", "WEBSOCKET_UPGRADE_FAILED", err.Error())
 		return

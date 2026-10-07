@@ -2,9 +2,11 @@ package sshpool
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -23,7 +25,6 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/net/proxy"
-	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -84,19 +85,29 @@ type DialOptions struct {
 	AgentSocket   string
 	HostKeyPolicy string
 	Timeout       time.Duration
+	// prompt receives the effective caller and pool cancellation context.
+	prompt func(context.Context, HostKeyPrompt) bool
 }
 
 type Pool struct {
 	mu                 sync.Mutex
 	entries            map[string]*entry
-	sf                 singleflight.Group
+	inflight           map[string]*inflightRoute
 	idleTimeout        time.Duration
 	closed             bool
 	ConnectCallback    func(string, *ssh.Client)
 	DisconnectCallback func(string)
 	ctx                context.Context
 	cancel             context.CancelFunc
+	// interacting counts the attempts that carry their own host key prompt. They
+	// are not shared through inflight, so CloseAll has to be able to reach them
+	// by cancelling the pool context and wait for them to unwind.
+	interacting sync.WaitGroup
 }
+
+// attemptGrace bounds how long CloseAll waits for interactive creations to
+// unwind after cancelling them. It is a variable so tests can shorten it.
+var attemptGrace = 2 * time.Second
 
 type entry struct {
 	client     *ssh.Client
@@ -106,6 +117,28 @@ type entry struct {
 	alias      string
 	remoteHost string
 	chainKeys  []string
+	// identity digests the material a client was authenticated with. A later
+	// attempt whose identity differs must not reuse this connection, even though
+	// the non-secret pool key is the same.
+	identity []byte
+}
+
+// inflightRoute is one in-flight route creation shared by callers that do not
+// need their own interactive prompt. It exists so a waiter can leave without
+// disturbing the others, and so the last waiter to leave stops a creation that
+// nobody is waiting for any more.
+type inflightRoute struct {
+	done    chan struct{}
+	client  *ssh.Client
+	err     error
+	created bool
+	waiters int
+	// identity is the digest the creation is authenticating with. A caller whose
+	// own identity differs must not join it.
+	identity []byte
+	// cancel ends the creation itself. It is derived from the pool context, not
+	// from any single caller, so a cancelled creator cannot fail the waiters.
+	cancel context.CancelFunc
 }
 
 type EntryStat struct {
@@ -118,17 +151,13 @@ type EntryStat struct {
 	ChainKeys []string `json:"chain_keys,omitempty"`
 }
 
-type getClientResult struct {
-	client *ssh.Client
-	isNew  bool
-}
-
 var dialClient = dial
 
 func NewPool() *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Pool{
 		entries:     map[string]*entry{},
+		inflight:    map[string]*inflightRoute{},
 		idleTimeout: 30 * time.Minute,
 		ctx:         ctx,
 		cancel:      cancel,
@@ -137,7 +166,24 @@ func NewPool() *Pool {
 	return p
 }
 
+// GetClient returns a pooled client for server without a caller context. It is
+// kept for callers that have no cancellation to propagate; new code should use
+// GetClientContext so a cancelled attempt ends its dial and handshake.
 func (p *Pool) GetClient(server config.ServerProfile, cfg config.RuntimeConfig, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, []string, bool, error) {
+	return p.GetClientContext(context.Background(), server, cfg, confirm, opts)
+}
+
+// GetClientContext returns a pooled client for server, creating one if needed.
+//
+// ctx bounds this caller's wait and its own creation attempt: a cancelled caller
+// stops waiting, and stops a creation nobody else is waiting for. It never
+// cancels a connection another session is already using. confirm, when non-nil,
+// marks an interactive creation whose host key prompt belongs to this caller
+// alone, so it is never merged with another session's in-flight attempt.
+func (p *Pool) GetClientContext(ctx context.Context, server config.ServerProfile, cfg config.RuntimeConfig, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, []string, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if cfg.Settings.IdleTimeout != "" {
 		if d, err := time.ParseDuration(cfg.Settings.IdleTimeout); err == nil {
 			p.SetIdleTimeout(d)
@@ -156,16 +202,27 @@ func (p *Pool) GetClient(server config.ServerProfile, cfg config.RuntimeConfig, 
 	keys := make([]string, 0, len(routes))
 	created := false
 	for _, route := range routes {
-		client, wasCreated, err := p.getRouteClient(route, cfg, jump, confirm, opts)
+		client, key, wasCreated, err := p.getRouteClient(ctx, route, cfg, jump, confirm, opts)
 		if err != nil {
 			return nil, nil, false, err
 		}
 		jump = client
-		keys = append(keys, route.key)
+		keys = append(keys, key)
 		created = created || wasCreated
 	}
 	p.setChainKeys(keys...)
 	return jump, keys, created, nil
+}
+
+// GetClientContextWithPrompt gives interactive callbacks the effective attempt
+// context. A pending prompt must return when this context ends, including when
+// the pool closes. Legacy GetClientContext callbacks have no context parameter.
+func (p *Pool) GetClientContextWithPrompt(ctx context.Context, server config.ServerProfile, cfg config.RuntimeConfig, prompt func(context.Context, HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, []string, bool, error) {
+	if prompt == nil {
+		return p.GetClientContext(ctx, server, cfg, nil, opts)
+	}
+	opts.prompt = prompt
+	return p.GetClientContext(ctx, server, cfg, func(HostKeyPrompt) bool { return false }, opts)
 }
 
 func (p *Pool) SetIdleTimeout(d time.Duration) {
@@ -262,7 +319,29 @@ func (p *Pool) CloseAll() int {
 	p.entries = map[string]*entry{}
 	p.mu.Unlock()
 	p.closeEntries(entries, true)
+	// Cancelling the pool context ends interactive creations that were still
+	// dialling. They are waited for so a closed pool cannot later publish a
+	// client into an entry that no longer exists.
+	p.waitInteractive(attemptGrace)
 	return len(entries)
+}
+
+// waitInteractive waits at most grace for the in-flight interactive creations
+// to unwind. Past the grace the caller is released anyway: the creations have
+// already been cancelled and their result is discarded on the way out, so
+// teardown cannot be pinned by a dial that ignores its context.
+func (p *Pool) waitInteractive(grace time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		p.interacting.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
 }
 
 func (p *Pool) statsLocked(now time.Time) []EntryStat {
@@ -425,65 +504,382 @@ func recoverCallbackPanic(name string) {
 	}
 }
 
-func (p *Pool) getRouteClient(route routeStep, cfg config.RuntimeConfig, jump *ssh.Client, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, bool, error) {
-	res, err, shared := p.sf.Do(route.key, func() (any, error) {
-		p.mu.Lock()
-		if p.closed {
-			p.mu.Unlock()
-			return nil, errors.New("ssh pool is closed")
-		}
-		if ent := p.entries[route.key]; ent != nil {
-			ent.lastAccess = time.Now()
-			client := ent.client
-			p.mu.Unlock()
-			return getClientResult{client: client}, nil
-		}
-		p.mu.Unlock()
+// getRouteClient returns a usable client for one step of the route chain
+// together with the pool key it is registered under. The key can differ from
+// route.key when the stored identity no longer matches the credentials of this
+// attempt, so callers must use the returned key for any later reference
+// bookkeeping.
+func (p *Pool) getRouteClient(ctx context.Context, route routeStep, cfg config.RuntimeConfig, jump *ssh.Client, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, string, bool, error) {
+	identityProfile := route.server
+	if route.via != nil {
+		identityProfile.JumpHostIDs = route.via
+	}
+	identity := clientIdentity(identityProfile, cfg, opts)
 
-		client, err := dialClient(route.server, cfg, jump, confirm, opts)
+	// An interactive attempt owns its own creation: its host key prompt belongs
+	// to this caller, so it must never be merged with another session's attempt.
+	if confirm != nil {
+		key, _, err := p.resolveKey(route.key, identity)
 		if err != nil {
-			return nil, err
+			return nil, route.key, false, err
 		}
+		if client := p.reusableClient(key, identity); client != nil {
+			return client, key, false, nil
+		}
+		// The attempt ends with the pool as well as with its caller. CloseAll
+		// cancels the pool context, and without this the dial below would keep
+		// running: an interactive attempt is not registered as an inflight route,
+		// so nothing else would reach it.
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		defer cancelAttempt()
+		stopPoolWatch := context.AfterFunc(p.ctx, cancelAttempt)
+		defer stopPoolWatch()
 
-		now := time.Now()
 		p.mu.Lock()
 		if p.closed {
 			p.mu.Unlock()
-			_ = client.Close()
-			return nil, errors.New("ssh pool is closed")
+			return nil, key, false, errors.New("ssh pool is closed")
 		}
-		if ent := p.entries[route.key]; ent != nil {
-			ent.lastAccess = now
-			existing := ent.client
-			p.mu.Unlock()
-			_ = client.Close()
-			return getClientResult{client: existing}, nil
-		}
-		p.entries[route.key] = &entry{
-			client:     client,
-			lastAccess: now,
-			serverID:   route.server.ID,
-			alias:      route.server.Alias,
-			remoteHost: route.server.Host,
-			chainKeys:  []string{route.key},
-		}
+		p.interacting.Add(1)
 		p.mu.Unlock()
+		defer p.interacting.Done()
 
-		go p.keepAliveLoop(route.key, client, cfg)
-		p.notifyConnect(route.key, client)
-		return getClientResult{client: client, isNew: true}, nil
-	})
-	if err != nil {
-		return nil, false, err
+		effectiveConfirm := func(prompt HostKeyPrompt) bool {
+			if opts.prompt != nil {
+				return opts.prompt(attemptCtx, prompt)
+			}
+			// A legacy callback cannot be interrupted; stop the dial's wait and discard
+			// its answer. New core callers use the context-aware API above.
+			answered := make(chan bool, 1)
+			go func() { answered <- confirm(prompt) }()
+			select {
+			case accept := <-answered:
+				return accept
+			case <-attemptCtx.Done():
+				return false
+			}
+		}
+		client, err := dialClient(attemptCtx, route.server, cfg, jump, effectiveConfirm, opts)
+		if err != nil {
+			return nil, key, false, err
+		}
+		// The pool may have closed while this attempt was dialling. Publishing
+		// then would leave a live client in a pool that is already torn down, so
+		// the connection is closed instead.
+		if err := attemptCtx.Err(); err != nil {
+			_ = client.Close()
+			return nil, key, false, err
+		}
+		publishedKey, use, created, err := p.publish(key, route, identity, client, cfg)
+		if err != nil {
+			_ = client.Close()
+			return nil, key, false, err
+		}
+		return use, publishedKey, created, nil
 	}
-	result := res.(getClientResult)
-	if shared {
-		result.isNew = false
+
+	for {
+		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, route.key, false, errors.New("ssh pool is closed")
+		}
+		key, client, inflight := p.resolveLocked(route.key, identity)
+		if client != nil {
+			ent := p.entries[key]
+			ent.lastAccess = time.Now()
+			p.mu.Unlock()
+			return client, key, false, nil
+		}
+		if inflight == nil {
+			createCtx, cancel := context.WithCancel(p.ctx)
+			inflight = &inflightRoute{
+				done:     make(chan struct{}),
+				waiters:  1,
+				identity: identity,
+				cancel:   cancel,
+			}
+			p.inflight[key] = inflight
+			p.mu.Unlock()
+			go p.runCreation(createCtx, key, route, identity, cfg, jump, opts, inflight)
+		} else {
+			inflight.waiters++
+			p.mu.Unlock()
+		}
+
+		client, created, err := p.awaitInflight(ctx, key, inflight)
+		if err != nil {
+			return nil, key, false, err
+		}
+		return client, key, created, nil
 	}
-	return result.client, result.isNew, nil
 }
 
-func dial(server config.ServerProfile, cfg config.RuntimeConfig, jump *ssh.Client, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, error) {
+// runCreation performs one shared route creation and publishes its result into
+// the in-flight entry. It runs under a context derived from the pool, never from
+// a single caller, so a caller that gives up cannot fail the others still
+// waiting on this connection.
+func (p *Pool) runCreation(ctx context.Context, key string, route routeStep, identity []byte, cfg config.RuntimeConfig, jump *ssh.Client, opts DialOptions, inflight *inflightRoute) {
+	client, err := dialClient(ctx, route.server, cfg, jump, nil, opts)
+	if err == nil && ctx.Err() != nil {
+		// The creation outlived its purpose; do not publish a client nobody is
+		// waiting for any more.
+		_ = client.Close()
+		err = ctx.Err()
+	}
+	created := false
+	if err == nil {
+		var published *ssh.Client
+		if _, published, created, err = p.publish(key, route, identity, client, cfg); err != nil {
+			_ = client.Close()
+		} else {
+			client = published
+		}
+	}
+
+	p.mu.Lock()
+	inflight.client = client
+	inflight.err = err
+	inflight.created = created
+	// The in-flight entry is always registered under the key the creation
+	// started with, whatever key the client itself landed on.
+	if p.inflight[key] == inflight {
+		delete(p.inflight, key)
+	}
+	cancel := inflight.cancel
+	close(inflight.done)
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// awaitInflight waits for a shared creation to finish. A caller that gives up
+// stops waiting at once, and its departure cancels a creation nobody is waiting
+// for any more, without touching the connections other sessions already hold.
+func (p *Pool) awaitInflight(ctx context.Context, key string, inflight *inflightRoute) (*ssh.Client, bool, error) {
+	select {
+	case <-inflight.done:
+		p.leaveInflight(key, inflight)
+		return inflight.client, inflight.created, inflight.err
+	case <-ctx.Done():
+		p.leaveInflight(key, inflight)
+		return nil, false, ctx.Err()
+	case <-p.ctx.Done():
+		p.leaveInflight(key, inflight)
+		return nil, false, errors.New("ssh pool is closed")
+	}
+}
+
+// leaveInflight releases one waiter. The last waiter to leave ends the creation,
+// because the connection it is producing has no consumer left.
+func (p *Pool) leaveInflight(key string, inflight *inflightRoute) {
+	p.mu.Lock()
+	if p.inflight[key] != inflight {
+		p.mu.Unlock()
+		return
+	}
+	inflight.waiters--
+	if inflight.waiters > 0 {
+		p.mu.Unlock()
+		return
+	}
+	inflight.waiters = 0
+	cancel := inflight.cancel
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// resolveKey returns the pool key an attempt with this identity may be published
+// under, without consulting the in-flight registry.
+func (p *Pool) resolveKey(base string, identity []byte) (string, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return base, false, errors.New("ssh pool is closed")
+	}
+	key, _, _ := p.resolveLocked(base, identity)
+	return key, true, nil
+}
+
+// reusableClient returns the pooled client at key when it was authenticated with
+// the same material as this attempt.
+func (p *Pool) reusableClient(key string, identity []byte) *ssh.Client {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ent := p.entries[key]
+	if ent == nil || !bytes.Equal(ent.identity, identity) {
+		return nil
+	}
+	ent.lastAccess = time.Now()
+	return ent.client
+}
+
+// resolveLocked picks the key this attempt may use, the client it may reuse, and
+// the in-flight creation it may join. The base key is preferred; when it holds
+// different material and a session is still using it, a revision key carries the
+// new material so the live session keeps the connection it was authenticated
+// with. The caller must hold p.mu.
+func (p *Pool) resolveLocked(base string, identity []byte) (string, *ssh.Client, *inflightRoute) {
+	for rev := 0; ; rev++ {
+		key := base
+		if rev > 0 {
+			key = fmt.Sprintf("%s|rev=%d", base, rev)
+		}
+		ent := p.entries[key]
+		if ent != nil {
+			if bytes.Equal(ent.identity, identity) {
+				return key, ent.client, nil
+			}
+			if ent.refCount > 0 {
+				// In use with other material: keep it and move on.
+				continue
+			}
+		}
+		inflight := p.inflight[key]
+		if inflight != nil && !bytes.Equal(inflight.identity, identity) {
+			// Being created with other material: it owns this key.
+			continue
+		}
+		return key, nil, inflight
+	}
+}
+
+// publish stores a freshly created client and reports the key it landed under,
+// the client that key now holds, and whether that client is the new one. When an
+// equivalent connection appeared while this one was being built, the existing
+// client wins and the new one is closed here.
+func (p *Pool) publish(base string, route routeStep, identity []byte, client *ssh.Client, cfg config.RuntimeConfig) (string, *ssh.Client, bool, error) {
+	now := time.Now()
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return base, nil, false, errors.New("ssh pool is closed")
+	}
+	key := base
+	if ent := p.entries[key]; ent != nil && ent.refCount > 0 && !bytes.Equal(ent.identity, identity) {
+		// Defensive: a live session took the slot while this client was being
+		// built. Keep its connection and give the new material its own key.
+		for rev := 1; ; rev++ {
+			candidate := fmt.Sprintf("%s|rev=%d", base, rev)
+			if cur := p.entries[candidate]; cur == nil || bytes.Equal(cur.identity, identity) {
+				key = candidate
+				break
+			}
+		}
+	}
+	if ent := p.entries[key]; ent != nil && bytes.Equal(ent.identity, identity) {
+		ent.lastAccess = now
+		existing := ent.client
+		p.mu.Unlock()
+		_ = client.Close()
+		return key, existing, false, nil
+	}
+	var stale *ssh.Client
+	if ent := p.entries[key]; ent != nil {
+		stale = ent.client
+	}
+	p.entries[key] = &entry{
+		client:     client,
+		lastAccess: now,
+		serverID:   route.server.ID,
+		alias:      route.server.Alias,
+		remoteHost: route.server.Host,
+		chainKeys:  []string{key},
+		identity:   identity,
+	}
+	p.mu.Unlock()
+
+	if stale != nil && stale != client {
+		_ = stale.Close()
+		p.notifyDisconnect(key)
+	}
+	go p.keepAliveLoop(key, client, cfg)
+	p.notifyConnect(key, client)
+	return key, client, true, nil
+}
+
+// clientIdentity digests the material a connection is authenticated with: the
+// credentials, the proxy credentials and the options that decide whether a
+// pooled connection may serve a later attempt. Only the digest is kept, so no
+// secret reaches a pool key or the stats exposed over the API.
+//
+// The digest covers the whole route, not just the target: a connection through a
+// jump host was authenticated by that jump host too, so rotating the jump's
+// password or key must invalidate the target's cached connection instead of
+// letting a later attempt reuse one that still runs over the old route.
+func clientIdentity(server config.ServerProfile, cfg config.RuntimeConfig, opts DialOptions) []byte {
+	h := sha256.New()
+	identityFields(h, server, cfg, opts)
+	for _, id := range server.JumpHostIDs {
+		jump, ok := cfg.Servers[id]
+		if !ok {
+			// A route that cannot be resolved must not digest the same as one
+			// whose jump host is present but identical.
+			fmt.Fprintf(h, "jump-missing=%s\n", id)
+			continue
+		}
+		fmt.Fprintf(h, "jump=%s\n", id)
+		identityFields(h, jump, cfg, opts)
+	}
+	return h.Sum(nil)
+}
+
+// identityFields folds one server profile's authentication material into the
+// identity digest.
+func identityFields(h io.Writer, server config.ServerProfile, cfg config.RuntimeConfig, opts DialOptions) {
+	field := func(label, value string) {
+		fmt.Fprintf(h, "%s=%d:%s\n", label, len(value), value)
+	}
+	field("id", server.ID)
+	field("host", server.Host)
+	field("port", strconv.Itoa(server.Port))
+	field("user", server.User)
+	field("auth", server.AuthMethod)
+	field("password", server.Password)
+	field("key", server.KeyID)
+	if key, ok := cfg.Keys[server.KeyID]; ok {
+		field("key-private", key.PrivateKey)
+		field("key-source", key.SourcePath)
+		field("key-type", key.Type)
+		// The path alone is not the key: replacing the file at that path changes
+		// what the next authentication uses, so the bytes decide the identity.
+		field("key-source-digest", sourceKeyDigest(key.SourcePath))
+	}
+	field("agent-socket", opts.AgentSocket)
+	field("host-key-policy", opts.HostKeyPolicy)
+	field("known-hosts", server.KnownHostsPath)
+	if proxyCfg, ok := cfg.Proxies[server.ProxyID]; ok {
+		field("proxy-type", proxyCfg.Type)
+		field("proxy-host", proxyCfg.Host)
+		field("proxy-port", strconv.Itoa(proxyCfg.Port))
+		field("proxy-user", proxyCfg.Username)
+		field("proxy-password", proxyCfg.Password)
+	}
+}
+
+// sourceKeyDigest digests an external key file's contents. A key that cannot be
+// read is reported as unreadable rather than as an empty file, so a missing key
+// and a present-but-unreadable one do not share an identity with an in-memory
+// key.
+func sourceKeyDigest(path string) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return "unreadable"
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func dial(ctx context.Context, server config.ServerProfile, cfg config.RuntimeConfig, jump *ssh.Client, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	auth, closer, err := authMethods(server, cfg, opts)
 	if err != nil {
 		return nil, err
@@ -491,17 +887,21 @@ func dial(server config.ServerProfile, cfg config.RuntimeConfig, jump *ssh.Clien
 	if closer != nil {
 		defer closer.Close()
 	}
-	hostKeyCallback, err := hostKeyCallback(server, confirm, opts.HostKeyPolicy)
-	if err != nil {
-		return nil, err
-	}
 	timeout := opts.Timeout
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
 	addr := net.JoinHostPort(server.Host, strconv.Itoa(server.Port))
-	conn, err := dialTransport(addr, server, cfg, jump, timeout)
+
+	// The transport phase carries its own deadline: the proxy negotiation and the
+	// jump host dial must not outlive the attempt.
+	conn, err := dialTransport(ctx, addr, server, cfg, jump, timeout)
 	if err != nil {
+		return nil, err
+	}
+	hostKeyCallback, err := hostKeyCallback(server, confirm, opts.HostKeyPolicy, &handshakeDeadline{conn: conn, timeout: timeout})
+	if err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 	clientConfig := &ssh.ClientConfig{
@@ -510,6 +910,15 @@ func dial(server config.ServerProfile, cfg config.RuntimeConfig, jump *ssh.Clien
 		HostKeyCallback: hostKeyCallback,
 		Timeout:         timeout,
 	}
+
+	// ssh.ClientConfig.Timeout only bounds the initial Dial, which this pool
+	// performs itself; the handshake run by NewClientConn is bounded by the socket
+	// deadline instead. A caller that gives up closes the socket, because the
+	// handshake has no cancellation of its own.
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	stopWatch := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopWatch()
+
 	ncc, chans, reqs, err := ssh.NewClientConn(conn, addr, clientConfig)
 	if err != nil {
 		_ = conn.Close()
@@ -522,6 +931,15 @@ func dial(server config.ServerProfile, cfg config.RuntimeConfig, jump *ssh.Clien
 		}
 		return nil, err
 	}
+	// The handshake is done: clear the phase deadline so the pooled connection is
+	// not killed mid-session, and stop watching so a later cancellation of the
+	// same context cannot close a connection that is now shared.
+	stopWatch()
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Time{})
 	return ssh.NewClient(ncc, chans, reqs), nil
 }
 
@@ -604,13 +1022,19 @@ func authMethods(server config.ServerProfile, cfg config.RuntimeConfig, opts Dia
 	}
 }
 
-func dialTransport(addr string, server config.ServerProfile, cfg config.RuntimeConfig, jump *ssh.Client, timeout time.Duration) (net.Conn, error) {
+// dialTransport opens the socket for one route step. Every phase - the jump host
+// dial, the proxy negotiation and the direct dial - is bounded by ctx and by the
+// phase timeout, so a cancelled attempt does not leave a socket behind.
+func dialTransport(ctx context.Context, addr string, server config.ServerProfile, cfg config.RuntimeConfig, jump *ssh.Client, timeout time.Duration) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if jump != nil {
-		return jump.Dial("tcp", addr)
+		return dialViaJump(ctx, jump, addr)
 	}
 	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 	if server.ProxyID == "" {
-		return dialer.Dial("tcp", addr)
+		return dialer.DialContext(ctx, "tcp", addr)
 	}
 	proxyCfg, ok := cfg.Proxies[server.ProxyID]
 	if !ok {
@@ -619,30 +1043,90 @@ func dialTransport(addr string, server config.ServerProfile, cfg config.RuntimeC
 	proxyAddr := net.JoinHostPort(proxyCfg.Host, strconv.Itoa(proxyCfg.Port))
 	switch proxyCfg.Type {
 	case config.ProxyTypeSOCKS5:
-		var auth *proxy.Auth
-		if proxyCfg.Username != "" {
-			auth = &proxy.Auth{User: proxyCfg.Username, Password: proxyCfg.Password}
-		}
-		d, err := proxy.SOCKS5("tcp", proxyAddr, auth, dialer)
-		if err != nil {
-			return nil, err
-		}
-		return d.Dial("tcp", addr)
+		return dialSOCKS5(ctx, proxyAddr, addr, proxyCfg, dialer, timeout)
 	case config.ProxyTypeHTTP:
-		return dialHTTPProxy(proxyAddr, addr, proxyCfg.Username, proxyCfg.Password, dialer)
+		return dialHTTPProxy(ctx, proxyAddr, addr, proxyCfg.Username, proxyCfg.Password, dialer, timeout)
 	default:
 		return nil, fmt.Errorf("unsupported proxy type %q", proxyCfg.Type)
 	}
 }
 
-func dialHTTPProxy(proxyAddr string, targetAddr string, user string, pass string, dialer *net.Dialer) (net.Conn, error) {
-	if strings.ContainsAny(targetAddr+user+pass, "\r\n") {
-		return nil, errors.New("invalid proxy CONNECT parameters")
+// dialViaJump dials through a pooled jump client. x/crypto/ssh offers no
+// cancellation for this call, so a cancelled attempt abandons the pending dial
+// and closes whatever it eventually returns.
+func dialViaJump(ctx context.Context, jump *ssh.Client, addr string) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
 	}
-	conn, err := dialer.Dial("tcp", proxyAddr)
+	done := make(chan result, 1)
+	go func() {
+		conn, err := jump.Dial("tcp", addr)
+		done <- result{conn: conn, err: err}
+	}()
+	select {
+	case res := <-done:
+		return res.conn, res.err
+	case <-ctx.Done():
+		go func() {
+			if res := <-done; res.conn != nil {
+				_ = res.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
+// fixedDialer hands out one already-connected socket, so the SOCKS5 negotiation
+// runs on the socket whose deadline bounds it rather than on a fresh connection.
+type fixedDialer struct {
+	conn net.Conn
+	used bool
+}
+
+func (d *fixedDialer) Dial(network, address string) (net.Conn, error) {
+	if d.used {
+		return nil, errors.New("proxy dialer is already used")
+	}
+	d.used = true
+	return d.conn, nil
+}
+
+func dialSOCKS5(ctx context.Context, proxyAddr string, targetAddr string, proxyCfg config.ProxyProfile, dialer *net.Dialer, timeout time.Duration) (net.Conn, error) {
+	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
 		return nil, err
 	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	var auth *proxy.Auth
+	if proxyCfg.Username != "" {
+		auth = &proxy.Auth{User: proxyCfg.Username, Password: proxyCfg.Password}
+	}
+	d, err := proxy.SOCKS5("tcp", proxyAddr, auth, &fixedDialer{conn: conn})
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	target, err := d.Dial("tcp", targetAddr)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	_ = target.SetDeadline(time.Time{})
+	return target, nil
+}
+
+func dialHTTPProxy(ctx context.Context, proxyAddr string, targetAddr string, user string, pass string, dialer *net.Dialer, timeout time.Duration) (net.Conn, error) {
+	if strings.ContainsAny(targetAddr+user+pass, "\r\n") {
+		return nil, errors.New("invalid proxy CONNECT parameters")
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
+	if err != nil {
+		return nil, err
+	}
+	// The CONNECT exchange is a phase of its own: bound it, then hand the socket
+	// over to the handshake, which arms its own deadline.
+	_ = conn.SetDeadline(time.Now().Add(timeout))
 	authHeader := ""
 	if user != "" {
 		authHeader = "Proxy-Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass)) + "\r\n"
@@ -673,6 +1157,11 @@ func dialHTTPProxy(proxyAddr string, targetAddr string, user string, pass string
 			break
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Time{})
 	if reader.Buffered() > 0 {
 		return &bufferedConn{Conn: conn, reader: reader}, nil
 	}
@@ -696,7 +1185,37 @@ type HostKeyPrompt struct {
 	Message     string `json:"message"`
 }
 
-func hostKeyCallback(server config.ServerProfile, confirm func(HostKeyPrompt) bool, policy string) (ssh.HostKeyCallback, error) {
+// handshakeDeadline parks and re-arms the connection phase deadline around a host
+// key prompt. Without it the phase timeout would fire while a human is deciding,
+// killing a connection the client is still willing to accept.
+type handshakeDeadline struct {
+	conn    net.Conn
+	timeout time.Duration
+}
+
+func (d *handshakeDeadline) park() {
+	if d == nil || d.conn == nil {
+		return
+	}
+	_ = d.conn.SetDeadline(time.Time{})
+}
+
+func (d *handshakeDeadline) arm() {
+	if d == nil || d.conn == nil || d.timeout <= 0 {
+		return
+	}
+	_ = d.conn.SetDeadline(time.Now().Add(d.timeout))
+}
+
+// ask runs confirm with the phase deadline parked, so the prompt may take as long
+// as the client needs, and re-arms it once the answer is in.
+func (d *handshakeDeadline) ask(confirm func(HostKeyPrompt) bool, prompt HostKeyPrompt) bool {
+	d.park()
+	defer d.arm()
+	return confirm(prompt)
+}
+
+func hostKeyCallback(server config.ServerProfile, confirm func(HostKeyPrompt) bool, policy string, deadline *handshakeDeadline) (ssh.HostKeyCallback, error) {
 	policy, err := normalizeHostKeyPolicy(policy)
 	if err != nil {
 		return nil, err
@@ -736,7 +1255,7 @@ func hostKeyCallback(server config.ServerProfile, confirm func(HostKeyPrompt) bo
 			switch {
 			case changed:
 				prompt := newHostKeyPrompt(hostname, key, true)
-				if policy == HostKeyPolicyAsk && confirm != nil && confirm(prompt) {
+				if policy == HostKeyPolicyAsk && confirm != nil && deadline.ask(confirm, prompt) {
 					return replaceKnownHost(khPath, hostname, key, keyErr.Want)
 				}
 				return &HostKeyError{Prompt: prompt}
@@ -744,7 +1263,7 @@ func hostKeyCallback(server config.ServerProfile, confirm func(HostKeyPrompt) bo
 				return appendKnownHost(khPath, hostname, key)
 			case policy == HostKeyPolicyAsk && confirm != nil:
 				prompt := newHostKeyPrompt(hostname, key, false)
-				if confirm(prompt) {
+				if deadline.ask(confirm, prompt) {
 					return appendKnownHost(khPath, hostname, key)
 				}
 				return &HostKeyError{Prompt: prompt}
@@ -859,6 +1378,7 @@ func ensureFile(path string, perm os.FileMode) error {
 type routeStep struct {
 	server config.ServerProfile
 	key    string
+	via    []string
 }
 
 func routeChain(server config.ServerProfile, cfg config.RuntimeConfig) ([]routeStep, error) {
@@ -876,7 +1396,7 @@ func routeChain(server config.ServerProfile, cfg config.RuntimeConfig) ([]routeS
 		if len(via) > 0 {
 			key += "|via=" + strings.Join(via, "->")
 		}
-		out = append(out, routeStep{server: jump, key: key})
+		out = append(out, routeStep{server: jump, key: key, via: append([]string{}, via...)})
 		via = append(via, id)
 	}
 	out = append(out, routeStep{server: server, key: connKey(server) + "|via=" + strings.Join(via, "->")})

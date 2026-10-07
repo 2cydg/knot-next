@@ -12,6 +12,7 @@ import (
 type Info struct {
 	Version         string    `json:"version"`
 	APIVersion      string    `json:"api_version"`
+	InstanceID      string    `json:"instance_id"`
 	PID             int       `json:"pid"`
 	Port            int       `json:"port"`
 	ListenAddresses []string  `json:"listen_addresses"`
@@ -24,10 +25,11 @@ type Info struct {
 	StartedAt       time.Time `json:"started_at"`
 }
 
-func NewInfo(version, apiVersion string, port int, listenAddresses []string, layout paths.Layout, startedAt time.Time, tokenPresent bool) Info {
+func NewInfo(version, apiVersion, instanceID string, port int, listenAddresses []string, layout paths.Layout, startedAt time.Time, tokenPresent bool) Info {
 	return Info{
 		Version:         version,
 		APIVersion:      apiVersion,
+		InstanceID:      instanceID,
 		PID:             os.Getpid(),
 		Port:            port,
 		ListenAddresses: append([]string(nil), listenAddresses...),

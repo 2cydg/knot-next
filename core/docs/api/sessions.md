@@ -346,6 +346,13 @@ attach 失败时，服务端直接写入 text frame：
 }
 ```
 
+服务端在升级 WebSocket **之前**就先校验并占用附着权。因此以下情况直接返回普通 HTTP 错误，不会升级连接：
+
+- session 不存在：`404 NOT_FOUND`
+- session 已 `closed`/`failed`、已被其他客户端附着、或 PTY backend 尚未就绪：`409 CONFLICT`
+
+升级之后才发生的失败（例如升级成功后事件订阅失败）才使用上面的 `ATTACH_FAILED` text frame。被拒绝的请求不会留下附着状态，第一个客户端不受影响。
+
 control 失败时，服务端写入：
 
 ```json
@@ -363,9 +370,18 @@ session 结束时，服务端会额外发送：
   "type": "session.exit",
   "session_id": "session_1",
   "exit_code": 0,
-  "error": ""
+  "error": "",
+  "disconnect_cause": ""
 }
 ```
+
+字段语义：
+
+- `exit_code`：远端退出码。`0` 是明确的成功；非零保留远端原值（远端被信号终止时为 `128+signum`，例如 `SIGKILL` 为 `137`）；**没有收到 exit-status 时为 `null`**，不能当作成功。
+- `error`：框架级失败信息（网络错误、缺少 exit-status 等）。远端正常退出或非零退出时为空。
+- `disconnect_cause`：机器可读的结束原因，可能取值 `exit_status_missing`、`network_error`、`client_disconnected`、`pool_disconnected`、`remote_signal`；远端正常退出时为空。连接被对端或连接池销毁时有多种原因同时成立，字段记录最先被观察到的那一个。
+
+`session.exit` 的退出码与同一时刻 `GET /v1/sessions/{id}` 的 `exit_code` 一定一致：两者来自同一个只读结果快照。
 
 attach WebSocket 帧方向总结：
 
@@ -411,11 +427,21 @@ attach WebSocket 帧方向总结：
 
 ## 实现约束
 
-- `attach` 只允许单个客户端附着；重复 attach 返回冲突
+- `attach` 只允许单个客户端附着；重复 attach 在升级前返回 `409 CONFLICT`，且不影响已附着客户端
 - `attach` 不区分 stdout/stderr 通道类型，二者都通过 binary frame 输出
+- 客户端 binary frame 是 PTY 原始字节，服务端不解释、不改写换行、不做 ANSI/编码处理；允许重新分帧，但字节内容不变。同一流（stdout 或 stderr）内部顺序保持；两个流之间不承诺全局顺序，PTY 合流按真实到达顺序
+- 服务端在正常结束时会**先发完已收到的输出字节，再发送唯一的 `session.exit`，随后关闭连接**；客户端可以据此认为 `session.exit` 之后不会再有输出
+- 未附着期间产生的输出保存在**有界**缓冲（上限 64 KiB）中，在下一个客户端 attach 时先补发。已发送给前一个 attach 的字节不会重放，因此重新 attach 不会看到重复输出；超过上限时丢弃最旧的字节，并通过 `session.attached` 之后的一个 text frame 告知：
+  ```json
+  {"type": "session.attach.truncated", "session_id": "session_1", "detail": "pre-attach output exceeded the retained backlog"}
+  ```
+- 慢客户端不会被无限缓冲：服务端有界队列写满或写入超时后，attach 会被明确结束并关闭连接（客户端此时可能收不到错误帧，因为它已停止读取）。session 本身保持存活并可重新 attach
+- 输入写入按 session 串行处理。detach 丢弃旧 attachment 尚未发送的队列；已经进入 SSH 传输层的输入无法撤回，可能在 detach 后送达。远端停止读取时，新 attachment 可建立，但其输入等待同一 backend 写入完成，队列保持有界，不会为每次重新附着新增阻塞写入者。
+- disconnect 会先记录资源终态，再释放 backend；关闭超时或失败通过错误响应返回，不能把 `state=closed` 单独当作物理资源全部释放的证明。
+- resize 只在 `rows`/`cols` 均处于 1..1000 时下发真实 `window-change`；非法值返回 `400 VALIDATION_FAILED`（HTTP）或 `CONTROL_FAILED`（WS），且不发送到远端。`close_stdin` 可重复发送且幂等；`signal` 成功时不产生额外事件，可通过远端行为观察
 - 当前没有独立的 `/cwd/events`；cwd 变化通过 session 事件中的 `path` 体现
 - `session.exit` 是 attach WebSocket 的附加消息类型，不属于 `session.Event` 结构
-- `session.exit` 由独立 goroutine 根据 attach stream 的 `Done` 信号发送，普通 session 事件由另一个 goroutine 转发；二者之间没有严格时序保证。客户端只能假定它出现在 attach 生命周期后段，不能假定它一定晚于所有 `session.Event`
+- `session.exit` 在所有输出帧之后由同一个发送队列发出，之后连接关闭；其他 session 事件仍由独立订阅转发，不保证与 `session.exit` 的先后关系（只能假定 `session.exit` 是最后一条消息）
 
 ## 客户端建议
 

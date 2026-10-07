@@ -15,7 +15,7 @@ func (s *Server) eventsWS(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	}
 	events, cancel := s.core.SubscribeEvents()
 	defer cancel()
-	conn, err := upgradeWebSocket(w, r)
+	conn, err := s.upgradeWebSocket(w, r)
 	if err != nil {
 		writeAPIError(w, stdhttp.StatusBadRequest, response.RiskReadOnly, "events", "WEBSOCKET_UPGRADE_FAILED", err.Error())
 		return
@@ -25,8 +25,8 @@ func (s *Server) eventsWS(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	go conn.drainControlFrames(cancel)
-	go pingAttach(ctx, cancel, func(opcode int, payload []byte) error {
-		return conn.WriteFrame(opcode, payload)
+	go pingAttach(ctx, conn, func(opcode int, payload []byte) bool {
+		return conn.WriteFrame(opcode, payload) == nil
 	})
 	_ = conn.WriteFrame(wsOpcodeText, []byte(`{"type":"core.snapshot","api_version":"v1"}`))
 	for {
@@ -59,6 +59,8 @@ func (s *Server) shutdown(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	if !requireMethod(w, r, stdhttp.MethodPost) {
 		return
 	}
+	// Respond before triggering: the client gets its acknowledgement, and the
+	// runner then owns the single teardown flow that every trigger shares.
 	response.JSON(w, stdhttp.StatusOK, map[string]bool{"shutdown": true})
-	s.core.Shutdown()
+	s.core.RequestShutdown()
 }

@@ -2,25 +2,23 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	stdhttp "net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
 	apihttp "knot-core/internal/api/http"
 	"knot-core/internal/auth"
+	"knot-core/internal/lifecycle"
 	"knot-core/internal/paths"
 	coreruntime "knot-core/internal/runtime"
-	"knot-core/internal/transport"
 	"knot-core/pkg/config"
 	"knot-core/pkg/core"
 	"knot-core/pkg/crypto"
@@ -30,7 +28,14 @@ import (
 	"knot-core/pkg/sshpool"
 )
 
-const defaultPort = 17898
+const (
+	defaultPort = 17898
+
+	// shutdownGracePeriod bounds the graceful phase of teardown. It lives here
+	// rather than at the call site so every trigger — the API, a signal, or a
+	// serve error — is bounded by the same value.
+	shutdownGracePeriod = 10 * time.Second
+)
 
 func main() {
 	if err := run(); err != nil {
@@ -46,40 +51,89 @@ func run() error {
 	flag.Parse()
 
 	startedAt := time.Now().UTC()
+
+	// Only argument parsing and path computation happen before the instance
+	// lock: neither reads nor writes shared state, so a second instance is
+	// rejected before it can touch the token, crypto provider, or pool.
 	layout, err := paths.DefaultLayout()
 	if err != nil {
 		return fmt.Errorf("resolve paths: %w", err)
 	}
-	if err := layout.Ensure(); err != nil {
-		return fmt.Errorf("prepare paths: %w", err)
+
+	runtimeInfo := coreruntime.NewHolder()
+	connTracker := apihttp.NewConnTracker()
+
+	runner, err := lifecycle.New(lifecycle.Config{
+		Layout:      layout,
+		Port:        port,
+		Version:     core.DefaultVersion,
+		APIVersion:  core.APIVersion,
+		StartedAt:   startedAt,
+		GracePeriod: shutdownGracePeriod,
+		Runtime:     runtimeInfo,
+		Server: lifecycle.ServerConfig{
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       10 * time.Second,
+			WriteTimeout:      0,
+			IdleTimeout:       30 * time.Second,
+			MaxHeaderBytes:    1 << 20,
+		},
+		Prepare: func(ctx context.Context, env lifecycle.Env) (stdhttp.Handler, error) {
+			return prepareServices(env, layout, startedAt, origins, runtimeInfo, connTracker)
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("create runner: %w", err)
 	}
 
+	// Setup signal handling
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Start the service. Shutdown of the shared resources happens inside the
+	// runner, so this path and the API path cannot diverge.
+	if err := runner.Start(ctx); err != nil {
+		return fmt.Errorf("start service: %w", err)
+	}
+
+	log.Printf("knot-core started successfully")
+
+	// Wait for the single teardown flow to finish. It is triggered by the
+	// authenticated shutdown API, by SIGINT/SIGTERM, or by a serve error, and it
+	// bounds itself, so this cannot wait forever on a stuck handler.
+	runner.Wait()
+
+	if err := runner.Shutdown(context.Background()); err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
+
+	log.Printf("knot-core stopped")
+	return nil
+}
+
+// prepareServices builds every service that touches shared state. It runs while
+// the lifecycle runner holds the single-instance lock, so a second instance can
+// never reach this code.
+func prepareServices(
+	env lifecycle.Env,
+	layout paths.Layout,
+	startedAt time.Time,
+	origins string,
+	runtimeInfo *coreruntime.Holder,
+	connTracker *apihttp.ConnTracker,
+) (stdhttp.Handler, error) {
 	token, err := auth.TokenStore{Path: layout.TokenPath}.LoadOrCreate()
 	if err != nil {
-		return fmt.Errorf("load token: %w", err)
+		return nil, fmt.Errorf("load token: %w", err)
 	}
-
-	listeners, addresses, err := transport.ListenLoopback(port)
-	if err != nil {
-		return fmt.Errorf("listen on loopback: %w", err)
-	}
-	serverOwnsListeners := false
-	defer func() {
-		if !serverOwnsListeners {
-			closeListeners(listeners)
-		}
-	}()
-	actualPort := listeners[0].Addr().(*net.TCPAddr).Port
-
-	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, actualPort, addresses, layout, startedAt, token != "")
-	if err := coreruntime.WriteInfo(layout.RuntimePath, runtimeInfo); err != nil {
-		return fmt.Errorf("write runtime info: %w", err)
-	}
+	// Discovery reports the token that actually exists, not a placeholder.
+	env.SetTokenPresent(token != "")
 
 	cryptoProvider, err := crypto.NewDefaultProvider(layout)
 	if err != nil {
-		return fmt.Errorf("initialize crypto provider: %w", err)
+		return nil, fmt.Errorf("initialize crypto provider: %w", err)
 	}
+
 	configService := config.NewService(layout, cryptoProvider)
 	secretService := secret.NewService(configService, cryptoProvider)
 	sharedPool := sshpool.NewPool()
@@ -90,72 +144,34 @@ func run() error {
 	sftpService.UseConfig(configService)
 	sftpService.UseSession(sessionService)
 	sftpService.UsePool(sharedPool)
+
 	coreService := core.New(core.DefaultVersion, startedAt)
 	coreService.UseConfig(configService)
 	coreService.UseSecret(secretService)
 	coreService.UseSession(sessionService)
 	coreService.UseSFTP(sftpService)
 	coreService.UseSSHPool(sharedPool)
-	shutdownRequested := make(chan struct{})
-	var requestShutdown sync.Once
-	coreService.UseShutdown(func() {
-		requestShutdown.Do(func() {
-			_ = os.Remove(layout.RuntimePath)
-			close(shutdownRequested)
-		})
+	// The shutdown API only asks for shutdown; the runner owns the teardown and
+	// releases resources through the cleanups below.
+	coreService.UseShutdown(env.RequestShutdown)
+
+	// Cleanups run in reverse registration order: WebSocket connections are
+	// closed before the services they are attached to are torn down.
+	env.OnCleanup(func(ctx context.Context) error {
+		return coreService.Shutdown(ctx)
 	})
-	server := &stdhttp.Server{
-		Handler:           apihttp.NewServer(coreService, runtimeInfo, auth.NewVerifier(token), auth.NewOriginChecker(splitCSV(origins))).Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      0,
-		IdleTimeout:       30 * time.Second,
-		MaxHeaderBytes:    1 << 20,
-	}
+	env.OnCleanup(func(context.Context) error {
+		connTracker.CloseAll()
+		return nil
+	})
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
-	errCh := make(chan error, len(listeners))
-	var wg sync.WaitGroup
-	serverOwnsListeners = true
-	for _, ln := range listeners {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if err := server.Serve(ln); err != nil && !errors.Is(err, stdhttp.ErrServerClosed) {
-				select {
-				case errCh <- err:
-				default:
-				}
-			}
-		}()
-	}
-
-	log.Printf("knot-core listening on %s", strings.Join(addresses, ", "))
-	select {
-	case <-ctx.Done():
-	case <-shutdownRequested:
-	case err := <-errCh:
-		_ = server.Close()
-		wg.Wait()
-		return err
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		return err
-	}
-	wg.Wait()
-	_ = os.Remove(layout.RuntimePath)
-	return nil
-}
-
-func closeListeners(listeners []net.Listener) {
-	for _, ln := range listeners {
-		_ = ln.Close()
-	}
+	return apihttp.NewServer(
+		coreService,
+		runtimeInfo,
+		auth.NewVerifier(token),
+		auth.NewOriginChecker(splitCSV(origins)),
+		apihttp.WithConnTracker(connTracker),
+	).Handler(), nil
 }
 
 func envInt(key string, fallback int) int {

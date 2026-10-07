@@ -14,12 +14,28 @@ import (
 type Server struct {
 	mux     *stdhttp.ServeMux
 	core    *core.Service
-	runtime coreruntime.Info
+	runtime *coreruntime.Holder
 	token   auth.Verifier
 	origins auth.OriginChecker
+	// tracker holds hijacked WebSocket connections so service teardown can close
+	// them. Nil means the server does not participate in connection tracking.
+	tracker *ConnTracker
 }
 
-func NewServer(coreService *core.Service, runtimeInfo coreruntime.Info, token auth.Verifier, origins auth.OriginChecker) *Server {
+// Option customizes a Server at construction.
+type Option func(*Server)
+
+// WithConnTracker registers hijacked WebSocket connections so teardown can
+// close them. http.Server.Shutdown does not track hijacked connections.
+func WithConnTracker(tracker *ConnTracker) Option {
+	return func(s *Server) {
+		s.tracker = tracker
+	}
+}
+
+// NewServer builds the API server. The runtime holder is read per request rather
+// than copied, so the values published by startup are the ones the API reports.
+func NewServer(coreService *core.Service, runtimeInfo *coreruntime.Holder, token auth.Verifier, origins auth.OriginChecker, opts ...Option) *Server {
 	s := &Server{
 		mux:     stdhttp.NewServeMux(),
 		core:    coreService,
@@ -27,8 +43,23 @@ func NewServer(coreService *core.Service, runtimeInfo coreruntime.Info, token au
 		token:   token,
 		origins: origins,
 	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(s)
+		}
+	}
 	s.routes()
 	return s
+}
+
+// runtimeInfo returns the published discovery information, or the zero value
+// while startup has not published it yet.
+func (s *Server) runtimeInfo() coreruntime.Info {
+	if s.runtime == nil {
+		return coreruntime.Info{}
+	}
+	info, _ := s.runtime.Get()
+	return info
 }
 
 func (s *Server) Handler() stdhttp.Handler {
@@ -133,10 +164,11 @@ func (s *Server) getHealth(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	if !requireMethod(w, r, stdhttp.MethodGet) {
 		return
 	}
+	info := s.runtimeInfo()
 	response.JSON(w, stdhttp.StatusOK, s.core.Health(true, core.HealthInput{
 		TokenAvailable:  s.token.Available(),
-		RuntimePath:     s.runtime.RuntimePath,
-		ListenAddresses: s.runtime.ListenAddresses,
+		RuntimePath:     info.RuntimePath,
+		ListenAddresses: info.ListenAddresses,
 	}))
 }
 
@@ -151,7 +183,7 @@ func (s *Server) getRuntime(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	if !requireMethod(w, r, stdhttp.MethodGet) {
 		return
 	}
-	response.JSON(w, stdhttp.StatusOK, s.runtime)
+	response.JSON(w, stdhttp.StatusOK, s.runtimeInfo())
 }
 
 func (s *Server) getStatus(w stdhttp.ResponseWriter, r *stdhttp.Request) {

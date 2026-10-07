@@ -1,6 +1,8 @@
 package core
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -180,35 +182,132 @@ func (s *Service) ClearConnections() int {
 	return closed
 }
 
-func (s *Service) Shutdown() {
+// RequestShutdown asks the process to begin its shutdown flow. The HTTP handler
+// uses it because the runner owns the single teardown flow: every trigger, the
+// API included, enters through the same entry point instead of releasing
+// resources on its own path.
+func (s *Service) RequestShutdown() {
+	s.capabilityMu.RLock()
+	shutdown := s.shutdown
+	s.capabilityMu.RUnlock()
+	if shutdown != nil {
+		shutdown()
+	}
+}
+
+// Shutdown releases the resources this service owns. The lifecycle runner calls
+// it during teardown, so the API, SIGINT/SIGTERM, and serve-error paths all
+// release sessions, SFTP resources, and pooled connections the same way.
+func (s *Service) Shutdown(ctx context.Context) error {
 	s.capabilityMu.RLock()
 	sessionService := s.session
 	sftpService := s.sftp
 	pool := s.sshPool
-	shutdown := s.shutdown
 	s.capabilityMu.RUnlock()
 
 	s.PublishEvent(Event{Type: "core.shutdown_started", Resource: "core", Level: "info"})
-	if sessionService != nil {
-		for _, res := range sessionService.List() {
-			if res.State != "closed" {
-				_, _ = sessionService.Disconnect(res.ID)
+
+	// The three resource classes are released concurrently. Running them in
+	// sequence would let one stalled connection hold the others back and make the
+	// budget cover the sum of the steps rather than the whole teardown; each class
+	// also stops as soon as the budget is gone instead of walking the rest of its
+	// list, so an expired budget cannot be multiplied by the number of resources.
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		releases []error
+	)
+	release := func(name string, fn func(ctx context.Context) error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := ctx.Err(); err != nil {
+				mu.Lock()
+				releases = append(releases, fmt.Errorf("%s release skipped: %w", name, err))
+				mu.Unlock()
+				return
 			}
-		}
+			err := fn(ctx)
+			if err != nil {
+				mu.Lock()
+				releases = append(releases, fmt.Errorf("%s release: %w", name, err))
+				mu.Unlock()
+			}
+			if err := ctx.Err(); err != nil {
+				mu.Lock()
+				releases = append(releases, fmt.Errorf("%s release did not finish: %w", name, err))
+				mu.Unlock()
+			}
+		}()
+	}
+
+	if sessionService != nil {
+		release("session", func(ctx context.Context) error {
+			var errs []error
+			for _, res := range sessionService.List() {
+				if ctx.Err() != nil {
+					return errors.Join(append(errs, ctx.Err())...)
+				}
+				if res.State != "closed" {
+					_, err := sessionService.Disconnect(res.ID)
+					errs = append(errs, err)
+				}
+			}
+			return errors.Join(errs...)
+		})
 	}
 	if sftpService != nil {
-		for _, res := range sftpService.ListSessions() {
-			if res.State != "closed" {
-				_, _ = sftpService.Close(res.ID)
+		release("sftp", func(ctx context.Context) error {
+			var errs []error
+			for _, res := range sftpService.ListSessions() {
+				if ctx.Err() != nil {
+					return errors.Join(append(errs, ctx.Err())...)
+				}
+				if res.State != "closed" {
+					_, err := sftpService.Close(res.ID)
+					errs = append(errs, err)
+				}
 			}
-		}
+			return errors.Join(errs...)
+		})
 	}
 	if pool != nil {
-		pool.CloseAll()
+		release("ssh pool", func(context.Context) error { pool.CloseAll(); return nil })
 	}
-	if shutdown != nil {
-		go shutdown()
+	// The wait is bounded by the same budget. A release step that never returns —
+	// a subsystem close parked on a remote that stopped answering — must not keep
+	// Shutdown from returning; the step is left to finish on its own and its
+	// expiry is reported below.
+	finished := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+	case <-ctx.Done():
+		mu.Lock()
+		releases = append(releases, fmt.Errorf("core resource release did not finish: %w", ctx.Err()))
+		mu.Unlock()
 	}
+
+	// A release step may still be running — the wait above is bounded, not the
+	// step — so the report is snapshotted under the lock rather than read while
+	// a straggler could still be appending to it.
+	mu.Lock()
+	report := append([]error(nil), releases...)
+	mu.Unlock()
+
+	// A cancelled budget means teardown ran out of time part-way or skipped a
+	// class entirely; the caller must be able to observe that rather than read it
+	// as a complete release.
+	if err := errors.Join(report...); err != nil {
+		return fmt.Errorf("core resource release: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("core resource release: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) handleSessionEvent(event session.Event) {

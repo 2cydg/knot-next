@@ -36,6 +36,11 @@ const (
 	maxSessionCWDFollowers = 8
 )
 
+// attachDrainTimeout bounds how long a terminal transition waits for output
+// delivery to finish before forcing the pump closed. It exists so a wedged
+// reader cannot stall the transition, not as a tail-flush delay.
+var attachDrainTimeout = 5 * time.Second
+
 type configWriter interface {
 	RuntimeConfig() (config.RuntimeConfig, error)
 	SetServerPassword(id string, password string) (config.ServerProfileView, error)
@@ -153,20 +158,39 @@ type resource struct {
 	authChallenge    *pendingChallenge
 	authRetryCount   int
 	authResponse     *ChallengeResponse
-	subscribers      map[chan Event]struct{}
-	cwdSubscribers   map[chan CWDNotify]struct{}
-	backend          *interactiveBackend
-	poolKeys         []string
-	cancel           context.CancelFunc
+
+	// pendingCredentials holds credentials to save after successful authentication.
+	// This ensures we only save credentials that actually worked.
+	pendingCredentials *ChallengeResponse
+
+	// outcomeCommitted guards one-time recording of the terminal exit outcome,
+	// so the session resource and its attach observers always agree.
+	outcomeCommitted bool
+	// attachGen identifies the current attachment owner so a stale detachment
+	// cannot release a newer attachment.
+	attachGen int64
+	// claim is the attachment that owns this session's interactive streams. It
+	// is the current owner while Attached is set, and the retiring owner until
+	// the next attachment has waited for its workers.
+	claim *attachmentClaim
+
+	subscribers    map[chan Event]struct{}
+	cwdSubscribers map[chan CWDNotify]struct{}
+	backend        *interactiveBackend
+	poolKeys       []string
+	cancel         context.CancelFunc
 }
 
 type interactiveBackend struct {
-	session *ssh.Session
-	stdin   io.WriteCloser
-	stdout  io.Reader
-	stderr  io.Reader
-	done    chan error
-	mu      sync.Mutex
+	session    *ssh.Session
+	stdin      io.WriteCloser
+	pump       *outputPump
+	exitResult *exitResult
+	mu         sync.Mutex
+	closed     bool
+	// inputSlot is held by the actual stdin write, including after its attachment
+	// stops waiting. Reattachment cannot create another writer on this backend.
+	inputSlot chan struct{}
 }
 
 type Event struct {
@@ -179,8 +203,23 @@ type Event struct {
 	ExitCode  *int       `json:"exit_code,omitempty"`
 	Error     string     `json:"error,omitempty"`
 	Challenge *Challenge `json:"challenge,omitempty"`
+	Warning   *Warning   `json:"warning,omitempty"`
 	Time      time.Time  `json:"time"`
 }
+
+// Warning is a sanitized, client-visible notice about a non-fatal problem, such
+// as a credential that could not be persisted after a successful connection.
+// Its message never carries credential material.
+type Warning struct {
+	Kind    string `json:"kind"`
+	Message string `json:"message"`
+}
+
+// Warning kinds. They are part of the event contract, so a client can react to
+// a specific condition instead of matching on message text.
+const (
+	WarningCredentialSaveFailed = "credential_save_failed"
+)
 
 type CWDNotify struct {
 	SessionID string    `json:"session_id"`
@@ -243,12 +282,37 @@ type ChallengeResponse struct {
 	Passphrase string `json:"passphrase,omitempty"`
 }
 
+// AttachStream is one attachment to an interactive session's PTY. Exactly one
+// attachment exists at a time; callers must invoke Cancel and Release when done.
+//
+// Output is delivered per stream: ordering within stdout or stderr is preserved,
+// but no global ordering between the two streams is promised. `Exit` delivers the
+// session's final outcome exactly once, after which no further output arrives.
+// If `Overflow` is closed, this attachment fell behind and output was truncated;
+// the client must treat the stream as incomplete and re-attach.
 type AttachStream struct {
-	Cancel func()
-	Stdout <-chan []byte
-	Stderr <-chan []byte
-	Done   <-chan error
-	Input  io.WriteCloser
+	Cancel  func()
+	Release func()
+	Stdout  <-chan []byte
+	Stderr  <-chan []byte
+	// Input accepts stdin bytes for this attachment and queues them for the
+	// attachment's own worker. Closing it ends input for this attachment only;
+	// the session's stdin stays usable for the next one.
+	Input io.WriteCloser
+	Exit  <-chan ExitOutcome
+	// Revoked is closed when this attachment loses ownership of the session
+	// without the session ending: an explicit detach, or a newer attachment. A
+	// session that ends is reported through Exit instead, so a completed session
+	// is never mistaken for a revocation.
+	Revoked <-chan struct{}
+	// InputError reports the first failure delivering input to the remote, after
+	// which this attachment's input worker has stopped.
+	InputError <-chan error
+	Overflow   <-chan struct{}
+	// BacklogTruncated reports that output produced before this attachment was
+	// dropped because it exceeded the retained backlog. Bytes delivered to an
+	// earlier attachment are never replayed.
+	BacklogTruncated bool
 }
 
 func (s *Service) Create(req CreateRequest) (Resource, error) {
@@ -308,7 +372,7 @@ func (s *Service) Create(req CreateRequest) (Resource, error) {
 	s.sessions[id] = session
 	s.publishSessionLocked(session, Event{Type: "session.created", SessionID: id, State: res.State, Time: now})
 	if testMode {
-		backend := newLocalInteractiveBackend()
+		backend := newSessionBackend()
 		session.backend = backend
 		session.State = "connected"
 		session.UpdatedAt = now
@@ -394,39 +458,113 @@ func (s *Service) Attach(id string) (Resource, error) {
 
 func (s *Service) AttachStream(id string) (AttachStream, Resource, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	session, ok := s.sessions[id]
 	if !ok {
+		s.mu.Unlock()
 		return AttachStream{}, Resource{}, ErrNotFound
 	}
 	if session.State == "closed" || session.State == "failed" {
+		s.mu.Unlock()
 		return AttachStream{}, Resource{}, fmt.Errorf("%w: closed session cannot be attached", ErrConflict)
 	}
 	if session.Attached {
+		s.mu.Unlock()
 		return AttachStream{}, Resource{}, fmt.Errorf("%w: session is already attached", ErrConflict)
 	}
-	if session.backend == nil {
+	backend := session.backend
+	if backend == nil {
+		s.mu.Unlock()
 		return AttachStream{}, Resource{}, fmt.Errorf("%w: SSH PTY backend is not connected", ErrConflict)
+	}
+	// The previous claim loses ownership before the new one takes the pump. Its
+	// subscription is dropped here, and its workers are awaited below, so no
+	// output owner or input worker of the old attachment overlaps the new one.
+	retiring := session.claim
+	if retiring != nil {
+		retiring.revoke()
 	}
 	now := time.Now().UTC()
 	session.Attached = true
+	session.attachGen++
+	claim := newAttachmentClaim(session.attachGen, backend)
+	session.claim = claim
 	session.State = "attached"
 	session.UpdatedAt = now
 	s.publishSessionLocked(session, Event{Type: "session.attached", SessionID: id, State: session.State, Time: now})
-	ctx, cancel := context.WithCancel(context.Background())
-	stdout := make(chan []byte, 16)
-	stderr := make(chan []byte, 16)
-	go readByteStream(ctx, session.backend.stdout, stdout)
-	go readByteStream(ctx, session.backend.stderr, stderr)
+	snapshot := session.snapshot()
+	s.mu.Unlock()
+
+	// Waiting for the old workers happens outside the service lock: a worker that
+	// is stuck writing to a remote that stopped reading must not block other
+	// sessions.
+	if retiring != nil {
+		retiring.wait(attachmentGrace)
+	}
+	claim.start()
+
+	var releaseMu sync.Mutex
+	released := false
+	release := func() {
+		releaseMu.Lock()
+		defer releaseMu.Unlock()
+		if released {
+			return
+		}
+		released = true
+		s.detachAttachment(id, claim.gen)
+	}
+	cancel := func() {
+		releaseMu.Lock()
+		defer releaseMu.Unlock()
+		claim.revoke()
+	}
+
 	return AttachStream{
-		Cancel: cancel,
-		Stdout: stdout,
-		Stderr: stderr,
-		Done:   session.backend.done,
-		Input:  session.backend.stdin,
-	}, session.snapshot(), nil
+		Cancel:           cancel,
+		Release:          release,
+		Stdout:           claim.stdout,
+		Stderr:           claim.stderr,
+		Input:            claim.input,
+		Exit:             claim.exit,
+		Overflow:         claim.sub.Overflow(),
+		Revoked:          claim.revoked,
+		InputError:       claim.inputErr,
+		BacklogTruncated: claim.backlogTruncated,
+	}, snapshot, nil
 }
 
+// detachAttachment releases attachment ownership only if gen still owns it, so a
+// finishing attachment can never detach a newer one.
+func (s *Service) detachAttachment(id string, gen int64) {
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, ok := s.sessions[id]
+	if !ok || !session.Attached || session.attachGen != gen {
+		return
+	}
+	s.releaseAttachLocked(session, now)
+}
+
+// releaseAttachLocked hands the session back to the next client. The claim stays
+// on the session as the retiring owner: it is revoked here, which drops its
+// output subscription immediately, and the next attachment waits for its
+// workers before starting.
+func (s *Service) releaseAttachLocked(session *resource, now time.Time) {
+	session.Attached = false
+	if session.State == "attached" {
+		session.State = "detached"
+	}
+	session.UpdatedAt = now
+	s.publishSessionLocked(session, Event{Type: "session.detached", SessionID: session.ID, State: session.State, Time: now})
+	if session.claim != nil {
+		session.claim.revoke()
+	}
+}
+
+// Detach releases the current attachment, whatever its generation. Attachments
+// started via AttachStream should prefer AttachStream.Release so they cannot
+// release a newer attachment.
 func (s *Service) Detach(id string) (Resource, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -437,66 +575,150 @@ func (s *Service) Detach(id string) (Resource, error) {
 	if session.State == "closed" || session.State == "failed" {
 		return session.snapshot(), nil
 	}
-	now := time.Now().UTC()
-	session.Attached = false
-	if session.State == "attached" {
-		session.State = "detached"
-	}
-	session.UpdatedAt = now
-	s.publishSessionLocked(session, Event{Type: "session.detached", SessionID: id, State: session.State, Time: now})
+	s.releaseAttachLocked(session, time.Now().UTC())
 	return session.snapshot(), nil
 }
 
-func (s *Service) Control(id string, req ControlRequest) (Resource, error) {
+// controlIOTimeout bounds one control operation's backend I/O. A control
+// request must never wait forever on a remote that stopped answering: past the
+// bound the caller is given a definite error instead of being pinned. It is a
+// variable so tests can shorten it.
+var controlIOTimeout = 10 * time.Second
+
+// runControlIO runs a backend control operation without the service lock held
+// and never blocks the caller for longer than controlIOTimeout. The operation
+// itself is released by the session teardown a disconnect performs: closing the
+// SSH session unblocks a write that is stuck on it.
+func runControlIO(fn func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	timer := time.NewTimer(controlIOTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("timed out after %s", controlIOTimeout)
+	}
+}
+
+// failControl reports a backend control failure on the session's event stream
+// and returns it as a definite error. A control operation that failed is never
+// reported as success.
+func (s *Service) failControl(id string, target *resource, op string, cause error) error {
+	err := fmt.Errorf("%w: %s failed: %v", ErrConflict, op, cause)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if current, ok := s.sessions[id]; ok && current == target && !isTerminalState(current.State) {
+		s.publishSessionLocked(current, Event{Type: "session.error", SessionID: id, State: current.State, Error: err.Error(), Time: time.Now().UTC()})
+	}
+	return err
+}
+
+// Control applies one control operation to a session.
+//
+// The service lock only guards validation and result commit. Operations that
+// reach the remote (resize, signal, close_stdin) run with the lock released, so
+// a stalled SSH write cannot block every other session, and a concurrent
+// disconnect can still acquire the lock and tear the backend down to release
+// them. The result is committed only after re-checking, under the lock, that the
+// session is still the same live resource.
+func (s *Service) Control(id string, req ControlRequest) (Resource, error) {
+	s.mu.Lock()
 	session, ok := s.sessions[id]
 	if !ok {
+		s.mu.Unlock()
 		return Resource{}, ErrNotFound
 	}
-	if (session.State == "closed" || session.State == "failed") && req.Type != "disconnect" {
+	if isTerminalState(session.State) && req.Type != "disconnect" {
+		s.mu.Unlock()
 		return Resource{}, fmt.Errorf("%w: closed session cannot be controlled", ErrConflict)
 	}
 	now := time.Now().UTC()
+
+	switch req.Type {
+	case "detach":
+		s.releaseAttachLocked(session, now)
+		snapshot := session.snapshot()
+		s.mu.Unlock()
+		return snapshot, nil
+	case "disconnect":
+		// Close the backend outside the service lock: tearing down an SSH session
+		// must never block every other session behind s.mu.
+		backend := s.closeSessionLocked(session, "closed", ExitOutcome{DisconnectCause: causeClientDisconnected}, now)
+		snapshot := session.snapshot()
+		s.mu.Unlock()
+		if backend != nil {
+			if err := backend.Close(); err != nil {
+				return snapshot, fmt.Errorf("disconnect session: %w", err)
+			}
+		}
+		return snapshot, nil
+	}
+
+	// Validate with the lock held so invalid parameters never reach the remote,
+	// then capture the backend the operation applies to.
+	backend := session.backend
+	var op func() error
 	switch req.Type {
 	case "resize":
 		if !validTerminalDimensions(req.Rows, req.Cols) {
+			s.mu.Unlock()
 			return Resource{}, fmt.Errorf("%w: terminal dimensions are invalid", ErrValidation)
 		}
-		session.Rows = req.Rows
-		session.Cols = req.Cols
-		if session.backend != nil {
-			if err := session.backend.WindowChange(req.Rows, req.Cols); err != nil {
-				s.publishSessionLocked(session, Event{Type: "session.error", SessionID: id, State: session.State, Error: err.Error(), Time: now})
-			}
+		if backend != nil {
+			op = func() error { return backend.WindowChange(req.Rows, req.Cols) }
 		}
-		s.publishSessionLocked(session, Event{Type: "session.resized", SessionID: id, State: session.State, Rows: req.Rows, Cols: req.Cols, Time: now})
-	case "detach":
-		session.Attached = false
-		session.State = "detached"
-		s.publishSessionLocked(session, Event{Type: "session.detached", SessionID: id, State: session.State, Time: now})
 	case "close_stdin":
-		if session.backend != nil && session.backend.stdin != nil {
-			_ = session.backend.stdin.Close()
+		// Idempotent: repeating close_stdin must not close twice or affect other
+		// sessions.
+		if backend != nil {
+			op = func() error { return backend.CloseStdin() }
 		}
 	case "signal":
 		switch req.Signal {
 		case "HUP", "INT", "KILL", "TERM", "USR1", "USR2":
 		default:
+			s.mu.Unlock()
 			return Resource{}, fmt.Errorf("%w: unsupported signal", ErrValidation)
 		}
-		if session.backend != nil {
-			if err := session.backend.Signal(req.Signal); err != nil {
-				s.publishSessionLocked(session, Event{Type: "session.error", SessionID: id, State: session.State, Error: err.Error(), Time: now})
-			}
+		if backend != nil {
+			op = func() error { return backend.Signal(req.Signal) }
 		}
-	case "disconnect":
-		s.closeSessionLocked(session, "closed", "client requested disconnect", nil, now)
 	default:
+		s.mu.Unlock()
 		return Resource{}, fmt.Errorf("%w: unsupported control type", ErrValidation)
 	}
-	session.UpdatedAt = now
-	return session.snapshot(), nil
+	s.mu.Unlock()
+
+	if op != nil {
+		if err := runControlIO(op); err != nil {
+			return Resource{}, s.failControl(id, session, req.Type, err)
+		}
+	}
+
+	// Commit under the lock, and only if the session is still this resource and
+	// still live. An operation that raced a disconnect did reach the backend, but
+	// its result no longer describes a live resource: record nothing new and
+	// publish nothing, so a closed session is never reported as resized.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.sessions[id]
+	if !ok {
+		return Resource{}, fmt.Errorf("%w: session no longer exists", ErrConflict)
+	}
+	if current != session || isTerminalState(current.State) {
+		return current.snapshot(), nil
+	}
+	if req.Type == "resize" {
+		current.Rows = req.Rows
+		current.Cols = req.Cols
+	}
+	current.UpdatedAt = time.Now().UTC()
+	if req.Type == "resize" {
+		s.publishSessionLocked(current, Event{Type: "session.resized", SessionID: id, State: current.State, Rows: req.Rows, Cols: req.Cols, Time: current.UpdatedAt})
+	}
+	return current.snapshot(), nil
 }
 
 func (s *Service) Disconnect(id string) (Resource, error) {
@@ -509,14 +731,21 @@ func (s *Service) DisconnectByPoolKey(poolKey string) []Resource {
 	}
 	now := time.Now().UTC()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	var closed []Resource
+	var backends []*interactiveBackend
 	for _, session := range s.sessions {
 		if session.State == "closed" || session.State == "failed" || !containsString(session.poolKeys, poolKey) {
 			continue
 		}
-		s.closeSessionLocked(session, "closed", "ssh pool disconnected", nil, now)
+		backend := s.closeSessionLocked(session, "closed", ExitOutcome{DisconnectCause: causePoolDisconnected}, now)
+		if backend != nil {
+			backends = append(backends, backend)
+		}
 		closed = append(closed, session.snapshot())
+	}
+	s.mu.Unlock()
+	for _, backend := range backends {
+		_ = backend.Close()
 	}
 	return closed
 }
@@ -670,6 +899,12 @@ func (s *Service) respondChallenge(id string, typ string, resp ChallengeResponse
 		s.mu.Unlock()
 		return Challenge{}, ErrNotFound
 	}
+	// Once terminal, a challenge is no longer submittable: answering one would
+	// let a late prompt move the session back out of its recorded outcome.
+	if isTerminalState(session.State) {
+		s.mu.Unlock()
+		return Challenge{}, fmt.Errorf("%w: session %s no longer accepts challenge responses", ErrConflict, id)
+	}
 	var pending *pendingChallenge
 	if typ == "host_key" {
 		pending = session.hostKeyChallenge
@@ -722,6 +957,13 @@ func (s *Service) dependencies() (configWriter, *sshpool.Pool, DialOptions, bool
 	return s.config, s.pool, s.dial, s.testMode
 }
 
+// isTerminalState reports whether a session state is final. A terminal state is
+// never left again: the outcome, its time and its cause are recorded once, so a
+// late background failure cannot rewrite a completed cancellation.
+func isTerminalState(state string) bool {
+	return state == "closed" || state == "failed"
+}
+
 func (s *Service) connectSession(ctx context.Context, id string, req CreateRequest, cfgProvider configWriter, pool *sshpool.Pool, dialOpts DialOptions, testMode bool) {
 	var runtimeCfg config.RuntimeConfig
 	var err error
@@ -735,15 +977,19 @@ func (s *Service) connectSession(ctx context.Context, id string, req CreateReque
 		s.failSession(id, err, runtimeCfg, "failed")
 		return
 	}
+	// The resolved server is always recorded: it is the save target for a
+	// remembered credential, and a client-supplied Alias is display-only.
 	if req.Alias == "" {
 		req.Alias = server.Alias
-		s.mu.Lock()
-		if session, ok := s.sessions[id]; ok {
-			session.Alias = server.Alias
-			session.serverID = server.ID
-		}
-		s.mu.Unlock()
 	}
+	s.mu.Lock()
+	if session, ok := s.sessions[id]; ok {
+		session.serverID = server.ID
+		if req.Alias != "" {
+			session.Alias = req.Alias
+		}
+	}
+	s.mu.Unlock()
 	backend, poolKeys, finalCfg, err := s.openInteractive(ctx, id, req, server, runtimeCfg, pool, dialOpts)
 	if err != nil {
 		s.failSession(id, err, finalCfg, "failed")
@@ -778,6 +1024,18 @@ func (s *Service) attachBackend(id string, backend *interactiveBackend, poolKeys
 		session.State = "connected"
 	}
 	session.UpdatedAt = now
+
+	// Authentication succeeded - now save credentials if Remember was set. The
+	// candidate is bound to the attempt that just succeeded, so a stale one from
+	// an earlier rejected attempt can never be written here.
+	if session.pendingCredentials != nil && session.pendingCredentials.Remember {
+		candidate := *session.pendingCredentials
+		session.pendingCredentials = nil
+		go s.saveCredentials(id, session.serverID, candidate)
+	} else {
+		session.pendingCredentials = nil
+	}
+
 	s.publishSessionLocked(session, Event{Type: "session.connected", SessionID: id, State: session.State, Time: now})
 }
 
@@ -789,12 +1047,73 @@ func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig, st
 	if !ok {
 		return
 	}
+	// A session that already reached a terminal state keeps it. The connect
+	// attempt that produced this error was cancelled, so its failure must not
+	// rewrite the recorded outcome, time or cause.
+	if isTerminalState(session.State) {
+		return
+	}
 	session.State = state
 	session.Attached = false
 	session.UpdatedAt = now
 	session.ExitedAt = &now
 	session.FrameworkError = safeError(err, cfg)
+	// No credential candidate survives a failed connect attempt.
+	session.pendingCredentials = nil
+	session.hostKeyChallenge = nil
+	session.authChallenge = nil
+	session.HostKeyPending = false
+	session.AuthPending = false
 	s.publishSessionLocked(session, Event{Type: "session.error", SessionID: id, State: session.State, Error: session.FrameworkError, Time: now})
+}
+
+// openSSHSession opens a channel on a pooled client under ctx. x/crypto/ssh has
+// no cancellation for this call, so a cancelled attempt abandons the pending open
+// and closes whatever channel it eventually returns; the shared client itself is
+// never closed here, because another session may be using it.
+func openSSHSession(ctx context.Context, client *ssh.Client) (*ssh.Session, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type result struct {
+		session *ssh.Session
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		session, err := client.NewSession()
+		done <- result{session: session, err: err}
+	}()
+	select {
+	case res := <-done:
+		return res.session, res.err
+	case <-ctx.Done():
+		go func() {
+			if res := <-done; res.session != nil {
+				_ = res.session.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
+}
+
+// sessionSetup runs one blocking setup step on a session this attempt owns. A
+// cancelled attempt closes that session, which unblocks the step; the step's own
+// result is drained so the goroutine cannot leak.
+func sessionSetup(ctx context.Context, session *ssh.Session, step func() error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- step() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		_ = session.Close()
+		go func() { <-done }()
+		return ctx.Err()
+	}
 }
 
 func (s *Service) openInteractive(ctx context.Context, sessionID string, req CreateRequest, server config.ServerProfile, cfg config.RuntimeConfig, pool *sshpool.Pool, dialOpts DialOptions) (*interactiveBackend, []string, config.RuntimeConfig, error) {
@@ -805,10 +1124,10 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 			return nil, nil, currentCfg, ctx.Err()
 		default:
 		}
-		confirm := func(prompt sshpool.HostKeyPrompt) bool {
-			return s.waitHostKeyResponse(ctx, sessionID, server, prompt)
+		confirm := func(attemptCtx context.Context, prompt sshpool.HostKeyPrompt) bool {
+			return s.waitHostKeyResponse(attemptCtx, sessionID, server, prompt)
 		}
-		client, poolKeys, _, err := pool.GetClient(server, currentCfg, confirm, sshpool.DialOptions{
+		client, poolKeys, _, err := pool.GetClientContextWithPrompt(ctx, server, currentCfg, confirm, sshpool.DialOptions{
 			AgentSocket:   dialOpts.AgentSocket,
 			HostKeyPolicy: req.HostKeyPolicy,
 			Timeout:       dialOpts.Timeout,
@@ -829,12 +1148,14 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 			return nil, nil, currentCfg, err
 		}
 		pool.IncRef(poolKeys...)
-		sshSession, err := client.NewSession()
+		sshSession, err := openSSHSession(ctx, client)
 		if err != nil {
 			pool.DecRef(poolKeys...)
 			return nil, nil, currentCfg, err
 		}
-		if err := sshSession.RequestPty(req.Term, req.Rows, req.Cols, sshTerminalModes()); err != nil {
+		if err := sessionSetup(ctx, sshSession, func() error {
+			return sshSession.RequestPty(req.Term, req.Rows, req.Cols, sshTerminalModes())
+		}); err != nil {
 			_ = sshSession.Close()
 			pool.DecRef(poolKeys...)
 			return nil, nil, currentCfg, err
@@ -869,17 +1190,26 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 		stderr = newObservedReader(stderr, func(path string) {
 			s.updateCurrentDir(sessionID, path)
 		})
-		if err := sshSession.Shell(); err != nil {
+		if err := sessionSetup(ctx, sshSession, sshSession.Shell); err != nil {
 			_ = sshSession.Close()
 			pool.DecRef(poolKeys...)
 			return nil, nil, currentCfg, err
 		}
-		done := make(chan error, 1)
-		backend := &interactiveBackend{session: sshSession, stdin: stdin, stdout: stdout, stderr: stderr, done: done}
-		go func() {
-			done <- sshSession.Wait()
-			close(done)
-		}()
+
+		// Both streams feed one pump, so a re-attach subscribes to the same single
+		// reader instead of racing a second one, and remote stderr is drained
+		// (an unread stderr pipe would stop replenishing the SSH window).
+		pump := newOutputPump()
+		pump.AddReader(streamStdout, stdout)
+		pump.AddReader(streamStderr, stderr)
+		backend := &interactiveBackend{
+			session:    sshSession,
+			stdin:      stdin,
+			pump:       pump,
+			exitResult: newExitResult(),
+		}
+		pump.Start()
+
 		return backend, poolKeys, currentCfg, nil
 	}
 	return nil, nil, currentCfg, fmt.Errorf("%w: retry limit reached", ErrConflict)
@@ -906,6 +1236,12 @@ func (s *Service) waitHostKeyResponse(ctx context.Context, sessionID string, ser
 	s.mu.Lock()
 	session, ok := s.sessions[sessionID]
 	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	// A cancelled session must not re-enter a pending state through a late host
+	// key prompt from the attempt that is still unwinding.
+	if isTerminalState(session.State) {
 		s.mu.Unlock()
 		return false
 	}
@@ -962,6 +1298,12 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 		s.mu.Unlock()
 		return cfg, ErrNotFound
 	}
+	// The session was cancelled or already failed while this attempt was in
+	// flight; do not raise another prompt or move it back to a pending state.
+	if isTerminalState(session.State) {
+		s.mu.Unlock()
+		return cfg, fmt.Errorf("%w: session is no longer connectable", ErrConflict)
+	}
 	session.authRetryCount = retryCount
 	session.authChallenge = challenge
 	session.AuthPending = true
@@ -982,6 +1324,22 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 		if resp.Abort {
 			return cfg, fmt.Errorf("%w: authentication retry aborted", ErrAuthRetryAborted)
 		}
+
+		// The candidate is bound to the attempt it answers: every response
+		// replaces the previous one, including with nil when this attempt is not
+		// to be remembered. A rejected attempt's remembered password therefore
+		// never survives into a later successful connection.
+		s.mu.Lock()
+		if session, ok := s.sessions[sessionID]; ok {
+			if resp.Remember {
+				candidate := resp
+				session.pendingCredentials = &candidate
+			} else {
+				session.pendingCredentials = nil
+			}
+		}
+		s.mu.Unlock()
+
 		return s.runtimeConfigForAuthResponse(cfg, server, resp)
 	case <-timer.C:
 		s.failPendingChallenge(sessionID, "auth", "authentication retry timed out")
@@ -994,44 +1352,29 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 
 var ErrAuthRetryAborted = errors.New("authentication retry aborted")
 
+// runtimeConfigForAuthResponse constructs temporary runtime config for authentication attempt.
+// It does NOT save credentials - that happens only after successful authentication.
+// The Remember flag is stored separately and processed after connection succeeds.
 func (s *Service) runtimeConfigForAuthResponse(cfg config.RuntimeConfig, server config.ServerProfile, resp ChallengeResponse) (config.RuntimeConfig, error) {
 	next := cloneRuntimeConfig(cfg)
 	profile := next.Servers[server.ID]
+
 	if resp.Password != "" {
 		profile.AuthMethod = config.AuthMethodPassword
 		profile.Password = resp.Password
-		if resp.Remember {
-			if _, err := s.config.SetServerPassword(server.ID, resp.Password); err != nil {
-				return cfg, err
-			}
-			saved, err := s.config.RuntimeConfig()
-			if err != nil {
-				return cfg, err
-			}
-			next = saved
-			profile = next.Servers[server.ID]
-		}
+		// Note: Do NOT save here - wait for authentication success
 	}
+
 	if resp.KeyID != "" {
 		profile.AuthMethod = config.AuthMethodKey
 		profile.KeyID = resp.KeyID
-		if resp.Remember {
-			savedProfile := profile
-			savedProfile.Password = ""
-			if _, err := s.config.UpdateServer(server.ID, savedProfile); err != nil {
-				return cfg, err
-			}
-			saved, err := s.config.RuntimeConfig()
-			if err != nil {
-				return cfg, err
-			}
-			next = saved
-			profile = next.Servers[server.ID]
-		}
+		// Note: Do NOT save here - wait for authentication success
 	}
+
 	if resp.Password == "" && resp.KeyID == "" {
 		profile.AuthMethod = config.AuthMethodAgent
 	}
+
 	next.Servers[server.ID] = profile
 	return next, nil
 }
@@ -1042,6 +1385,11 @@ func (s *Service) failPendingChallenge(sessionID string, typ string, message str
 	defer s.mu.Unlock()
 	session, ok := s.sessions[sessionID]
 	if !ok {
+		return
+	}
+	// A challenge that was cancelled by a terminal transition reports its
+	// failure here; the terminal state and its cause stand.
+	if isTerminalState(session.State) {
 		return
 	}
 	if typ == "host_key" {
@@ -1055,6 +1403,7 @@ func (s *Service) failPendingChallenge(sessionID string, typ string, message str
 	session.FrameworkError = message
 	session.ExitedAt = &now
 	session.UpdatedAt = now
+	session.pendingCredentials = nil
 	s.publishSessionLocked(session, Event{Type: "session.error", SessionID: sessionID, State: session.State, Error: message, Time: now})
 }
 
@@ -1067,36 +1416,100 @@ func (s *Service) publishError(sessionID string, message string) {
 	}
 }
 
+// watchInteractive is the single owner of a session's terminal transition. It
+// waits for the remote to exit, drains output that was already received, records
+// the outcome once, and releases the pool references.
 func (s *Service) watchInteractive(id string, backend *interactiveBackend, pool *sshpool.Pool, poolKeys []string, cfg config.RuntimeConfig) {
-	err := <-backend.done
+	// ssh.Session.Wait returns only after the stdin/stdout/stderr copies have all
+	// finished, so by the time it returns the pump has read every byte the remote
+	// sent. A bounded wait (instead of a fixed sleep) covers a wedged reader.
+	err := backend.session.Wait()
+	if !backend.pump.WaitDone(attachDrainTimeout) {
+		backend.pump.Abort()
+	}
+
+	outcome := computeExitResult(err)
+
 	now := time.Now().UTC()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	session, ok := s.sessions[id]
-	if !ok {
-		pool.DecRef(poolKeys...)
-		return
-	}
-	if session.State == "closed" || session.State == "failed" {
-		pool.DecRef(poolKeys...)
-		return
-	}
-	var exitCode *int
-	var frameworkError string
-	state := "closed"
-	var exitErr *ssh.ExitError
+	var backendToClose *interactiveBackend
 	switch {
-	case err == nil, errors.Is(err, io.EOF), errors.Is(err, context.Canceled):
-	case errors.As(err, &exitErr):
-		code := exitErr.ExitStatus()
-		exitCode = &code
+	case !ok:
+		// The session record is gone; still publish the outcome so no attach
+		// observer waits forever.
+		backend.exitResult.Set(outcome)
+	case isTerminalState(session.State):
+		// Already finalized, for example by a client disconnect or pool teardown.
+		// The terminal state and its cause stand; commitOutcomeLocked is a no-op
+		// for an outcome already recorded, and guarantees publication otherwise.
+		s.commitOutcomeLocked(session, outcome)
 	default:
-		frameworkError = safeError(err, cfg)
+		state := "closed"
+		if outcome.FrameworkError != "" {
+			state = "failed"
+		}
+		backendToClose = s.closeSessionLocked(session, state, outcome, now)
 	}
-	session.ExitCode = exitCode
-	session.FrameworkError = frameworkError
-	s.closeSessionLocked(session, state, "", exitCode, now)
+	s.mu.Unlock()
+
+	if backendToClose != nil {
+		_ = backendToClose.Close()
+	}
 	pool.DecRef(poolKeys...)
+}
+
+// exitStatuser matches anything exposing a remote exit status, including wrapped
+// errors and test doubles, without pinning callers to *ssh.ExitError.
+type exitStatuser interface {
+	ExitStatus() int
+}
+
+// computeExitResult maps the error from ssh.Session.Wait into an explicit
+// outcome. A missing exit status, a dropped connection and a deliberate local
+// close are all kept distinct from a normal remote exit, and none of them is
+// reported as success.
+func computeExitResult(err error) ExitOutcome {
+	if err == nil || errors.Is(err, io.EOF) {
+		zero := 0
+		return ExitOutcome{Code: &zero}
+	}
+
+	var missing *ssh.ExitMissingError
+	if errors.As(err, &missing) {
+		return ExitOutcome{
+			FrameworkError:  "remote session ended without exit status",
+			DisconnectCause: causeExitStatusMissing,
+		}
+	}
+
+	// A remote exit-signal is reported by the ssh package as 128+signum together
+	// with the signal name, which is what distinguishes it from a plain non-zero
+	// exit status.
+	var exitErr *ssh.ExitError
+	if errors.As(err, &exitErr) {
+		code := exitErr.ExitStatus()
+		outcome := ExitOutcome{Code: &code}
+		if exitErr.Signal() != "" {
+			outcome.DisconnectCause = causeRemoteSignal
+		}
+		return outcome
+	}
+
+	var status exitStatuser
+	if errors.As(err, &status) {
+		code := status.ExitStatus()
+		if code < 0 {
+			return ExitOutcome{Code: &code, DisconnectCause: causeRemoteSignal}
+		}
+		return ExitOutcome{Code: &code}
+	}
+
+	if errors.Is(err, context.Canceled) {
+		return ExitOutcome{DisconnectCause: causeClientDisconnected}
+	}
+
+	return ExitOutcome{FrameworkError: err.Error(), DisconnectCause: causeNetworkError}
 }
 
 func (s *Service) updateCurrentDir(id string, dir string) {
@@ -1126,23 +1539,42 @@ func (s *Service) updateCurrentDir(id string, dir string) {
 	s.publishSessionLocked(session, Event{Type: "session.cwd", SessionID: id, State: session.State, Path: dir, Time: now})
 }
 
-func (s *Service) closeSessionLocked(session *resource, state string, cause string, exitCode *int, now time.Time) {
+// closeSessionLocked marks the session terminal and records its outcome exactly
+// once. The outcome is committed to the session resource and to the backend's
+// exit result together, so GET and the attach exit message always agree.
+//
+// The backend is returned for the caller to close after releasing s.mu: it is
+// never closed here, because tearing down an SSH session can block on the
+// network and must not hold the service lock.
+//
+// Calling it again for an already terminal session is a no-op; the terminal
+// state, exit outcome and ExitedAt of the first close are preserved.
+func (s *Service) closeSessionLocked(session *resource, state string, outcome ExitOutcome, now time.Time) *interactiveBackend {
+	if isTerminalState(session.State) {
+		return nil
+	}
+	backend := session.backend
+	s.commitOutcomeLocked(session, outcome)
 	if session.cancel != nil {
 		session.cancel()
 	}
-	if session.backend != nil {
-		_ = session.backend.Close()
-	}
 	session.State = state
 	session.Attached = false
+	// The attachment is dropped without being revoked: its exit waiter must still
+	// deliver the terminal outcome to whoever is watching, and its input worker
+	// ends when the pump does.
+	session.claim = nil
 	session.UpdatedAt = now
 	session.ExitedAt = &now
-	if exitCode != nil {
-		session.ExitCode = exitCode
-	}
-	if cause != "" {
-		session.DisconnectCause = cause
-	}
+	// Clear every pending marker, waiter and credential candidate so a late
+	// challenge, retry or background failure cannot resurrect the session or
+	// leave a secret waiting to be written.
+	session.hostKeyChallenge = nil
+	session.authChallenge = nil
+	session.HostKeyPending = false
+	session.AuthPending = false
+	session.authResponse = nil
+	session.pendingCredentials = nil
 	for ch := range session.cwdSubscribers {
 		select {
 		case ch <- CWDNotify{SessionID: session.ID, Closed: true, Time: now}:
@@ -1163,6 +1595,29 @@ func (s *Service) closeSessionLocked(session *resource, state string, cause stri
 		Error:     session.FrameworkError,
 		Time:      now,
 	})
+	return backend
+}
+
+// commitOutcomeLocked records the terminal outcome on the session record and
+// publishes it to exit observers. The first outcome wins, so a synthesized
+// result can never replace a real exit status.
+func (s *Service) commitOutcomeLocked(session *resource, outcome ExitOutcome) {
+	if session.outcomeCommitted {
+		return
+	}
+	session.outcomeCommitted = true
+	if outcome.Code != nil {
+		session.ExitCode = outcome.Code
+	}
+	if outcome.FrameworkError != "" {
+		session.FrameworkError = outcome.FrameworkError
+	}
+	if outcome.DisconnectCause != "" {
+		session.DisconnectCause = outcome.DisconnectCause
+	}
+	if session.backend != nil {
+		session.backend.exitResult.Set(outcome)
+	}
 }
 
 func (s *Service) publishSessionLocked(session *resource, event Event) {
@@ -1205,7 +1660,15 @@ func resolveServer(cfg config.RuntimeConfig, ref string) (config.ServerProfile, 
 }
 
 func runExec(exec Exec, req ExecRequest, server config.ServerProfile, cfg config.RuntimeConfig, pool *sshpool.Pool, dialOpts DialOptions) Exec {
-	client, poolKeys, _, err := pool.GetClient(server, cfg, nil, sshpool.DialOptions{
+	// The exec deadline bounds the whole operation, connection included, so a
+	// cancelled attempt cannot leave a dial or a handshake running behind it.
+	runCtx := context.Background()
+	if req.TimeoutMS > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeout(runCtx, time.Duration(req.TimeoutMS)*time.Millisecond)
+		defer cancel()
+	}
+	client, poolKeys, _, err := pool.GetClientContext(runCtx, server, cfg, nil, sshpool.DialOptions{
 		AgentSocket:   dialOpts.AgentSocket,
 		HostKeyPolicy: req.HostKeyPolicy,
 		Timeout:       dialOpts.Timeout,
@@ -1219,7 +1682,7 @@ func runExec(exec Exec, req ExecRequest, server config.ServerProfile, cfg config
 	}
 	pool.IncRef(poolKeys...)
 	defer pool.DecRef(poolKeys...)
-	session, err := client.NewSession()
+	session, err := openSSHSession(runCtx, client)
 	if err != nil {
 		exec.State = "failed"
 		exec.ExitCode = -1
@@ -1232,12 +1695,6 @@ func runExec(exec Exec, req ExecRequest, server config.ServerProfile, cfg config
 	stderr := &limitedWriter{limit: 512 * 1024}
 	session.Stdout = stdout
 	session.Stderr = stderr
-	runCtx := context.Background()
-	if req.TimeoutMS > 0 {
-		var cancel context.CancelFunc
-		runCtx, cancel = context.WithTimeout(runCtx, time.Duration(req.TimeoutMS)*time.Millisecond)
-		defer cancel()
-	}
 	done := make(chan error, 1)
 	go func() {
 		done <- session.Run(req.Command)
@@ -1291,19 +1748,37 @@ func (s *Service) recordTestExec(req ExecRequest, now time.Time) Exec {
 	return exec
 }
 
+// newSessionBackend builds the backend of a session created in test mode. It is a
+// variable so tests can supply a backend whose I/O they control.
+var newSessionBackend = newLocalInteractiveBackend
+
+// newLocalInteractiveBackend builds a backend that behaves like a session whose
+// remote immediately reaches EOF on stdin: it echoes nothing, and reports a clean
+// exit 0 once stdin is closed. It exists so HTTP/WS contract tests can exercise
+// attach without a real SSH server.
 func newLocalInteractiveBackend() *interactiveBackend {
 	stdinReader, stdinWriter := io.Pipe()
 	stdoutReader, stdoutWriter := io.Pipe()
-	stderrReader, stderrWriter := io.Pipe()
-	done := make(chan error, 1)
+
+	pump := newOutputPump()
+	pump.AddReader(streamStdout, stdoutReader)
+	exitResult := newExitResult()
+	pump.Start()
+
 	go func() {
 		_, _ = io.Copy(io.Discard, stdinReader)
 		_ = stdoutWriter.Close()
-		_ = stderrWriter.Close()
-		done <- nil
-		close(done)
+		<-pump.Done()
+
+		zero := 0
+		exitResult.Set(ExitOutcome{Code: &zero})
 	}()
-	return &interactiveBackend{stdin: stdinWriter, stdout: stdoutReader, stderr: stderrReader, done: done}
+
+	return &interactiveBackend{
+		stdin:      stdinWriter,
+		pump:       pump,
+		exitResult: exitResult,
+	}
 }
 
 type limitedWriter struct {
@@ -1399,34 +1874,154 @@ func validSSHEnvValue(value string) bool {
 	return true
 }
 
+// teardownGrace bounds how long a teardown step waits for one close to finish
+// before leaving it to complete in the background. It is a variable so tests can
+// shorten it.
+var teardownGrace = 2 * time.Second
+
+// ErrTeardownTimeout reports that a teardown step did not finish within its
+// grace. The step keeps running in the background, but the release it performs
+// is incomplete, and a caller that needs to know the difference between "done"
+// and "still going" must not read that as success.
+var ErrTeardownTimeout = errors.New("teardown step did not finish within its grace")
+
+// boundedClose runs one teardown step and waits at most grace for it.
+//
+// A close stuck in a network write also holds the SSH channel's write lock, so
+// waiting for it in-line pins the caller behind a remote that stopped reading.
+// Past the grace the step is left to finish on its own and teardown proceeds:
+// the backend is already marked closed and its output is aborted, so nothing
+// that follows can treat it as live, while a disconnect or a shutdown stays
+// responsive. The expiry is reported, not swallowed, so a shutdown can tell a
+// complete release from one that ran out of time.
+func boundedClose(grace time.Duration, release func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- release() }()
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("%w after %s", ErrTeardownTimeout, grace)
+	}
+}
+
 func (b *interactiveBackend) Close() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.stdin != nil {
-		_ = b.stdin.Close()
+	if b.closed {
+		b.mu.Unlock()
+		return nil
 	}
-	if b.session != nil {
-		return b.session.Close()
+	b.closed = true
+	stdin := b.stdin
+	b.stdin = nil
+	pump := b.pump
+	session := b.session
+	slot := b.inputSlot
+	b.mu.Unlock()
+
+	// Abort first so attach relays see end-of-stream, then close the stdin writer
+	// and the SSH session to release any reader still blocked in Read.
+	if pump != nil {
+		pump.Abort()
+	}
+	// The two closes run concurrently. Closing the stdin writer can block in a
+	// network write when the remote stopped reading, and the SSH session close is
+	// exactly what releases it: running them in sequence would let the blocked
+	// one hold the other back, so neither could finish.
+	var steps []func() error
+	if stdin != nil {
+		steps = append(steps, stdin.Close)
+	}
+	if session != nil {
+		steps = append(steps, session.Close)
+	}
+	return boundedClose(teardownGrace, func() error {
+		err := closeConcurrently(steps...)
+		// Successful release also waits for the backend's actual writer. A close
+		// that fails to unblock stdin cannot be mistaken for completed teardown.
+		if slot != nil {
+			slot <- struct{}{}
+			<-slot
+		}
+		return err
+	})
+}
+
+// closeConcurrently runs independent close steps together and joins their
+// results. The steps of one teardown release each other: closing the SSH session
+// is what unblocks a stdin write stuck in the network, so running them in
+// sequence would let the blocked step hold back the very close that frees it.
+// Nil steps are skipped, so a backend that owns only some of the handles still
+// closes what it has.
+func closeConcurrently(steps ...func() error) error {
+	var wg sync.WaitGroup
+	errs := make([]error, len(steps))
+	for i, step := range steps {
+		if step == nil {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = step()
+			if errors.Is(errs[i], io.EOF) || errors.Is(errs[i], net.ErrClosed) {
+				errs[i] = nil
+			}
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+// CloseStdin closes the remote stdin once. Repeated close_stdin controls are
+// no-ops rather than double closes.
+//
+// The handle is detached under the lock but closed outside it: a stdin close
+// that blocks on the network must not hold the backend lock, or a concurrent
+// Close could not release it.
+func (b *interactiveBackend) CloseStdin() error {
+	b.mu.Lock()
+	stdin := b.stdin
+	b.stdin = nil
+	b.mu.Unlock()
+	if stdin != nil {
+		return stdin.Close()
 	}
 	return nil
 }
 
-func (b *interactiveBackend) WindowChange(rows, cols int) error {
+// stdinWriter returns the session's current stdin handle, or nil once it has
+// been closed. Callers must not cache it: an attachment's worker reads it per
+// write so a close_stdin ends its input instead of writing to a dead handle.
+func (b *interactiveBackend) stdinWriter() io.WriteCloser {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.session == nil {
+	return b.stdin
+}
+
+// WindowChange and Signal hand the session pointer to the SSH library outside
+// the backend lock for the same reason: the lock must stay available to Close so
+// teardown can release an operation stuck in a network write.
+func (b *interactiveBackend) WindowChange(rows, cols int) error {
+	b.mu.Lock()
+	session := b.session
+	b.mu.Unlock()
+	if session == nil {
 		return nil
 	}
-	return b.session.WindowChange(rows, cols)
+	return session.WindowChange(rows, cols)
 }
 
 func (b *interactiveBackend) Signal(signal string) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.session == nil {
+	session := b.session
+	b.mu.Unlock()
+	if session == nil {
 		return nil
 	}
-	return b.session.Signal(ssh.Signal(signal))
+	return session.Signal(ssh.Signal(signal))
 }
 
 func safeError(err error, cfg any) string {
@@ -1534,6 +2129,10 @@ func cloneChallengePtr(ch *Challenge) *Challenge {
 func cloneEvent(event Event) Event {
 	out := event
 	out.Challenge = cloneChallengePtr(event.Challenge)
+	if event.Warning != nil {
+		warning := *event.Warning
+		out.Warning = &warning
+	}
 	return out
 }
 

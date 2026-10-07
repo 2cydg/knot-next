@@ -28,6 +28,14 @@ import (
 	"knot-core/pkg/sshpool"
 )
 
+// testRuntimeHolder publishes discovery information the way startup does, so
+// the API reports the same values the tests wrote to disk.
+func testRuntimeHolder(info coreruntime.Info) *coreruntime.Holder {
+	holder := coreruntime.NewHolder()
+	holder.Set(info)
+	return holder
+}
+
 func waitForSFTPTransfer(t *testing.T, server *Server, sessionID string, transferID string) sftp.Transfer {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -200,7 +208,7 @@ func TestServerHealthReportsDegradedConfig(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(layout.ConfigDir, "config.json"), []byte("{"), 0o600); err != nil {
 		t.Fatalf("write invalid config: %v", err)
 	}
-	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)
+	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, "test-instance-id", 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)
 	if err := coreruntime.WriteInfo(layout.RuntimePath, runtimeInfo); err != nil {
 		t.Fatalf("write runtime info: %v", err)
 	}
@@ -210,7 +218,7 @@ func TestServerHealthReportsDegradedConfig(t *testing.T) {
 	coreService.UseConfig(configService)
 	coreService.UseSecret(secret.NewService(configService, provider))
 	coreService.UseSSHPool(sshpool.NewPool())
-	server := NewServer(coreService, runtimeInfo, auth.NewVerifier("test-token"), auth.NewOriginChecker(nil))
+	server := NewServer(coreService, testRuntimeHolder(runtimeInfo), auth.NewVerifier("test-token"), auth.NewOriginChecker(nil))
 
 	req := authenticatedRequest(http.MethodGet, "/v1/health")
 	rec := httptest.NewRecorder()
@@ -743,17 +751,20 @@ func TestSessionAttachRejectsClosedSession(t *testing.T) {
 
 	ts := httptest.NewServer(server.Handler())
 	defer ts.Close()
-	conn, reader := openTestWebSocket(t, ts, "/v1/sessions/"+created.Data.ID+"/attach")
-	defer conn.Close()
-	opcode, got, err := readServerFrame(reader)
+	// Attaching a terminal session is rejected before the upgrade, so the client
+	// gets an actionable HTTP status instead of a frame on an upgraded socket.
+	_, _, status := tryOpenTestWebSocket(t, ts, "/v1/sessions/"+created.Data.ID+"/attach", 5*time.Second)
+	if !strings.Contains(status, "409") {
+		t.Fatalf("handshake status = %q, want 409 Conflict", status)
+	}
+
+	// The rejection must not leave the session attached.
+	current, err := server.core.Session().Get(created.Data.ID)
 	if err != nil {
-		t.Fatalf("read attach error: %v", err)
+		t.Fatalf("get session: %v", err)
 	}
-	if opcode != wsOpcodeText {
-		t.Fatalf("opcode = %d, want text", opcode)
-	}
-	if !bytes.Contains(got, []byte("ATTACH_FAILED")) {
-		t.Fatalf("payload = %s, want attach failed", got)
+	if current.Attached {
+		t.Fatalf("session left attached after a rejected attach: %+v", current)
 	}
 }
 
@@ -1503,14 +1514,19 @@ func newTestServerWithOrigins(t testing.TB, origins []string) *Server {
 	if err := layout.Ensure(); err != nil {
 		t.Fatalf("ensure layout: %v", err)
 	}
-	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)
+	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, "test-instance-id", 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)
 	if err := coreruntime.WriteInfo(layout.RuntimePath, runtimeInfo); err != nil {
 		t.Fatalf("write runtime info: %v", err)
 	}
-	return NewServer(core.New(core.DefaultVersion, startedAt), runtimeInfo, auth.NewVerifier("test-token"), auth.NewOriginChecker(origins))
+	return NewServer(core.New(core.DefaultVersion, startedAt), testRuntimeHolder(runtimeInfo), auth.NewVerifier("test-token"), auth.NewOriginChecker(origins))
 }
 
 func newStatefulTestServer(t *testing.T) *Server {
+	t.Helper()
+	return newStatefulTestServerWithOptions(t)
+}
+
+func newStatefulTestServerWithOptions(t *testing.T, opts ...Option) *Server {
 	t.Helper()
 	startedAt := time.Unix(1000, 0).UTC()
 	root := t.TempDir()
@@ -1534,11 +1550,11 @@ func newStatefulTestServer(t *testing.T) *Server {
 	sftpService.UseLocalTestBackend()
 	coreService.UseSFTP(sftpService)
 	coreService.UseSSHPool(sharedPool)
-	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)
+	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, "test-instance-id", 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)
 	if err := coreruntime.WriteInfo(layout.RuntimePath, runtimeInfo); err != nil {
 		t.Fatalf("write runtime info: %v", err)
 	}
-	return NewServer(coreService, runtimeInfo, auth.NewVerifier("test-token"), auth.NewOriginChecker(nil))
+	return NewServer(coreService, testRuntimeHolder(runtimeInfo), auth.NewVerifier("test-token"), auth.NewOriginChecker(nil), opts...)
 }
 
 func assertHealthCheck(t *testing.T, checks []core.HealthCheck, name string, status string) {
@@ -1572,14 +1588,25 @@ func strconvQuote(value string) string {
 	return string(raw)
 }
 
-func openTestWebSocket(t *testing.T, ts *httptest.Server, path string) (net.Conn, *bufio.Reader) {
+func openTestWebSocketWithDeadline(t *testing.T, ts *httptest.Server, path string, timeout time.Duration) (net.Conn, *bufio.Reader) {
 	t.Helper()
-	conn, err := net.DialTimeout("tcp", ts.Listener.Addr().String(), 2*time.Second)
+	conn, reader, status := tryOpenTestWebSocket(t, ts, path, timeout)
+	if !strings.Contains(status, "101") {
+		t.Fatalf("handshake status = %q", status)
+	}
+	return conn, reader
+}
+
+// tryOpenTestWebSocket performs a WebSocket handshake and returns the raw status
+// line, so tests can assert a request was rejected before the upgrade.
+func tryOpenTestWebSocket(t *testing.T, ts *httptest.Server, path string, timeout time.Duration) (net.Conn, *bufio.Reader, string) {
+	t.Helper()
+	conn, err := net.DialTimeout("tcp", ts.Listener.Addr().String(), timeout)
 	if err != nil {
 		t.Fatalf("dial websocket server: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		t.Fatalf("set websocket deadline: %v", err)
 	}
 	key := "dGhlIHNhbXBsZSBub25jZQ=="
@@ -1599,7 +1626,8 @@ func openTestWebSocket(t *testing.T, ts *httptest.Server, path string) (net.Conn
 		t.Fatalf("read status: %v", err)
 	}
 	if !strings.Contains(status, "101") {
-		t.Fatalf("handshake status = %q", status)
+		// Rejected before the upgrade: the error is an ordinary HTTP response.
+		return conn, reader, status
 	}
 	for {
 		line, err := reader.ReadString('\n')
@@ -1610,7 +1638,12 @@ func openTestWebSocket(t *testing.T, ts *httptest.Server, path string) (net.Conn
 			break
 		}
 	}
-	return conn, reader
+	return conn, reader, status
+}
+
+func openTestWebSocket(t *testing.T, ts *httptest.Server, path string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	return openTestWebSocketWithDeadline(t, ts, path, 5*time.Second)
 }
 
 func maskedClientFrame(opcode int, payload []byte) []byte {

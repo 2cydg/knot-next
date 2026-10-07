@@ -3,7 +3,6 @@ package sftp
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
@@ -78,25 +77,6 @@ func localBase(input string) string {
 		return trimmed[idx+1:]
 	}
 	return trimmed
-}
-
-func localCompletionDisplayPath(input string) string {
-	if runtime.GOOS != "windows" {
-		return input
-	}
-	return normalizeWindowsLocalDisplayPath(input)
-}
-
-func normalizeWindowsLocalDisplayPath(input string) string {
-	input = strings.ReplaceAll(input, `\`, "/")
-	if len(input) >= 2 && isASCIIAlpha(input[0]) && input[1] == ':' {
-		rest := input[2:]
-		if strings.HasPrefix(rest, "/") {
-			rest = "/" + strings.TrimLeft(rest, "/")
-		}
-		return input[:2] + rest
-	}
-	return input
 }
 
 func isASCIIAlpha(b byte) bool {

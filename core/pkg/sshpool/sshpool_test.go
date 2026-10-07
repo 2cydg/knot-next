@@ -1,6 +1,7 @@
 package sshpool
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
@@ -473,7 +474,7 @@ func TestDialErrorDoesNotPoisonSingleflightCache(t *testing.T) {
 	var reject atomic.Bool
 	dialMu.Lock()
 	orig := dialClient
-	dialClient = func(server config.ServerProfile, cfg config.RuntimeConfig, jump *ssh.Client, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, error) {
+	dialClient = func(ctx context.Context, server config.ServerProfile, cfg config.RuntimeConfig, jump *ssh.Client, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, error) {
 		if reject.Load() {
 			return nil, errors.New("dial failed")
 		}
@@ -538,7 +539,7 @@ func installTestDial(t *testing.T, srv *testSSHServer) {
 	t.Helper()
 	dialMu.Lock()
 	orig := dialClient
-	dialClient = func(server config.ServerProfile, cfg config.RuntimeConfig, jump *ssh.Client, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, error) {
+	dialClient = func(ctx context.Context, server config.ServerProfile, cfg config.RuntimeConfig, jump *ssh.Client, confirm func(HostKeyPrompt) bool, opts DialOptions) (*ssh.Client, error) {
 		if jump != nil {
 			return nil, errors.New("jump clients are not supported in this test")
 		}
