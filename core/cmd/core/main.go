@@ -129,12 +129,18 @@ func prepareServices(
 	// Discovery reports the token that actually exists, not a placeholder.
 	env.SetTokenPresent(token != "")
 
+	if err := config.RecoverBootstrap(layout); err != nil {
+		return nil, fmt.Errorf("recover crypto bootstrap: %w", err)
+	}
 	cryptoProvider, err := crypto.NewDefaultProvider(layout)
 	if err != nil {
 		return nil, fmt.Errorf("initialize crypto provider: %w", err)
 	}
 
 	configService := config.NewService(layout, cryptoProvider)
+	if err := configService.Initialize(); err != nil {
+		return nil, fmt.Errorf("open configuration: %w", err)
+	}
 	secretService := secret.NewService(configService, cryptoProvider)
 	sharedPool := sshpool.NewPool()
 	sessionService := session.NewService()

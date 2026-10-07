@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"knot-core/internal/api/response"
+	"knot-core/internal/keyutil"
 	"knot-core/pkg/config"
 )
 
@@ -54,7 +55,12 @@ func (s *Server) handleConfig(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if !requireMethod(w, r, stdhttp.MethodGet) {
 			return
 		}
-		response.JSON(w, stdhttp.StatusOK, configService.MigrationPlan())
+		if path := r.URL.Query().Get("source_path"); path != "" {
+			data, err := configService.PlanImport(config.MigrationApplyRequest{SourcePath: path, Mode: r.URL.Query().Get("mode")})
+			writeResult(w, response.RiskReadOnly, "config/migration/plan", data, err)
+		} else {
+			response.JSON(w, stdhttp.StatusOK, configService.MigrationPlan())
+		}
 	case len(parts) == 2 && parts[0] == "migration" && parts[1] == "apply":
 		if !requireMethod(w, r, stdhttp.MethodPost) {
 			return
@@ -63,7 +69,13 @@ func (s *Server) handleConfig(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		data, err := configService.ApplyMigration(body.Mode)
+		var data config.Summary
+		var err error
+		if body.SourcePath != "" {
+			data, err = configService.ApplyImport(body)
+		} else {
+			data, err = configService.ApplyMigration(body.Mode)
+		}
 		writeResult(w, response.RiskLocalMutation, "config/migration/apply", data, err)
 	case len(parts) >= 1 && parts[0] == "settings":
 		s.handleSettings(w, r, configService, parts[1:])
@@ -346,13 +358,14 @@ func (s *Server) handleSecrets(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		switch r.Method {
 		case stdhttp.MethodPut:
 			var body struct {
+				Passphrase string `json:"passphrase,omitempty"`
 				PrivateKey string `json:"private_key"`
 				SourcePath string `json:"source_path"`
 			}
 			if !decodeJSON(w, r, &body) {
 				return
 			}
-			data, err := secretService.SetKeyPrivate(id, body.PrivateKey, body.SourcePath)
+			data, err := secretService.SetKeyPrivateWithPassphrase(id, body.PrivateKey, body.SourcePath, body.Passphrase)
 			writeResult(w, response.RiskLocalMutation, "secrets/keys/"+id+"/private", data, err)
 		case stdhttp.MethodDelete:
 			data, err := secretService.ClearKeyPrivate(id)
@@ -528,10 +541,12 @@ func writeMappedError(w stdhttp.ResponseWriter, risk response.Risk, resource str
 		writeAPIError(w, stdhttp.StatusNotFound, risk, resource, "NOT_FOUND", "resource was not found")
 	case errors.Is(err, config.ErrConflict):
 		writeAPIError(w, stdhttp.StatusConflict, risk, resource, "CONFLICT", "resource conflicts with an existing configuration item")
+	case errors.Is(err, keyutil.ErrPassphraseRequired):
+		writeAPIError(w, stdhttp.StatusBadRequest, risk, resource, "PASSPHRASE_REQUIRED", "private key passphrase required")
 	case errors.Is(err, config.ErrValidation):
 		writeAPIError(w, stdhttp.StatusBadRequest, risk, resource, "VALIDATION_FAILED", err.Error())
 	default:
-		writeAPIError(w, stdhttp.StatusInternalServerError, risk, resource, "INTERNAL_ERROR", err.Error())
+		writeAPIError(w, stdhttp.StatusInternalServerError, risk, resource, "INTERNAL_ERROR", "configuration operation failed")
 	}
 }
 

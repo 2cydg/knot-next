@@ -205,7 +205,7 @@ func TestServerHealthReportsDegradedConfig(t *testing.T) {
 	if err := layout.Ensure(); err != nil {
 		t.Fatalf("ensure layout: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(layout.ConfigDir, "config.json"), []byte("{"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(layout.ConfigDir, "config.toml"), []byte("["), 0o600); err != nil {
 		t.Fatalf("write invalid config: %v", err)
 	}
 	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, "test-instance-id", 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)

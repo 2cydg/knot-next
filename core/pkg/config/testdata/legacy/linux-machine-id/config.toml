@@ -1,0 +1,80 @@
+[settings]
+  forward_agent = false
+  clear_screen_on_connect = false
+  broadcast_escape_enable = true
+  broadcast_escape_char = "!"
+  idle_timeout = "15m"
+  keepalive_interval = "10s"
+  log_level = "info"
+  recent_limit = 7
+  default_sftp_local_path = "~/fixture files"
+  default_sync_provider = "cloud"
+  sync_password = "ENC:vl9S9vmQcN/lT4dumUyCikFT4o4EDOgyj42lec6YXTpj/CEx/Z2hU7Dc+Bek2NSnYw=="
+
+[servers]
+  [servers.srv_jump]
+    id = "srv_jump"
+    alias = "jump"
+    host = "jump.example"
+    port = 2222
+    user = "fixture"
+    auth_method = "agent"
+  [servers.srv_legacy]
+    id = "srv_legacy"
+    alias = "prod"
+    host = "prod.example"
+    port = 2222
+    user = "fixture"
+    auth_method = "key"
+    password = "ENC:0KLzzBxQqPgcIEYku8EOjGJIwMyBxRbmKmqEygWmOiTrcFXWfEW3Xti7GIQhEqnt3Mh0"
+    key_id = "key_legacy"
+    proxy_id = "prx_legacy"
+    jump_host_ids = ["srv_jump"]
+    tags = ["测试", "fixture"]
+
+    [[servers.srv_legacy.forwards]]
+      type = "L"
+      local_port = 8080
+      remote_addr = "127.0.0.1:80"
+
+    [[servers.srv_legacy.forwards]]
+      type = "D"
+      local_port = 1080
+
+[proxies]
+  [proxies.prx_legacy]
+    id = "prx_legacy"
+    alias = "proxy"
+    type = "socks5"
+    host = "proxy.example"
+    port = 1080
+    username = "fixture"
+    password = "ENC:yWlThB/Pe3hJPXfhOas5njMRGGFpJInAQ4BYAyZ+uj4NWDBGCidCGP9nN0lUKtfYd3s="
+
+[keys]
+  [keys.key_legacy]
+    id = "key_legacy"
+    alias = "deploy"
+    type = "ed25519"
+    length = 256
+    private_key = "ENC:sjSUKrEliTNDqKdRersCaD0/5tByiXXpBgjYEmfIZHCNzelt9CAztMOXviIQ/m/hji8l6ZlVYlk7hR6BvPtOs0RjEg176mGebWPGvi3ZuNkH+riQOu+0McKJ2Ka9tf9Es+8Css4Kvh2LVBXX1yUtyGqQVjrx4eEgQvw+mQAllpbYpMizcholzpg8cWqi0KbPNfmNA1WYdW7oNGJQdeIkmOXx31IOn3fvEKOFAlCBR964G6nYZTZ5tM1r4Ie1lHdfEOXd2fCstHxWpGnMjbpGF1VKyFpYaQGp7gfp0RW3CLPAAHnsdN7bWs+7B4XPb4nUIRJcqBu5IxCsdWHdA02A6XNEuUyWXIMAG++QW6oHiD9zPdIyopVmzqGChjUYs9+HUtUuRE8wbnPv3cv8s0SlhhkCpF0XAItwcxnLymqn+XbRgE7o1aR+xX5pcUqg2tkcMUQ8WE6899z05gQI6o0mi8zgGKI/eum6AsBRFEx0F8kAImyqyltLO4tnwy0UDvZvBKLCf8UfpyAf7UDfgW8CHVmQsOnLXES7jA9BbBm3hScBSJOvxcazpozPdcfkIQqPP2uxr+02DR0="
+
+[sync_providers]
+  [sync_providers.sync_s3]
+    id = "sync_s3"
+    alias = "object"
+    type = "s3"
+    bucket = "fixture"
+    key = "config.toml"
+    region = "test"
+    access_key_id = "ENC:fz+8iXYI+qxyVe85Qt2imEPl6XiyiWtKOf9GDs3oGBpCvfX87tOCxs2H"
+    secret_access_key = "ENC:NCmAcHvkUr8KxlqQSfogVF2a+/1CBdsw6aTarYixY6IjqclNn5EKoNQh"
+    session_token = "ENC:lqL5KcV+VWMM2PM8IEG82gZrhQe3UXmuunXVISQ63ZSj7POVXo9kBAw="
+    path_style = true
+  [sync_providers.sync_web]
+    id = "sync_web"
+    alias = "cloud"
+    type = "webdav"
+    url = "https://dav.example.test"
+    username = "fixture"
+    password = "ENC:Z8nBkg9XXvfI5slsHoqhKLi0BKyHKEzRe/3x56HAHT06F7lYc9e1sn3kGb37Lt275Ih5"

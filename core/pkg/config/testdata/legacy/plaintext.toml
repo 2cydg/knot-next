@@ -1,0 +1,80 @@
+[settings]
+  forward_agent = false
+  clear_screen_on_connect = false
+  broadcast_escape_enable = true
+  broadcast_escape_char = "!"
+  idle_timeout = "15m"
+  keepalive_interval = "10s"
+  log_level = "debug"
+  recent_limit = 7
+  default_sftp_local_path = "~/fixture files"
+  default_sync_provider = "cloud"
+  sync_password = "fixture-sync-password"
+
+[servers]
+  [servers.srv_jump]
+    id = "srv_jump"
+    alias = "jump"
+    host = "jump.example"
+    port = 2222
+    user = "fixture"
+    auth_method = "agent"
+  [servers.srv_legacy]
+    id = "srv_legacy"
+    alias = "prod"
+    host = "prod.example"
+    port = 2222
+    user = "fixture"
+    auth_method = "key"
+    password = "fixture-server-password"
+    key_id = "key_legacy"
+    proxy_id = "prx_legacy"
+    jump_host_ids = ["srv_jump"]
+    tags = ["测试", "fixture"]
+
+    [[servers.srv_legacy.forwards]]
+      type = "L"
+      local_port = 8080
+      remote_addr = "127.0.0.1:80"
+
+    [[servers.srv_legacy.forwards]]
+      type = "D"
+      local_port = 1080
+
+[proxies]
+  [proxies.prx_legacy]
+    id = "prx_legacy"
+    alias = "proxy"
+    type = "socks5"
+    host = "proxy.example"
+    port = 1080
+    username = "fixture"
+    password = "fixture-proxy-password"
+
+[keys]
+  [keys.key_legacy]
+    id = "key_legacy"
+    alias = "deploy"
+    type = "ed25519"
+    length = 256
+    private_key = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtz\nc2gtZWQyNTUxOQAAACDIxOw3b3fYG+0H5LaI40mosSztJBSYNidkiJ4mHOz0LAAA\nAJiYUzRCmFM0QgAAAAtzc2gtZWQyNTUxOQAAACDIxOw3b3fYG+0H5LaI40mosSzt\nJBSYNidkiJ4mHOz0LAAAAEA+keHjLx8bDjRanJ2jAxq8sBH9DwibGKqAsmDxsyet\nzsjE7Ddvd9gb7QfktojjSaixLO0kFJg2J2SIniYc7PQsAAAAEmFydGlmaWNpYWwg\nZml4dHVyZQECAw==\n-----END OPENSSH PRIVATE KEY-----\n"
+
+[sync_providers]
+  [sync_providers.sync_s3]
+    id = "sync_s3"
+    alias = "object"
+    type = "s3"
+    bucket = "fixture"
+    key = "config.toml"
+    region = "test"
+    access_key_id = "fixture-access"
+    secret_access_key = "fixture-secret"
+    session_token = "fixture-token"
+    path_style = true
+  [sync_providers.sync_web]
+    id = "sync_web"
+    alias = "cloud"
+    type = "webdav"
+    url = "https://dav.example.test"
+    username = "fixture"
+    password = "fixture-webdav-password"

@@ -45,6 +45,7 @@
 说明：
 
 - 返回的是“是否已设置”，不是明文
+- 密码、S3 凭据字段写入空字符串表示清除，对应 presence 为 false；S3 的 access/secret 两字段仍须成对设置或清除。
 - `keys[id] == true` 表示存在 `private_key` 或 `source_path`
 
 ### Crypto Capability
@@ -53,7 +54,7 @@
 
 ```json
 {
-  "provider": "local-aes-gcm",
+  "provider": "linux-secret-service",
   "available": true,
   "limitations": [
     "local key file protects secrets; platform credential store integration is not active"
@@ -129,7 +130,7 @@
 ```json
 {
   "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----...",
-  "source_path": "/home/user/.ssh/id_ed25519"
+  "passphrase": "optional, validation only"
 }
 ```
 
@@ -137,8 +138,13 @@
 
 说明：
 
-- `private_key` 和 `source_path` 都由这个接口管理
-- 当只想更新 `source_path` 时，也可以传空 `private_key`
+- 选择 `private_key` 或 `source_path`，不能同时传非空值。SourcePath 由 core 在本机读取。
+- 私钥实际解析为 Ed25519 / RSA / ECDSA 并计算类型、位数、指纹；损坏 PEM 或公钥不能当作私钥保存。
+- 内联有口令私钥必须传正确 passphrase 以验证整个私钥。缺失返回 `400 PASSPHRASE_REQUIRED`，错误返回 `400 VALIDATION_FAILED`；passphrase 不落盘。原始有口令 key 仍加密保存，连接时需要本次尝试的 passphrase。
+- SourcePath 可无口令登记有口令 OpenSSH 或传统加密 PEM key。OpenSSH 从 public envelope 派生元数据；PEM 无 public envelope，未解锁时 type/length/fingerprint 留空，传正确的验证口令可补齐。未解锁的 PEM 仅验证格式和加密头，私钥内容在提供口令时验证。路径丢失、不可读、内容变化不能复用旧 signer/cache 假成功。
+- 无口令私钥忽略多余的 passphrase；有口令私钥仍严格验证口令。
+- `encrypted` 表示 SSH key 自身需要口令，所有写入的内联 key 在 TOML 中还使用兼容旧版的 `ENC:`。
+- 删除清空 key 材料及派生元数据。
 
 #### DELETE `/v1/secrets/keys/{id}/private`
 
@@ -210,8 +216,8 @@
 
 ## 实现约束
 
-- 所有 secret 写入都依赖当前 crypto provider 可用
-- provider 不可用时，底层会返回 `500 INTERNAL_ERROR`
+- 非空 secret 写入依赖当前 crypto provider 可用；空值不加密。保存仍校验配置中其他已有密文可解密。
+- 所需 provider 不可用时，底层会返回 `500 INTERNAL_ERROR`
 - API 不提供任何读取 secret 明文的接口
 
 ## 客户端建议

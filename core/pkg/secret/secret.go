@@ -69,3 +69,7 @@ func (s *Service) SetSyncProviderS3Credentials(id string, accessKeyID string, se
 func (s *Service) ClearSyncProviderS3Credentials(id string) (config.SyncProviderView, error) {
 	return s.config.ClearSyncProviderS3Credentials(id)
 }
+
+func (s *Service) SetKeyPrivateWithPassphrase(id, privateKey, sourcePath, passphrase string) (config.KeyMetadataView, error) {
+	return s.config.SetKeyPrivateWithPassphrase(id, privateKey, sourcePath, passphrase)
+}

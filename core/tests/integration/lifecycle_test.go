@@ -106,6 +106,11 @@ func startCore(t *testing.T, extraArgs ...string) *coreInstance {
 		"XDG_CONFIG_HOME="+configDir,
 		"XDG_STATE_HOME="+stateDir,
 	)
+	// Lifecycle tests must not create or depend on the user's Secret Service
+	// item. A private nonexistent bus forces the legacy machine fallback.
+	if runtime.GOOS == "linux" {
+		cmd.Env = append(cmd.Env, "DBUS_SESSION_BUS_ADDRESS=unix:path="+filepath.Join(root, "no-session-bus"))
+	}
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 
@@ -115,10 +120,10 @@ func startCore(t *testing.T, extraArgs ...string) *coreInstance {
 
 	inst := &coreInstance{
 		cmd:         cmd,
-		configDir:   filepath.Join(configDir, "knot-core"),
-		stateDir:    filepath.Join(stateDir, "knot-core"),
-		runtimePath: filepath.Join(stateDir, "knot-core", "runtime", "core.json"),
-		tokenPath:   filepath.Join(configDir, "knot-core", "token"),
+		configDir:   filepath.Join(configDir, "knot"),
+		stateDir:    filepath.Join(stateDir, "knot"),
+		runtimePath: filepath.Join(stateDir, "knot", "runtime", "core.json"),
+		tokenPath:   filepath.Join(stateDir, "knot", "runtime", "token"),
 	}
 	t.Cleanup(func() { inst.kill(t) })
 

@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "provider": "linux-secret-service",
+  "probe_ciphertext": "O7OBTMjwlBIwgo+mlh44Rg6TQXZVss6kZmeUlWF1ZB30GoBb/gp2aJnXC2Fy379a4B2TcnQNAqTVuTLm",
+  "probe_hash": "0223eb06233f65b5e2db3c13e90d7fb553480c445f2a5b93fece42709354d66a",
+  "created_at": "2026-10-07T00:00:00Z",
+  "updated_at": "2026-10-07T00:00:00Z"
+}

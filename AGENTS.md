@@ -173,6 +173,12 @@ B06 resource retention and cleanup are implemented: active capacity is separate 
 terminal history, subscribers are bounded, and shutdown waits for owned workers.
 See `core/docs/baseline-acceptance.md` for validation and platform boundaries.
 
+Legacy TOML/crypto reuse, transient private-key passphrases, and explicit TOML
+import are implemented (B07/B08). Normal legacy upgrades use config.toml directly;
+JSON import is unsupported and existing JSON is preserved. Native macOS/Windows
+credential-store interoperability remains unexecuted. See the migration and
+baseline acceptance documents for exact behavior and validation.
+
 ## Known Issues
 
 The following issues are documented for future phases:

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"knot-core/internal/keyutil"
 	"knot-core/pkg/config"
 	"knot-core/pkg/sshpool"
 
@@ -159,6 +160,14 @@ func (s *Service) ExecContext(ctx context.Context, req ExecRequest) (Exec, error
 		if err != nil {
 			return Exec{}, err
 		}
+		if req.Passphrase != "" {
+			key, ok := cfg.Keys[server.KeyID]
+			if !ok {
+				return Exec{}, fmt.Errorf("%w: passphrase requires a configured key", ErrValidation)
+			}
+			key.Passphrase = req.Passphrase
+			cfg.Keys[server.KeyID] = key
+		}
 		result, settled = runExec(runCtx, result, req, server, cfg, pool, dialOpts)
 	}
 	s.mu.Lock()
@@ -185,6 +194,8 @@ func failedExec(result Exec, err error, cfg config.RuntimeConfig) Exec {
 		result.FrameworkCode = "cleanup_timeout"
 	case errors.Is(err, sshpool.ErrHostKeyReject):
 		result.FrameworkCode = "host_key_verification_failed"
+	case errors.Is(err, keyutil.ErrPassphraseRequired):
+		result.FrameworkCode = "passphrase_required"
 	case sshpool.IsAuthError(err):
 		result.FrameworkCode = "authentication_failed"
 	default:

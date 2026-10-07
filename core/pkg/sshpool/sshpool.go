@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"knot-core/internal/keyutil"
 	"knot-core/internal/resourcepolicy"
 	"knot-core/pkg/config"
 
@@ -960,6 +961,7 @@ func identityFields(h io.Writer, server config.ServerProfile, cfg config.Runtime
 	field("key", server.KeyID)
 	if key, ok := cfg.Keys[server.KeyID]; ok {
 		field("key-private", key.PrivateKey)
+		field("key-passphrase", key.Passphrase)
 		field("key-source", key.SourcePath)
 		field("key-type", key.Type)
 		// The path alone is not the key: replacing the file at that path changes
@@ -1096,9 +1098,9 @@ func authMethods(server config.ServerProfile, cfg config.RuntimeConfig, opts Dia
 				Err:            fmt.Errorf("%w: private key is not configured", ErrAuthFailed),
 			}
 		}
-		signer, err := ssh.ParsePrivateKey([]byte(privateKey))
+		signer, err := keyutil.Signer([]byte(privateKey), key.Passphrase)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, &AuthError{FailedMethod: config.AuthMethodKey, AllowedMethods: []string{config.AuthMethodKey, config.AuthMethodPassword, config.AuthMethodAgent}, Err: fmt.Errorf("%w: %w", ErrAuthFailed, err)}
 		}
 		return []ssh.AuthMethod{ssh.PublicKeys(signer)}, nil, nil
 	case config.AuthMethodAgent, "":

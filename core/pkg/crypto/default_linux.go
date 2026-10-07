@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -25,62 +26,158 @@ const (
 	ssCollInterface = "org.freedesktop.Secret.Collection"
 	ssPromptIface   = "org.freedesktop.Secret.Prompt"
 	ssLoginCollPath = "/org/freedesktop/secrets/collection/login"
+
+	ssInitialTimeout = 3 * time.Second
+	ssPromptTimeout  = 2 * time.Minute
 )
 
 var ssItemAttributes = map[string]string{
-	"service": "knot-core",
-	"account": "knot-core-master-key",
+	"service": "knot",
+	"account": "knot-master-key",
 }
 
-func providerForState(layout paths.Layout, providerID string) (Provider, error) {
-	switch providerID {
-	case ProviderLinuxSecret:
-		key, err := getSecretServiceKey(3 * time.Second)
+var machineIDFunc = getMachineID
+var uidFunc = os.Getuid
+
+var getSecretServiceKeyFunc = getSecretServiceKey
+var getOrCreateSecretServiceKeyFunc = getOrCreateSecretServiceKey
+
+func openPlatformProvider(layout paths.Layout, initialize bool) (Provider, error) {
+	state, err := LoadState(layout)
+	if err != nil {
+		return nil, err
+	}
+	allowSalt := allowSaltInitialization(layout, initialize && state == nil)
+	factory, err := newLinuxProviderFactory(layout, allowSalt)
+	if err != nil {
+		return nil, err
+	}
+	if state != nil {
+		provider, err := factory.providerForState(state.Provider)
 		if err != nil {
-			return nil, fmt.Errorf("crypto provider is %s but Secret Service is unavailable: %w", ProviderLinuxSecret, err)
+			return nil, err
 		}
-		return NewKeyProvider(ProviderLinuxSecret, key, nil), nil
-	case ProviderLinuxMachine:
-		return newLinuxMachineProvider(layout, nil)
-	case ProviderLocal:
-		return NewLocalProvider(localKeyPath(layout))
+		if err := ValidateState(state, provider); err != nil {
+			return nil, err
+		}
+		return provider, nil
+	}
+	return factory.bootstrapProvider(layout, initialize)
+}
+
+type linuxProviderFactory struct {
+	machineIDKey []byte
+}
+
+func newLinuxProviderFactory(layout paths.Layout, initialize bool) (*linuxProviderFactory, error) {
+	machineID, err := machineIDFunc()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get machine id: %w", err)
+	}
+	slog.Debug("Machine ID retrieved")
+
+	salt, err := readSalt(layout, initialize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get salt: %w", err)
+	}
+
+	fallbackKey := DeriveKey(linuxFallbackKeyMaterial(machineID), salt)
+	return &linuxProviderFactory{machineIDKey: fallbackKey}, nil
+}
+
+func (f *linuxProviderFactory) providerForState(providerID string) (Provider, error) {
+	switch providerID {
+	case ProviderLinuxSecretService:
+		key, err := getSecretServiceKeyFunc(ssInitialTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("Knot encryption backend is %s, but Secret Service is unavailable or locked. Unlock your keyring and retry, or remove the .crypto-state file to let Knot choose a backend again: %w", ProviderLinuxSecretService, err)
+		}
+		return newKeyProvider(ProviderLinuxSecretService, key), nil
+	case ProviderLinuxMachineID:
+		return newKeyProvider(ProviderLinuxMachineID, f.machineIDKey), nil
 	default:
-		return nil, fmt.Errorf("unknown crypto provider %q", providerID)
+		return nil, fmt.Errorf("unknown encryption provider %q", providerID)
 	}
 }
 
-func selectDefaultProvider(layout paths.Layout) (Provider, error) {
-	key, err := getOrCreateSecretServiceKey(3 * time.Second)
-	if err == nil {
-		return NewKeyProvider(ProviderLinuxSecret, key, nil), nil
+func (f *linuxProviderFactory) bootstrapProvider(layout paths.Layout, initialize bool) (Provider, error) {
+	var candidates []Provider
+	var selected Provider
+	var reason string
+	lookup := getSecretServiceKeyFunc
+	if initialize {
+		lookup = getOrCreateSecretServiceKeyFunc
 	}
-	return newLinuxMachineProvider(layout, []string{"Secret Service unavailable; using local machine fallback"})
+	ssKey, err := lookup(ssInitialTimeout)
+	if err != nil {
+		slog.Debug("Secret Service access failed, will use Machine ID fallback", "error", err)
+		reason = err.Error()
+	} else {
+		selected = newKeyProvider(ProviderLinuxSecretService, ssKey)
+		candidates = append(candidates, selected)
+		slog.Debug("Secret Service key retrieved successfully")
+	}
+
+	machineProvider := newKeyProvider(ProviderLinuxMachineID, f.machineIDKey)
+	if selected == nil {
+		selected = machineProvider
+	}
+	candidates = append(candidates, machineProvider)
+
+	p := NewBootstrapProviderWithReason(selected, candidates, func() (Provider, error) { return openPlatformProvider(layout, false) }, reason).(*BootstrapProvider)
+	p.layout = layout
+	return p, nil
 }
 
-func newLinuxMachineProvider(layout paths.Layout, limitations []string) (Provider, error) {
-	machineID, err := getMachineID()
-	if err != nil {
-		return nil, err
+type keyProvider struct {
+	name string
+	key  []byte
+}
+
+func newKeyProvider(name string, key []byte) Provider {
+	return &keyProvider{name: name, key: key}
+}
+
+func (p *keyProvider) Available() bool { return len(p.key) == 32 }
+func (p *keyProvider) Limitations() []string {
+	if p.name == ProviderLinuxMachineID {
+		return []string{"machine and OS user bound fallback"}
 	}
-	salt, err := GetSalt(layout)
-	if err != nil {
-		return nil, err
-	}
-	material := machineID + "\x00" + strconv.Itoa(os.Getuid())
-	return NewKeyProvider(ProviderLinuxMachine, DeriveKey(material, salt), limitations), nil
+	return nil
+}
+
+func (p *keyProvider) Name() string {
+	return p.name
+}
+
+func (p *keyProvider) Encrypt(plaintext []byte) ([]byte, error) {
+	return EncryptWithKey(plaintext, p.key)
+}
+
+func (p *keyProvider) Decrypt(ciphertext []byte) ([]byte, error) {
+	return DecryptWithKey(ciphertext, p.key)
+}
+
+func linuxFallbackKeyMaterial(machineID string) string {
+	return machineID + "\x00" + strconv.Itoa(uidFunc())
 }
 
 func getDBusConn() (*dbus.Conn, error) {
 	addr := os.Getenv("DBUS_SESSION_BUS_ADDRESS")
 	if addr == "" {
-		fallback := fmt.Sprintf("unix:path=/run/user/%d/bus", os.Getuid())
-		if _, err := os.Stat(strings.TrimPrefix(fallback, "unix:path=")); err == nil {
-			addr = fallback
+		// Try standard path fallback
+		stdPath := fmt.Sprintf("unix:path=/run/user/%d/bus", os.Getuid())
+		socketPath := strings.TrimPrefix(stdPath, "unix:path=")
+		if _, err := os.Stat(socketPath); err == nil {
+			addr = stdPath
+			slog.Debug("Using fallback DBUS_SESSION_BUS_ADDRESS", "path", stdPath)
 		}
 	}
+
 	if addr == "" {
-		return nil, fmt.Errorf("no D-Bus session address found")
+		return nil, fmt.Errorf("no D-Bus session address found (DBUS_SESSION_BUS_ADDRESS is empty)")
 	}
+
 	return dbus.Connect(addr)
 }
 
@@ -103,218 +200,280 @@ func secretServiceKey(timeout time.Duration, allowCreate bool) ([]byte, error) {
 	defer cancel()
 
 	obj := conn.Object(ssServiceName, ssObjectPath)
+
+	// 1. Open Session (Plain)
 	var sessionPath dbus.ObjectPath
 	var outVariant dbus.Variant
-	if err := obj.CallWithContext(ctx, ssInterface+".OpenSession", 0, "plain", dbus.MakeVariant("")).Store(&outVariant, &sessionPath); err != nil {
+	err = obj.CallWithContext(ctx, ssInterface+".OpenSession", 0, "plain", dbus.MakeVariant("")).Store(&outVariant, &sessionPath)
+	if err != nil {
 		return nil, fmt.Errorf("OpenSession failed: %w", err)
 	}
 
-	var unlocked []dbus.ObjectPath
-	var locked []dbus.ObjectPath
-	if err := obj.CallWithContext(ctx, ssInterface+".SearchItems", 0, ssItemAttributes).Store(&unlocked, &locked); err != nil {
+	// 2. Search Items
+	var unlockedPaths []dbus.ObjectPath
+	var lockedPaths []dbus.ObjectPath
+	err = obj.CallWithContext(ctx, ssInterface+".SearchItems", 0, ssItemAttributes).Store(&unlockedPaths, &lockedPaths)
+	if err != nil {
 		return nil, fmt.Errorf("SearchItems failed: %w", err)
 	}
+
 	itemPath := dbus.ObjectPath("")
-	if len(unlocked) > 0 {
-		itemPath = unlocked[0]
-	} else if len(locked) > 0 {
-		paths, err := unlockSecretServiceItems(ctx, conn, obj, locked)
+	if len(unlockedPaths) > 0 {
+		itemPath = unlockedPaths[0]
+	} else if len(lockedPaths) > 0 {
+		if !allowCreate {
+			return nil, fmt.Errorf("existing Knot Secret Service item is locked")
+		}
+		unlocked, err := unlockSecretServiceItems(ctx, conn, obj, lockedPaths)
 		if err != nil {
 			return nil, fmt.Errorf("Unlock failed: %w", err)
 		}
-		if len(paths) > 0 {
-			itemPath = paths[0]
+		if len(unlocked) > 0 {
+			itemPath = unlocked[0]
+		} else {
+			return nil, fmt.Errorf("Unlock completed without unlocking matching item")
 		}
 	}
-	if validSecretServicePath(itemPath) {
-		key, err := readSecretServiceItem(ctx, conn, itemPath, sessionPath)
-		if err == nil && len(key) == 32 {
-			return key, nil
+
+	if itemPath != "" {
+		// 3. Get Secret
+		type Secret struct {
+			Session     dbus.ObjectPath
+			Parameters  []byte
+			Value       []byte
+			ContentType string
 		}
+		var secret Secret
+		err = conn.Object(ssServiceName, itemPath).CallWithContext(ctx, "org.freedesktop.Secret.Item.GetSecret", 0, sessionPath).Store(&secret)
+		if err != nil {
+			return nil, fmt.Errorf("existing Knot Secret Service item cannot be read: %w", err)
+		}
+		key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(secret.Value)))
+		if err != nil || len(key) != 32 {
+			return nil, fmt.Errorf("existing Knot Secret Service item is invalid")
+		}
+		return key, nil
 	}
+
 	if !allowCreate {
 		return nil, fmt.Errorf("Secret Service item not found")
 	}
-	return createSecretServiceKey(ctx, conn, obj, sessionPath)
-}
 
-func readSecretServiceItem(ctx context.Context, conn *dbus.Conn, itemPath dbus.ObjectPath, sessionPath dbus.ObjectPath) ([]byte, error) {
-	type secret struct {
-		Session     dbus.ObjectPath
-		Parameters  []byte
-		Value       []byte
-		ContentType string
-	}
-	var out secret
-	if err := conn.Object(ssServiceName, itemPath).CallWithContext(ctx, "org.freedesktop.Secret.Item.GetSecret", 0, sessionPath).Store(&out); err != nil {
-		return nil, err
-	}
-	return base64.StdEncoding.DecodeString(strings.TrimSpace(string(out.Value)))
-}
-
-func createSecretServiceKey(ctx context.Context, conn *dbus.Conn, obj dbus.BusObject, sessionPath dbus.ObjectPath) ([]byte, error) {
+	// 4. Create new key if not found
+	slog.Debug("No key found in Secret Service, creating new one")
 	key := make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, key); err != nil {
 		return nil, err
 	}
-	type secretInput struct {
+	keyStr := base64.StdEncoding.EncodeToString(key)
+
+	type SecretInput struct {
 		Session     dbus.ObjectPath
 		Parameters  []byte
 		Value       []byte
 		ContentType string
 	}
-	properties := map[string]dbus.Variant{
-		"org.freedesktop.Secret.Item.Label":      dbus.MakeVariant("Knot Core Master Key"),
-		"org.freedesktop.Secret.Item.Attributes": dbus.MakeVariant(ssItemAttributes),
-	}
-	input := secretInput{
+
+	secretInput := SecretInput{
 		Session:     sessionPath,
 		Parameters:  []byte{},
-		Value:       []byte(base64.StdEncoding.EncodeToString(key)),
+		Value:       []byte(keyStr),
 		ContentType: "text/plain",
 	}
-	collections, err := secretServiceCollections(ctx, obj)
-	if err != nil {
-		return nil, err
+
+	properties := map[string]dbus.Variant{
+		"org.freedesktop.Secret.Item.Label":      dbus.MakeVariant("Knot Master Key"),
+		"org.freedesktop.Secret.Item.Attributes": dbus.MakeVariant(ssItemAttributes),
 	}
-	for _, collection := range collections {
-		if _, err := createSecretServiceItem(ctx, conn, collection, properties, input); err == nil {
+
+	collections, collectionsErr := getSecretServiceCollections(ctx, obj)
+	if collectionsErr != nil {
+		slog.Debug("Failed to enumerate Secret Service collections", "error", collectionsErr)
+	}
+
+	var createErrs []string
+	for _, collectionPath := range collections {
+		_, err = createSecretServiceItem(ctx, conn, collectionPath, properties, secretInput)
+		if err == nil {
 			return key, nil
 		}
+		createErrs = append(createErrs, fmt.Sprintf("%s: %v", collectionPath, err))
 	}
-	return nil, fmt.Errorf("CreateItem failed: no usable Secret Service collection")
+
+	if len(createErrs) > 0 {
+		return nil, fmt.Errorf("CreateItem failed: %s", strings.Join(createErrs, "; "))
+	}
+	if collectionsErr != nil {
+		return nil, fmt.Errorf("CreateItem failed: no Secret Service collection found: %w", collectionsErr)
+	}
+	return nil, fmt.Errorf("CreateItem failed: no Secret Service collection found")
 }
 
-func unlockSecretServiceItems(ctx context.Context, conn *dbus.Conn, obj dbus.BusObject, locked []dbus.ObjectPath) ([]dbus.ObjectPath, error) {
+func unlockSecretServiceItems(ctx context.Context, conn *dbus.Conn, obj dbus.BusObject, lockedPaths []dbus.ObjectPath) ([]dbus.ObjectPath, error) {
 	var unlocked []dbus.ObjectPath
 	var prompt dbus.ObjectPath
-	if err := obj.CallWithContext(ctx, ssInterface+".Unlock", 0, locked).Store(&unlocked, &prompt); err != nil {
+	if err := obj.CallWithContext(ctx, ssInterface+".Unlock", 0, lockedPaths).Store(&unlocked, &prompt); err != nil {
 		return nil, err
 	}
 	if len(unlocked) > 0 || !validSecretServicePath(prompt) {
 		return unlocked, nil
 	}
+
 	result, err := completeSecretServicePrompt(ctx, conn, prompt)
 	if err != nil {
 		return nil, err
 	}
-	paths, ok := result.Value().([]dbus.ObjectPath)
-	if !ok {
-		return nil, fmt.Errorf("prompt result has unexpected type %T", result.Value())
-	}
-	return paths, nil
+	return secretServiceObjectPathsFromVariant(result)
 }
 
-func createSecretServiceItem(ctx context.Context, conn *dbus.Conn, collection dbus.ObjectPath, properties map[string]dbus.Variant, input any) (dbus.ObjectPath, error) {
-	var item dbus.ObjectPath
+func createSecretServiceItem(ctx context.Context, conn *dbus.Conn, collectionPath dbus.ObjectPath, properties map[string]dbus.Variant, secretInput any) (dbus.ObjectPath, error) {
+	var newItem dbus.ObjectPath
 	var prompt dbus.ObjectPath
-	if err := conn.Object(ssServiceName, collection).CallWithContext(ctx, ssCollInterface+".CreateItem", 0, properties, input, true).Store(&item, &prompt); err != nil {
+	if err := conn.Object(ssServiceName, collectionPath).CallWithContext(ctx, ssCollInterface+".CreateItem", 0, properties, secretInput, true).Store(&newItem, &prompt); err != nil {
 		return "", err
 	}
-	if validSecretServicePath(item) {
-		return item, nil
+	if validSecretServicePath(newItem) {
+		return newItem, nil
 	}
 	if !validSecretServicePath(prompt) {
 		return "", fmt.Errorf("CreateItem returned no item and no prompt")
 	}
+
 	result, err := completeSecretServicePrompt(ctx, conn, prompt)
 	if err != nil {
 		return "", err
 	}
-	item, ok := result.Value().(dbus.ObjectPath)
-	if !ok {
-		return "", fmt.Errorf("prompt result has unexpected type %T", result.Value())
+	itemPath, err := secretServiceObjectPathFromVariant(result)
+	if err != nil {
+		return "", err
 	}
-	return item, nil
+	if !validSecretServicePath(itemPath) {
+		return "", fmt.Errorf("CreateItem prompt returned no item")
+	}
+	return itemPath, nil
 }
 
-func completeSecretServicePrompt(ctx context.Context, conn *dbus.Conn, prompt dbus.ObjectPath) (dbus.Variant, error) {
+func completeSecretServicePrompt(ctx context.Context, conn *dbus.Conn, promptPath dbus.ObjectPath) (dbus.Variant, error) {
 	sigCh := make(chan *dbus.Signal, 4)
 	conn.Signal(sigCh)
 	defer conn.RemoveSignal(sigCh)
 
-	match := []dbus.MatchOption{
-		dbus.WithMatchObjectPath(prompt),
+	matchOptions := []dbus.MatchOption{
+		dbus.WithMatchObjectPath(promptPath),
 		dbus.WithMatchInterface(ssPromptIface),
 		dbus.WithMatchMember("Completed"),
 	}
-	if err := conn.AddMatchSignalContext(ctx, match...); err != nil {
+	if err := conn.AddMatchSignalContext(ctx, matchOptions...); err != nil {
 		return dbus.Variant{}, err
 	}
 	defer func() {
-		_ = conn.RemoveMatchSignalContext(context.Background(), match...)
+		_ = conn.RemoveMatchSignalContext(context.Background(), matchOptions...)
 	}()
-	if err := conn.Object(ssServiceName, prompt).CallWithContext(ctx, ssPromptIface+".Prompt", 0, "").Store(); err != nil {
+
+	if err := conn.Object(ssServiceName, promptPath).CallWithContext(ctx, ssPromptIface+".Prompt", 0, "").Store(); err != nil {
 		return dbus.Variant{}, err
 	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return dbus.Variant{}, ctx.Err()
 		case sig := <-sigCh:
-			if sig == nil || sig.Path != prompt || sig.Name != ssPromptIface+".Completed" || len(sig.Body) != 2 {
+			if sig == nil || sig.Path != promptPath || sig.Name != ssPromptIface+".Completed" {
 				continue
+			}
+			if len(sig.Body) != 2 {
+				return dbus.Variant{}, fmt.Errorf("Prompt.Completed returned %d values, want 2", len(sig.Body))
 			}
 			dismissed, ok := sig.Body[0].(bool)
 			if !ok {
-				return dbus.Variant{}, fmt.Errorf("prompt dismissed field has unexpected type %T", sig.Body[0])
+				return dbus.Variant{}, fmt.Errorf("Prompt.Completed dismissed value has unexpected type %T", sig.Body[0])
 			}
 			if dismissed {
 				return dbus.Variant{}, fmt.Errorf("prompt dismissed")
 			}
 			result, ok := sig.Body[1].(dbus.Variant)
 			if !ok {
-				return dbus.Variant{}, fmt.Errorf("prompt result has unexpected type %T", sig.Body[1])
+				return dbus.Variant{}, fmt.Errorf("Prompt.Completed result has unexpected type %T", sig.Body[1])
 			}
 			return result, nil
 		}
 	}
 }
 
-func secretServiceCollections(ctx context.Context, obj dbus.BusObject) ([]dbus.ObjectPath, error) {
-	var defaultPath dbus.ObjectPath
-	_ = obj.CallWithContext(ctx, ssInterface+".ReadAlias", 0, "default").Store(&defaultPath)
-	var variant dbus.Variant
-	if err := obj.CallWithContext(ctx, "org.freedesktop.DBus.Properties.Get", 0, ssInterface, "Collections").Store(&variant); err != nil {
-		if validSecretServicePath(defaultPath) {
-			return []dbus.ObjectPath{defaultPath, ssLoginCollPath}, nil
-		}
-		return nil, err
+func secretServiceObjectPathsFromVariant(v dbus.Variant) ([]dbus.ObjectPath, error) {
+	paths, ok := v.Value().([]dbus.ObjectPath)
+	if !ok {
+		return nil, fmt.Errorf("prompt result has unexpected type %T", v.Value())
 	}
-	collections, _ := variant.Value().([]dbus.ObjectPath)
-	seen := map[dbus.ObjectPath]bool{}
-	out := make([]dbus.ObjectPath, 0, len(collections)+2)
-	add := func(path dbus.ObjectPath) {
-		if validSecretServicePath(path) && !seen[path] {
-			seen[path] = true
-			out = append(out, path)
+	result := make([]dbus.ObjectPath, 0, len(paths))
+	for _, path := range paths {
+		if validSecretServicePath(path) {
+			result = append(result, path)
 		}
 	}
-	add(defaultPath)
-	for _, path := range collections {
-		add(path)
+	return result, nil
+}
+
+func secretServiceObjectPathFromVariant(v dbus.Variant) (dbus.ObjectPath, error) {
+	path, ok := v.Value().(dbus.ObjectPath)
+	if !ok {
+		return "", fmt.Errorf("prompt result has unexpected type %T", v.Value())
 	}
-	add(ssLoginCollPath)
-	return out, nil
+	return path, nil
 }
 
 func validSecretServicePath(path dbus.ObjectPath) bool {
 	return path != "" && path != "/"
 }
 
+func getSecretServiceCollections(ctx context.Context, obj dbus.BusObject) ([]dbus.ObjectPath, error) {
+	var defaultPath dbus.ObjectPath
+	if err := obj.CallWithContext(ctx, ssInterface+".ReadAlias", 0, "default").Store(&defaultPath); err != nil {
+		return nil, fmt.Errorf("ReadAlias(default) failed: %w", err)
+	}
+
+	var collectionsVariant dbus.Variant
+	if err := obj.CallWithContext(ctx, "org.freedesktop.DBus.Properties.Get", 0, ssInterface, "Collections").Store(&collectionsVariant); err != nil {
+		return nil, fmt.Errorf("Get(Collections) failed: %w", err)
+	}
+
+	collections, ok := collectionsVariant.Value().([]dbus.ObjectPath)
+	if !ok {
+		return nil, fmt.Errorf("Collections property has unexpected type %T", collectionsVariant.Value())
+	}
+
+	return secretServiceCollectionCandidates(defaultPath, collections), nil
+}
+
+func secretServiceCollectionCandidates(defaultPath dbus.ObjectPath, collections []dbus.ObjectPath) []dbus.ObjectPath {
+	seen := make(map[dbus.ObjectPath]bool, len(collections)+2)
+	result := make([]dbus.ObjectPath, 0, len(collections)+2)
+
+	add := func(path dbus.ObjectPath) {
+		if !validSecretServicePath(path) || seen[path] {
+			return
+		}
+		seen[path] = true
+		result = append(result, path)
+	}
+
+	add(defaultPath)
+	for _, path := range collections {
+		add(path)
+	}
+	add(ssLoginCollPath)
+
+	return result
+}
+
 func getMachineID() (string, error) {
-	for _, path := range []string{"/etc/machine-id", "/var/lib/dbus/machine-id"} {
-		raw, err := os.ReadFile(path)
+	paths := []string{"/etc/machine-id", "/var/lib/dbus/machine-id"}
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
 		if err == nil {
-			id := strings.TrimSpace(string(raw))
-			if id != "" {
-				return id, nil
-			}
+			return strings.TrimSpace(string(data)), nil
 		}
 	}
-	hostname, err := os.Hostname()
-	if err != nil || strings.TrimSpace(hostname) == "" {
-		return "", fmt.Errorf("could not resolve machine id")
-	}
-	return hostname, nil
+	return "", fmt.Errorf("could not find machine-id in any of %v", paths)
 }

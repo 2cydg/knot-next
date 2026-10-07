@@ -3,11 +3,9 @@ package paths
 import (
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
-	"runtime"
 )
-
-const appName = "knot-core"
 
 type Layout struct {
 	ConfigDir   string `json:"config_dir"`
@@ -20,15 +18,15 @@ type Layout struct {
 }
 
 func DefaultLayout() (Layout, error) {
-	configBase, err := os.UserConfigDir()
+	configBase, err := legacyBaseDir("XDG_CONFIG_HOME", ".config")
 	if err != nil {
 		return Layout{}, err
 	}
-	stateBase, err := userStateDir()
+	stateBase, err := legacyBaseDir("XDG_STATE_HOME", filepath.Join(".local", "state"))
 	if err != nil {
 		return Layout{}, err
 	}
-	return NewLayout(filepath.Join(configBase, appName), filepath.Join(stateBase, appName)), nil
+	return NewLayout(filepath.Join(configBase, "knot"), filepath.Join(stateBase, "knot")), nil
 }
 
 func NewLayout(configDir, stateDir string) Layout {
@@ -39,7 +37,7 @@ func NewLayout(configDir, stateDir string) Layout {
 		StateDir:    stateDir,
 		RuntimeDir:  runtimeDir,
 		LogDir:      logDir,
-		TokenPath:   filepath.Join(configDir, "token"),
+		TokenPath:   filepath.Join(runtimeDir, "token"),
 		RuntimePath: filepath.Join(runtimeDir, "core.json"),
 		LogPath:     filepath.Join(logDir, "core.log"),
 	}
@@ -57,27 +55,21 @@ func (l Layout) Ensure() error {
 	return nil
 }
 
-func userStateDir() (string, error) {
-	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
+// Legacy Knot used the same home fallbacks on all three platforms.
+func legacyBaseDir(env, suffix string) (string, error) {
+	if dir := os.Getenv(env); dir != "" {
 		return dir, nil
 	}
-	switch runtime.GOOS {
-	case "windows":
-		if dir := os.Getenv("LOCALAPPDATA"); dir != "" {
-			return dir, nil
-		}
-		return os.UserConfigDir()
-	case "darwin":
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(home, "Library", "Application Support"), nil
-	default:
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		return filepath.Join(home, ".local", "state"), nil
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		return filepath.Join(home, suffix), nil
 	}
+	usr, userErr := user.Current()
+	if userErr == nil && usr.HomeDir != "" {
+		return filepath.Join(usr.HomeDir, suffix), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return "", userErr
 }

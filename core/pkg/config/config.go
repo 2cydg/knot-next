@@ -1,10 +1,11 @@
 package config
 
 import (
+	"bytes"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,8 +15,11 @@ import (
 	"time"
 
 	"knot-core/internal/fileutil"
+	"knot-core/internal/keyutil"
 	"knot-core/internal/paths"
 	"knot-core/pkg/crypto"
+
+	"github.com/BurntSushi/toml"
 )
 
 const (
@@ -39,104 +43,120 @@ var (
 )
 
 type Service struct {
-	mu       sync.Mutex
-	path     string
-	layout   paths.Layout
-	crypto   crypto.Provider
-	loaded   bool
-	cfg      Config
-	modified time.Time
+	mu             sync.Mutex
+	path           string
+	layout         paths.Layout
+	crypto         crypto.Provider
+	loaded         bool
+	cfg            Config
+	writeFile      func(string, []byte, os.FileMode) error
+	importProvider func(paths.Layout) (crypto.Provider, error)
+	revision       string
+	modified       time.Time
+	unknown        bool
 }
 
 func NewService(layout paths.Layout, provider crypto.Provider) *Service {
 	return &Service{
-		path:   filepath.Join(layout.ConfigDir, "config.json"),
-		layout: layout,
-		crypto: provider,
+		path:      filepath.Join(layout.ConfigDir, "config.toml"),
+		layout:    layout,
+		crypto:    provider,
+		writeFile: fileutil.AtomicWriteFile,
 	}
 }
 
 type Config struct {
-	SchemaVersion int                           `json:"schema_version"`
-	Settings      Settings                      `json:"settings"`
-	Servers       map[string]ServerProfile      `json:"servers"`
-	Proxies       map[string]ProxyProfile       `json:"proxies"`
-	Keys          map[string]KeyMetadata        `json:"keys"`
-	SyncProviders map[string]SyncProviderConfig `json:"sync_providers"`
-	UpdatedAt     time.Time                     `json:"updated_at"`
+	Warnings      []ValidationError             `json:"-" toml:"-"`
+	SchemaVersion int                           `json:"schema_version" toml:"-"`
+	Settings      Settings                      `json:"settings" toml:"settings"`
+	Servers       map[string]ServerProfile      `json:"servers" toml:"servers"`
+	Proxies       map[string]ProxyProfile       `json:"proxies" toml:"proxies"`
+	Keys          map[string]KeyMetadata        `json:"keys" toml:"keys"`
+	SyncProviders map[string]SyncProviderConfig `json:"sync_providers" toml:"sync_providers"`
+	UpdatedAt     time.Time                     `json:"updated_at" toml:"-"`
 }
 
 type Settings struct {
-	ForwardAgent          bool   `json:"forward_agent"`
-	ClearScreenOnConnect  bool   `json:"clear_screen_on_connect"`
-	BroadcastEscapeEnable bool   `json:"broadcast_escape_enable"`
-	BroadcastEscapeChar   string `json:"broadcast_escape_char"`
-	IdleTimeout           string `json:"idle_timeout"`
-	KeepaliveInterval     string `json:"keepalive_interval"`
-	LogLevel              string `json:"log_level"`
-	RecentLimit           int    `json:"recent_limit"`
-	DefaultSFTPLocalPath  string `json:"default_sftp_local_path,omitempty"`
-	DefaultSyncProvider   string `json:"default_sync_provider,omitempty"`
-	SyncPassword          string `json:"sync_password,omitempty"`
+	ForwardAgent          bool   `json:"forward_agent" toml:"forward_agent"`
+	ClearScreenOnConnect  bool   `json:"clear_screen_on_connect" toml:"clear_screen_on_connect"`
+	BroadcastEscapeEnable bool   `json:"broadcast_escape_enable" toml:"broadcast_escape_enable"`
+	BroadcastEscapeChar   string `json:"broadcast_escape_char" toml:"broadcast_escape_char"`
+	IdleTimeout           string `json:"idle_timeout" toml:"idle_timeout"`
+	KeepaliveInterval     string `json:"keepalive_interval" toml:"keepalive_interval"`
+	LogLevel              string `json:"log_level" toml:"log_level"`
+	RecentLimit           int    `json:"recent_limit" toml:"recent_limit"`
+	DefaultSFTPLocalPath  string `json:"default_sftp_local_path,omitempty" toml:"default_sftp_local_path,omitempty"`
+	DefaultSyncProvider   string `json:"default_sync_provider,omitempty" toml:"default_sync_provider,omitempty"`
+	SyncPassword          string `json:"sync_password,omitempty" toml:"sync_password,omitempty"`
+}
+
+type ForwardConfig struct {
+	Type       string `toml:"type"`
+	LocalPort  int    `toml:"local_port"`
+	RemoteAddr string `toml:"remote_addr,omitempty"`
 }
 
 type ServerProfile struct {
-	ID             string   `json:"id"`
-	Alias          string   `json:"alias"`
-	Host           string   `json:"host"`
-	Port           int      `json:"port"`
-	User           string   `json:"user"`
-	AuthMethod     string   `json:"auth_method,omitempty"`
-	Password       string   `json:"password,omitempty"`
-	KeyID          string   `json:"key_id,omitempty"`
-	KnownHostsPath string   `json:"known_hosts_path,omitempty"`
-	ProxyID        string   `json:"proxy_id,omitempty"`
-	JumpHostIDs    []string `json:"jump_host_ids,omitempty"`
-	Tags           []string `json:"tags,omitempty"`
+	ID             string          `json:"id" toml:"id"`
+	Alias          string          `json:"alias" toml:"alias"`
+	Host           string          `json:"host" toml:"host"`
+	Port           int             `json:"port" toml:"port"`
+	User           string          `json:"user" toml:"user"`
+	AuthMethod     string          `json:"auth_method,omitempty" toml:"auth_method,omitempty"`
+	Password       string          `json:"password,omitempty" toml:"password,omitempty"`
+	KeyID          string          `json:"key_id,omitempty" toml:"key_id,omitempty"`
+	KnownHostsPath string          `json:"known_hosts_path,omitempty" toml:"known_hosts_path,omitempty"`
+	ProxyID        string          `json:"proxy_id,omitempty" toml:"proxy_id,omitempty"`
+	JumpHostIDs    []string        `json:"jump_host_ids,omitempty" toml:"jump_host_ids,omitempty"`
+	Forwards       []ForwardConfig `json:"-" toml:"forwards,omitempty"`
+	Tags           []string        `json:"tags,omitempty" toml:"tags,omitempty"`
 }
 
 type ProxyProfile struct {
-	ID       string `json:"id"`
-	Alias    string `json:"alias"`
-	Type     string `json:"type,omitempty"`
-	Host     string `json:"host,omitempty"`
-	Port     int    `json:"port,omitempty"`
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
+	ID       string `json:"id" toml:"id"`
+	Alias    string `json:"alias" toml:"alias"`
+	Type     string `json:"type,omitempty" toml:"type,omitempty"`
+	Host     string `json:"host,omitempty" toml:"host,omitempty"`
+	Port     int    `json:"port,omitempty" toml:"port,omitempty"`
+	Username string `json:"username,omitempty" toml:"username,omitempty"`
+	Password string `json:"password,omitempty" toml:"password,omitempty"`
 }
 
 type KeyMetadata struct {
-	ID         string `json:"id"`
-	Alias      string `json:"alias"`
-	Type       string `json:"type,omitempty"`
-	Length     int    `json:"length,omitempty"`
-	PrivateKey string `json:"private_key,omitempty"`
-	SourcePath string `json:"source_path,omitempty"`
+	Passphrase  string `json:"-" toml:"-"`
+	Fingerprint string `json:"fingerprint,omitempty" toml:"fingerprint,omitempty"`
+	Encrypted   bool   `json:"encrypted,omitempty" toml:"encrypted,omitempty"`
+	ID          string `json:"id" toml:"id"`
+	Alias       string `json:"alias" toml:"alias"`
+	Type        string `json:"type,omitempty" toml:"type,omitempty"`
+	Length      int    `json:"length,omitempty" toml:"length,omitempty"`
+	PrivateKey  string `json:"private_key,omitempty" toml:"private_key,omitempty"`
+	SourcePath  string `json:"source_path,omitempty" toml:"source_path,omitempty"`
 }
 
 type SyncProviderConfig struct {
-	ID              string `json:"id"`
-	Alias           string `json:"alias"`
-	Type            string `json:"type"`
-	URL             string `json:"url,omitempty"`
-	Username        string `json:"username,omitempty"`
-	Password        string `json:"password,omitempty"`
-	Bucket          string `json:"bucket,omitempty"`
-	Key             string `json:"key,omitempty"`
-	Region          string `json:"region,omitempty"`
-	Endpoint        string `json:"endpoint,omitempty"`
-	AccessKeyID     string `json:"access_key_id,omitempty"`
-	SecretAccessKey string `json:"secret_access_key,omitempty"`
-	SessionToken    string `json:"session_token,omitempty"`
-	PathStyle       bool   `json:"path_style,omitempty"`
+	ID              string `json:"id" toml:"id"`
+	Alias           string `json:"alias" toml:"alias"`
+	Type            string `json:"type" toml:"type"`
+	URL             string `json:"url,omitempty" toml:"url,omitempty"`
+	Username        string `json:"username,omitempty" toml:"username,omitempty"`
+	Password        string `json:"password,omitempty" toml:"password,omitempty"`
+	Bucket          string `json:"bucket,omitempty" toml:"bucket,omitempty"`
+	Key             string `json:"key,omitempty" toml:"key,omitempty"`
+	Region          string `json:"region,omitempty" toml:"region,omitempty"`
+	Endpoint        string `json:"endpoint,omitempty" toml:"endpoint,omitempty"`
+	AccessKeyID     string `json:"access_key_id,omitempty" toml:"access_key_id,omitempty"`
+	SecretAccessKey string `json:"secret_access_key,omitempty" toml:"secret_access_key,omitempty"`
+	SessionToken    string `json:"session_token,omitempty" toml:"session_token,omitempty"`
+	PathStyle       bool   `json:"path_style,omitempty" toml:"path_style,omitempty"`
 }
 
 type RuntimeConfig struct {
-	Settings      Settings
-	Servers       map[string]ServerProfile
-	Proxies       map[string]ProxyProfile
-	Keys          map[string]KeyMetadata
-	SyncProviders map[string]SyncProviderConfig
+	Settings      Settings                      `json:"-"`
+	Servers       map[string]ServerProfile      `json:"-"`
+	Proxies       map[string]ProxyProfile       `json:"-"`
+	Keys          map[string]KeyMetadata        `json:"-"`
+	SyncProviders map[string]SyncProviderConfig `json:"-"`
 }
 
 type Page[T any] struct {
@@ -169,11 +189,12 @@ type Summary struct {
 }
 
 type Metadata struct {
-	SchemaVersion int       `json:"schema_version"`
-	Source        string    `json:"source"`
-	ConfigPath    string    `json:"config_path"`
-	Migration     Migration `json:"migration"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	Warnings      []ValidationError `json:"warnings,omitempty"`
+	SchemaVersion int               `json:"schema_version"`
+	Source        string            `json:"source"`
+	ConfigPath    string            `json:"config_path"`
+	Migration     Migration         `json:"migration"`
+	UpdatedAt     time.Time         `json:"updated_at"`
 }
 
 type SettingsView struct {
@@ -223,6 +244,8 @@ type ProxyProfileView struct {
 }
 
 type KeyMetadataView struct {
+	Fingerprint   string `json:"fingerprint,omitempty"`
+	Encrypted     bool   `json:"encrypted"`
 	ID            string `json:"id"`
 	Alias         string `json:"alias"`
 	Type          string `json:"type,omitempty"`
@@ -265,11 +288,17 @@ type Migration struct {
 	LegacyExists     bool   `json:"legacy_exists"`
 	NeedsMigration   bool   `json:"needs_migration"`
 	ConflictDetected bool   `json:"conflict_detected"`
+	Source           string `json:"source"`
+	JSONExists       bool   `json:"json_exists"`
 }
 
 type MigrationPlan struct {
-	Migration Migration       `json:"migration"`
-	Items     []MigrationItem `json:"items"`
+	Warnings       []ValidationError            `json:"warnings,omitempty"`
+	Migration      Migration                    `json:"migration"`
+	Items          []MigrationItem              `json:"items"`
+	SourceRevision string                       `json:"source_revision,omitempty"`
+	TargetRevision string                       `json:"target_revision,omitempty"`
+	IDMappings     map[string]map[string]string `json:"id_mappings,omitempty"`
 }
 
 type MigrationItem struct {
@@ -279,7 +308,10 @@ type MigrationItem struct {
 }
 
 type MigrationApplyRequest struct {
-	Mode string `json:"mode"`
+	Mode           string `json:"mode"`
+	SourcePath     string `json:"source_path,omitempty"`
+	SourceRevision string `json:"source_revision,omitempty"`
+	TargetRevision string `json:"target_revision,omitempty"`
 }
 
 func (s *Service) Summary() (Summary, error) {
@@ -464,9 +496,8 @@ func (s *Service) UpdateServer(id string, server ServerProfile) (ServerProfileVi
 		if aliasExistsServer(*cfg, server.Alias, id) {
 			return ErrConflict
 		}
-		if server.Password == "" {
-			server.Password = current.Password
-		}
+		server.Password = current.Password
+		server.Forwards = append([]ForwardConfig(nil), current.Forwards...)
 		normalizeServer(&server)
 		cfg.Servers[id] = server
 		out = serverView(server)
@@ -479,6 +510,13 @@ func (s *Service) DeleteServer(id string) error {
 	return s.withConfig(func(cfg *Config) error {
 		if _, ok := cfg.Servers[id]; !ok {
 			return ErrNotFound
+		}
+		for _, server := range cfg.Servers {
+			for _, jump := range server.JumpHostIDs {
+				if jump == id {
+					return fmt.Errorf("%w: server is referenced as a jump host", ErrConflict)
+				}
+			}
 		}
 		delete(cfg.Servers, id)
 		return nil
@@ -508,6 +546,12 @@ func (s *Service) RuntimeConfig() (RuntimeConfig, error) {
 	}
 	if err := s.decryptRuntimeSecrets(&cfg); err != nil {
 		return RuntimeConfig{}, err
+	}
+	for id, server := range cfg.Servers {
+		if server.KnownHostsPath == "" {
+			server.KnownHostsPath = filepath.Join(s.layout.ConfigDir, "known_hosts")
+			cfg.Servers[id] = server
+		}
 	}
 	return RuntimeConfig{
 		Settings:      cfg.Settings,
@@ -591,6 +635,11 @@ func (s *Service) DeleteProxy(id string) error {
 		if _, ok := cfg.Proxies[id]; !ok {
 			return ErrNotFound
 		}
+		for _, server := range cfg.Servers {
+			if server.ProxyID == id {
+				return fmt.Errorf("%w: resource is referenced by a server", ErrConflict)
+			}
+		}
 		delete(cfg.Proxies, id)
 		return nil
 	})
@@ -628,6 +677,15 @@ func (s *Service) CreateKey(key KeyMetadata) (KeyMetadataView, error) {
 		if _, ok := cfg.Keys[key.ID]; ok || aliasExistsKey(*cfg, key.Alias, key.ID) {
 			return ErrConflict
 		}
+		key.Type = ""
+		key.Length = 0
+		key.Fingerprint = ""
+		key.Encrypted = false
+		if key.SourcePath != "" {
+			if err := s.inspectKey(&key); err != nil {
+				return err
+			}
+		}
 		cfg.Keys[key.ID] = key
 		out = keyView(key)
 		return nil
@@ -657,6 +715,19 @@ func (s *Service) UpdateKey(id string, key KeyMetadata) (KeyMetadataView, error)
 		if key.PrivateKey == "" {
 			key.PrivateKey = current.PrivateKey
 		}
+		if key.SourcePath == "" {
+			key.SourcePath = current.SourcePath
+		}
+		key.Type = current.Type
+		key.Length = current.Length
+		key.Fingerprint = current.Fingerprint
+		key.Encrypted = current.Encrypted
+		if key.SourcePath != "" {
+			key.PrivateKey = ""
+			if err := s.inspectKey(&key); err != nil {
+				return err
+			}
+		}
 		cfg.Keys[id] = key
 		out = keyView(key)
 		return nil
@@ -668,6 +739,11 @@ func (s *Service) DeleteKey(id string) error {
 	return s.withConfig(func(cfg *Config) error {
 		if _, ok := cfg.Keys[id]; !ok {
 			return ErrNotFound
+		}
+		for _, server := range cfg.Servers {
+			if server.KeyID == id {
+				return fmt.Errorf("%w: resource is referenced by a server", ErrConflict)
+			}
 		}
 		delete(cfg.Keys, id)
 		return nil
@@ -774,81 +850,6 @@ func (s *Service) ClearDefaultSyncProvider() error {
 	})
 }
 
-func (s *Service) Migration() Migration {
-	legacyPath := filepath.Join(filepath.Dir(s.layout.ConfigDir), "knot", "config.toml")
-	_, legacyErr := os.Stat(legacyPath)
-	_, currentErr := os.Stat(s.path)
-	legacyExists := legacyErr == nil
-	currentExists := currentErr == nil
-	return Migration{
-		LegacyPath:       legacyPath,
-		LegacyExists:     legacyExists,
-		NeedsMigration:   legacyExists && !currentExists,
-		ConflictDetected: legacyExists && currentExists,
-	}
-}
-
-func (s *Service) MigrationPlan() MigrationPlan {
-	migration := s.Migration()
-	items := []MigrationItem{}
-	switch {
-	case !migration.LegacyExists:
-		items = append(items, MigrationItem{Resource: "legacy_config", Action: "skip", Reason: "legacy config file was not found"})
-	default:
-		legacy, err := LoadLegacyConfig(migration.LegacyPath)
-		if err != nil {
-			items = append(items, MigrationItem{Resource: "legacy_config", Action: "error", Reason: err.Error()})
-			break
-		}
-		current, err := s.snapshot()
-		if err != nil {
-			items = append(items, MigrationItem{Resource: "config", Action: "error", Reason: err.Error()})
-			break
-		}
-		if migration.ConflictDetected {
-			items = append(items, MigrationItem{Resource: "config", Action: "info", Reason: "current knot-core config already exists; skip_existing mode will keep existing resources"})
-		}
-		_, convertedItems, _ := ConvertLegacyConfig(legacy, current, "skip_existing")
-		items = append(items, convertedItems...)
-	}
-	migration.ConflictDetected = migration.ConflictDetected || hasMigrationConflict(items)
-	return MigrationPlan{Migration: migration, Items: items}
-}
-
-func (s *Service) ApplyMigration(mode string) (Summary, error) {
-	if mode == "" {
-		mode = "fail_on_conflict"
-	}
-	if mode != "skip_existing" && mode != "overwrite" && mode != "fail_on_conflict" {
-		return Summary{}, fmt.Errorf("%w: unsupported migration mode", ErrValidation)
-	}
-	var out Summary
-	err := s.withConfig(func(cfg *Config) error {
-		migration := s.Migration()
-		if !migration.LegacyExists {
-			return ErrNotFound
-		}
-		legacy, err := LoadLegacyConfig(migration.LegacyPath)
-		if err != nil {
-			return err
-		}
-		next, items, err := ConvertLegacyConfig(legacy, *cfg, mode)
-		if err != nil {
-			return err
-		}
-		if mode == "fail_on_conflict" && hasMigrationConflict(items) {
-			return fmt.Errorf("%w: migration has conflicts", ErrConflict)
-		}
-		if err := s.reencryptMigratedSecrets(&next); err != nil {
-			return err
-		}
-		*cfg = next
-		out = summaryFromConfig(next, s.metadataFor(next))
-		return nil
-	})
-	return out, err
-}
-
 func (s *Service) SetServerPassword(id string, password string) (ServerProfileView, error) {
 	var out ServerProfileView
 	err := s.withConfig(func(cfg *Config) error {
@@ -887,12 +888,37 @@ func (s *Service) ClearServerPassword(id string) (ServerProfileView, error) {
 }
 
 func (s *Service) SetKeyPrivate(id string, privateKey string, sourcePath string) (KeyMetadataView, error) {
+	return s.SetKeyPrivateWithPassphrase(id, privateKey, sourcePath, "")
+}
+
+func (s *Service) SetKeyPrivateWithPassphrase(id string, privateKey string, sourcePath string, passphrase string) (KeyMetadataView, error) {
 	var out KeyMetadataView
 	err := s.withConfig(func(cfg *Config) error {
 		key, ok := cfg.Keys[id]
 		if !ok {
 			return ErrNotFound
 		}
+		if privateKey != "" && sourcePath != "" {
+			return fmt.Errorf("%w: choose private_key or source_path", ErrValidation)
+		}
+		raw := []byte(privateKey)
+		if sourcePath != "" {
+			var err error
+			raw, err = os.ReadFile(sourcePath)
+			if err != nil {
+				return fmt.Errorf("%w: private key source cannot be read", ErrValidation)
+			}
+		}
+		if privateKey != "" {
+			if _, err := keyutil.Signer(raw, passphrase); err != nil {
+				return fmt.Errorf("%w: %w", ErrValidation, err)
+			}
+		}
+		key.Type, key.Length, key.Fingerprint = "", 0, ""
+		if err := inspectStoredKey(&key, raw, passphrase); err != nil {
+			return err
+		}
+		key.PrivateKey = ""
 		if privateKey != "" {
 			encrypted, err := s.encryptSecret(privateKey)
 			if err != nil {
@@ -917,6 +943,10 @@ func (s *Service) ClearKeyPrivate(id string) (KeyMetadataView, error) {
 		}
 		key.PrivateKey = ""
 		key.SourcePath = ""
+		key.Type = ""
+		key.Length = 0
+		key.Fingerprint = ""
+		key.Encrypted = false
 		cfg.Keys[id] = key
 		out = keyView(key)
 		return nil
@@ -1090,22 +1120,15 @@ func (s *Service) SecretSummary() (map[string]any, error) {
 	}, nil
 }
 
-func (s *Service) snapshot() (Config, error) {
+func (s *Service) snapshot() (Config, error) { cfg, _, err := s.snapshotRevision(); return cfg, err }
+func (s *Service) snapshotRevision() (Config, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out Config
-	err := fileutil.WithLock(s.path+".lock", func() error {
-		s.loaded = false
-		if err := s.loadLocked(); err != nil {
-			return err
-		}
-		out = cloneConfig(s.cfg)
-		return nil
-	})
-	if err != nil {
-		return Config{}, err
+	s.loaded = false
+	if err := s.loadLocked(); err != nil {
+		return Config{}, "", err
 	}
-	return out, nil
+	return cloneConfig(s.cfg), s.revision, nil
 }
 
 func (s *Service) withConfig(fn func(*Config) error) error {
@@ -1141,6 +1164,8 @@ func (s *Service) loadLocked() error {
 	}
 	if _, err := os.Stat(s.path); errors.Is(err, os.ErrNotExist) {
 		s.cfg = defaultConfig()
+		s.revision = "absent"
+		s.unknown = false
 		s.loaded = true
 		return nil
 	}
@@ -1148,14 +1173,22 @@ func (s *Service) loadLocked() error {
 	if err != nil {
 		return err
 	}
-	cfg := defaultConfig()
-	if err := json.Unmarshal(raw, &cfg); err != nil {
+	disk := diskFromConfig(defaultConfig())
+	md, err := toml.Decode(string(raw), &disk)
+	cfg := configFromDisk(disk)
+	if err != nil {
+		return fmt.Errorf("%w: invalid TOML configuration", ErrValidation)
+	}
+	s.unknown = len(md.Undecoded()) != 0
+	s.revision = contentRevision(raw)
+	ensureMaps(&cfg)
+	if err := applyDiskDefaults(&cfg); err != nil {
 		return err
 	}
-	ensureMaps(&cfg)
-	if cfg.SchemaVersion == 0 {
-		cfg.SchemaVersion = 1
+	if info, err := os.Stat(s.path); err == nil {
+		cfg.UpdatedAt = info.ModTime().UTC()
 	}
+
 	s.cfg = cfg
 	s.modified = cfg.UpdatedAt
 	s.loaded = true
@@ -1163,20 +1196,34 @@ func (s *Service) loadLocked() error {
 }
 
 func (s *Service) saveLocked(cfg Config) error {
-	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+	if s.unknown {
+		return fmt.Errorf("%w: configuration contains unknown TOML fields; refusing a lossy write", ErrValidation)
+	}
+	verified := cloneConfig(cfg)
+	if err := s.decryptRuntimeSecrets(&verified); err != nil {
 		return err
 	}
-	raw, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
+	// Encrypt plaintext legacy fields on the first intentional write. Existing
+	// ENC values retain their exact ciphertext; ordinary upgrades do not rekey.
+	if err := s.encryptPlainSecrets(&cfg); err != nil {
 		return err
 	}
-	return fileutil.AtomicWriteFile(s.path, raw, 0o600)
+	disk := cloneConfig(cfg)
+	if id := disk.Settings.DefaultSyncProvider; id != "" {
+		disk.Settings.DefaultSyncProvider = disk.SyncProviders[id].Alias
+	}
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(diskFromConfig(disk)); err != nil {
+		return err
+	}
+	return s.writeFile(s.path, buf.Bytes(), 0o600)
 }
 
 func (s *Service) metadataFor(cfg Config) Metadata {
 	return Metadata{
+		Warnings:      append([]ValidationError(nil), cfg.Warnings...),
 		SchemaVersion: cfg.SchemaVersion,
-		Source:        "knot-core",
+		Source:        "legacy-toml",
 		ConfigPath:    s.path,
 		Migration:     s.Migration(),
 		UpdatedAt:     cfg.UpdatedAt,
@@ -1184,14 +1231,17 @@ func (s *Service) metadataFor(cfg Config) Metadata {
 }
 
 func (s *Service) encryptSecret(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
 	if s.crypto == nil || !s.crypto.Available() {
 		return "", errors.New("secret encryption provider is not available")
 	}
 	encrypted, err := s.crypto.Encrypt([]byte(value))
 	if err != nil {
-		return "", err
+		return "", crypto.ErrEncryptionFailed
 	}
-	return secretPrefix + string(encrypted), nil
+	return secretPrefix + base64.StdEncoding.EncodeToString(encrypted), nil
 }
 
 func (s *Service) decryptRuntimeSecrets(cfg *Config) error {
@@ -1250,120 +1300,11 @@ func (s *Service) decryptSecret(value string) (string, error) {
 	if s.crypto == nil || !s.crypto.Available() {
 		return "", errors.New("secret encryption provider is not available")
 	}
-	plaintext, err := s.crypto.Decrypt([]byte(strings.TrimPrefix(value, secretPrefix)))
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(value, secretPrefix))
 	if err != nil {
-		return "", err
+		return "", crypto.ErrDecryptionFailed
 	}
-	return string(plaintext), nil
-}
-
-func (s *Service) reencryptMigratedSecrets(cfg *Config) error {
-	for id, server := range cfg.Servers {
-		value, err := s.normalizeMigratedSecret(server.Password)
-		if err != nil {
-			return fmt.Errorf("migrate server password %s: %w", id, err)
-		}
-		server.Password = value
-		cfg.Servers[id] = server
-	}
-	for id, proxy := range cfg.Proxies {
-		value, err := s.normalizeMigratedSecret(proxy.Password)
-		if err != nil {
-			return fmt.Errorf("migrate proxy password %s: %w", id, err)
-		}
-		proxy.Password = value
-		cfg.Proxies[id] = proxy
-	}
-	for id, key := range cfg.Keys {
-		value, err := s.normalizeMigratedSecret(key.PrivateKey)
-		if err != nil {
-			return fmt.Errorf("migrate private key %s: %w", id, err)
-		}
-		key.PrivateKey = value
-		cfg.Keys[id] = key
-	}
-	value, err := s.normalizeMigratedSecret(cfg.Settings.SyncPassword)
-	if err != nil {
-		return fmt.Errorf("migrate sync password: %w", err)
-	}
-	cfg.Settings.SyncPassword = value
-	for id, provider := range cfg.SyncProviders {
-		if provider.Password, err = s.normalizeMigratedSecret(provider.Password); err != nil {
-			return fmt.Errorf("migrate sync provider password %s: %w", id, err)
-		}
-		if provider.AccessKeyID, err = s.normalizeMigratedSecret(provider.AccessKeyID); err != nil {
-			return fmt.Errorf("migrate sync provider access key id %s: %w", id, err)
-		}
-		if provider.SecretAccessKey, err = s.normalizeMigratedSecret(provider.SecretAccessKey); err != nil {
-			return fmt.Errorf("migrate sync provider secret access key %s: %w", id, err)
-		}
-		if provider.SessionToken, err = s.normalizeMigratedSecret(provider.SessionToken); err != nil {
-			return fmt.Errorf("migrate sync provider session token %s: %w", id, err)
-		}
-		cfg.SyncProviders[id] = provider
-	}
-	return nil
-}
-
-func (s *Service) normalizeMigratedSecret(value string) (string, error) {
-	if value == "" {
-		return "", nil
-	}
-	if strings.HasPrefix(value, secretPrefix) {
-		plaintext, err := s.decryptSecret(value)
-		if err == nil {
-			return s.encryptSecret(plaintext)
-		}
-		raw := strings.TrimPrefix(value, secretPrefix)
-		plaintext, compatErr := s.decryptLegacyCiphertext(raw)
-		if compatErr != nil {
-			return "", compatErr
-		}
-		return s.encryptSecret(plaintext)
-	}
-	return s.encryptSecret(value)
-}
-
-func (s *Service) decryptLegacyCiphertext(value string) (string, error) {
-	for _, layout := range legacyLayoutCandidates(s.layout) {
-		for _, provider := range legacyProviders(layout) {
-			plaintext, err := decryptLegacyEncodedValue(value, provider)
-			if err == nil {
-				return plaintext, nil
-			}
-		}
-	}
-	return "", fmt.Errorf("%w: legacy secret could not be decrypted with available providers", crypto.ErrDecryptionFailed)
-}
-
-func legacyLayoutCandidates(layout paths.Layout) []paths.Layout {
-	var candidates []paths.Layout
-	configRoot := filepath.Dir(layout.ConfigDir)
-	stateRoot := filepath.Dir(layout.StateDir)
-	if configRoot != "" && stateRoot != "" {
-		candidates = append(candidates, paths.NewLayout(filepath.Join(configRoot, "knot"), filepath.Join(stateRoot, "knot")))
-	}
-	candidates = append(candidates, paths.NewLayout(layout.ConfigDir, layout.StateDir))
-	return candidates
-}
-
-func legacyProviders(layout paths.Layout) []crypto.Provider {
-	var providers []crypto.Provider
-	if provider, err := crypto.NewDefaultProvider(layout); err == nil {
-		providers = append(providers, provider)
-	}
-	if provider, err := crypto.NewLocalProvider(filepath.Join(layout.ConfigDir, "secret.key")); err == nil {
-		providers = append(providers, provider)
-	}
-	return providers
-}
-
-func decryptLegacyEncodedValue(value string, provider crypto.Provider) (string, error) {
-	decoded, err := base64.StdEncoding.DecodeString(value)
-	if err != nil {
-		return "", err
-	}
-	plaintext, err := provider.Decrypt(decoded)
+	plaintext, err := s.crypto.Decrypt(raw)
 	if err != nil {
 		return "", err
 	}
@@ -1409,10 +1350,12 @@ func ensureMaps(cfg *Config) {
 
 func cloneConfig(cfg Config) Config {
 	clone := cfg
+	clone.Warnings = append([]ValidationError(nil), cfg.Warnings...)
 	clone.Servers = make(map[string]ServerProfile, len(cfg.Servers))
 	for id, server := range cfg.Servers {
 		server.JumpHostIDs = append([]string(nil), server.JumpHostIDs...)
 		server.Tags = append([]string(nil), server.Tags...)
+		server.Forwards = append([]ForwardConfig(nil), server.Forwards...)
 		clone.Servers[id] = server
 	}
 	clone.Proxies = make(map[string]ProxyProfile, len(cfg.Proxies))
@@ -1526,11 +1469,20 @@ func setSetting(settings *Settings, key string, value any) error {
 	case "recent_limit":
 		switch v := value.(type) {
 		case float64:
+			if math.IsNaN(v) || math.IsInf(v, 0) || math.Trunc(v) != v || v < 0 || v >= float64(int(^uint(0)>>1)) {
+				return ErrValidation
+			}
 			settings.RecentLimit = int(v)
 		case int:
+			if v < 0 {
+				return ErrValidation
+			}
 			settings.RecentLimit = v
 		default:
 			return ErrValidation
+		}
+		if settings.RecentLimit == 0 {
+			settings.RecentLimit = defaultConfig().Settings.RecentLimit
 		}
 	case "default_sftp_local_path":
 		v, ok := value.(string)
@@ -1614,11 +1566,12 @@ func keyViews(cfg Config) []KeyMetadataView {
 
 func keyView(key KeyMetadata) KeyMetadataView {
 	return KeyMetadataView{
+		Fingerprint: key.Fingerprint, Encrypted: key.Encrypted,
 		ID:            key.ID,
 		Alias:         key.Alias,
 		Type:          key.Type,
 		Length:        key.Length,
-		PrivateKeySet: key.PrivateKey != "",
+		PrivateKeySet: key.PrivateKey != "" || key.SourcePath != "",
 		SourcePath:    key.SourcePath,
 	}
 }
@@ -1746,9 +1699,32 @@ func validate(cfg Config) ValidationResult {
 			add("settings", "default_sync_provider", "default sync provider does not exist")
 		}
 	}
+	for _, value := range []string{cfg.Settings.DefaultSFTPLocalPath, cfg.Settings.BroadcastEscapeChar, cfg.Settings.LogLevel} {
+		if hasControl(value) {
+			add("settings", "value", "settings must not contain control characters")
+		}
+	}
+	for _, duration := range []string{cfg.Settings.IdleTimeout, cfg.Settings.KeepaliveInterval} {
+		if parsed, err := time.ParseDuration(duration); err != nil || parsed < 0 {
+			add("settings", "duration", "duration must be valid and nonnegative")
+		}
+	}
 	aliases := map[string]string{}
 	for id, server := range cfg.Servers {
 		resource := "servers/" + id
+		if hasControl(server.ID) || hasControl(server.KnownHostsPath) {
+			add(resource, "id/path", "server ID and path must not contain control characters")
+		}
+		for _, f := range server.Forwards {
+			if f.LocalPort <= 0 || f.LocalPort > 65535 || (f.Type != "L" && f.Type != "R" && f.Type != "D") || hasControl(f.RemoteAddr) {
+				add(resource, "forwards", "invalid stored forwarding definition")
+			}
+		}
+		for _, tag := range server.Tags {
+			if hasControl(tag) {
+				add(resource, "tags", "tags must not contain control characters")
+			}
+		}
 		if server.ID != id {
 			add(resource, "id", "server id must match map key")
 		}
@@ -1801,6 +1777,9 @@ func validate(cfg Config) ValidationResult {
 	proxyAliases := map[string]string{}
 	for id, proxy := range cfg.Proxies {
 		resource := "proxies/" + id
+		if hasControl(proxy.ID) || hasControl(proxy.Username) {
+			add(resource, "id/username", "proxy fields must not contain control characters")
+		}
 		if proxy.ID != id {
 			add(resource, "id", "proxy id must match map key")
 		}
@@ -1824,6 +1803,9 @@ func validate(cfg Config) ValidationResult {
 	keyAliases := map[string]string{}
 	for id, key := range cfg.Keys {
 		resource := "keys/" + id
+		if hasControl(key.ID) || hasControl(key.SourcePath) {
+			add(resource, "id/path", "key ID and path must not contain control characters")
+		}
 		if key.ID != id {
 			add(resource, "id", "key id must match map key")
 		}
@@ -1838,6 +1820,9 @@ func validate(cfg Config) ValidationResult {
 	syncAliases := map[string]string{}
 	for id, provider := range cfg.SyncProviders {
 		resource := "sync_providers/" + id
+		if hasControl(provider.ID) || hasControl(provider.Username) || hasControl(provider.URL) || hasControl(provider.Bucket) || hasControl(provider.Key) || hasControl(provider.Region) || hasControl(provider.Endpoint) {
+			add(resource, "value", "provider fields must not contain control characters")
+		}
 		if provider.ID != id {
 			add(resource, "id", "sync provider id must match map key")
 		}
@@ -1893,6 +1878,7 @@ func normalizeServer(server *ServerProfile) {
 	}
 	server.JumpHostIDs = append([]string(nil), server.JumpHostIDs...)
 	server.Tags = append([]string(nil), server.Tags...)
+	server.Forwards = append([]ForwardConfig(nil), server.Forwards...)
 }
 
 func keepProviderSecrets(next *SyncProviderConfig, current SyncProviderConfig) {
@@ -2024,4 +2010,13 @@ func aliasExistsSync(cfg Config, alias string, self string) bool {
 
 func newID(prefix string) string {
 	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+}
+
+func hasControl(value string) bool {
+	for _, r := range value {
+		if r < 32 || r == 127 {
+			return true
+		}
+	}
+	return false
 }

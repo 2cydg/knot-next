@@ -1,4 +1,4 @@
-//go:build !linux && !windows && !darwin
+//go:build !linux && !darwin && !windows
 
 package crypto
 
@@ -8,15 +8,6 @@ import (
 	"knot-core/internal/paths"
 )
 
-func providerForState(layout paths.Layout, providerID string) (Provider, error) {
-	switch providerID {
-	case ProviderLocal:
-		return NewLocalProvider(localKeyPath(layout))
-	default:
-		return nil, fmt.Errorf("unknown crypto provider %q", providerID)
-	}
-}
-
-func selectDefaultProvider(layout paths.Layout) (Provider, error) {
-	return NewLocalProvider(localKeyPath(layout))
+func openPlatformProvider(layout paths.Layout, initialize bool) (Provider, error) {
+	return nil, fmt.Errorf("unsupported crypto platform")
 }

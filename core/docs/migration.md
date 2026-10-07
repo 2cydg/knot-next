@@ -1,248 +1,74 @@
-# Migration Guide
+# 旧配置复用与显式导入
 
-This document provides guidance for migrating from legacy knot installations to knot-core.
+新 core 直接使用旧 Knot 的 `config.toml` 和加密材料。正常升级停止旧 daemon 后启动 core 即可，无需先调用 migration apply，也无需转换 JSON、重新编号或重新录入凭据。
 
-## Overview
+## 原位置与兼容行为
 
-knot-core uses a different configuration format and directory structure compared to legacy knot:
+| 数据 | core 的行为 |
+| --- | --- |
+| 配置 | `$XDG_CONFIG_HOME/knot/config.toml`；未设置 XDG 时为 `~/.config/knot/config.toml`，三平台沿用旧规则 |
+| 最近使用 | `$XDG_STATE_HOME/knot/state.json`；未设置时为 `~/.local/state/knot/state.json`；保留原文件与 ID，成功使用回调在 B09 接入 |
+| 信任 | 显式 `known_hosts_path` 优先，否则配置目录中的 `known_hosts`；保留 hashed host 和非默认端口记录 |
+| 密文 | 保留 `ENC:` + 单层 Base64；provider 接收原始密文字节；普通写入不重新加密未修改的密文 |
+| Linux | 复用 `.salt`、`.crypto-state`，固定已选 provider；Secret Service 身份为 `knot` / `knot-master-key`，fallback 为旧 machine-id + NUL + UID 派生 |
+| macOS | 复用旧 Keychain 身份 `knot` / `knot-master-key` 与原 machine fallback；不删除或替换损坏的既有 Keychain item |
+| Windows | 保持旧 DPAPI flags=1、无额外 entropy，以及原 machine fallback；DPAPI 绑定原 Windows 账号 |
+| 持久 forwards | 完整保留在服务器的 TOML 中；引擎仍为 planned，不自动启动 |
+| 客户端偏好 | 当前完整保留；客户端配置拆分在客户端阶段处理 |
+| 默认同步 provider | TOML 保存 alias；HTTP 返回/接受 ID，读写时映射 |
+| core 发现文件 | state 目录下 `runtime/core.json` 和 `runtime/token`；不覆盖旧 daemon 的 PID、socket、发现文件 |
 
-| Aspect | Legacy knot | knot-core |
-|--------|------------|-----------|
-| Config format | TOML | JSON |
-| Config directory | `~/.config/knot/` or `$XDG_CONFIG_HOME/knot/` | `~/.config/knot-core/` or `$XDG_CONFIG_HOME/knot-core/` |
-| Config file | `config.toml` | `config.json` |
-| Keychain service (macOS) | `knot` / `knot-master-key` | `knot-core` / `knot-core-master-key` |
-| Secret Service (Linux) | `knot` / `knot-master-key` | `knot-core` / `knot-core-master-key` |
+HTTP/WS 管理接口继续使用 JSON，`schema_version` 和 `updated_at` 属于 API 元数据，不是旧 TOML 的升级要求。core 使用与旧版一致的 `config.toml.lock`，读操作依赖原子文件快照，不创建业务文件；新旧 daemon 不应同时管理同一安装。
 
-## Migration API
+未知 TOML 字段允许读取；会丢失未知字段的修改和导入会被拒绝。已有 JSON 业务配置（包括旧 `knot-core` 目录中的另一份 JSON）会被报告并保留；JSON 导入尚未实现，不影响旧 TOML 升级。
 
-knot-core provides built-in migration APIs to help transition from legacy configurations:
+## status / plan
 
-### Check Migration Status
+`GET /v1/config/migration` 返回 `source: "legacy-toml"`、`legacy_path`、`legacy_exists`、`needs_migration`、`conflict_detected` 和 `json_exists`。默认原位置 TOML 的 `needs_migration` 为 false。额外来源与已有目标共存表示可显式导入，不表示 active TOML 必须转换。
 
-```bash
-GET /v1/config/migration
+`GET /v1/config/migration/plan` 报告 `reuse` / `preserve`，说明 forwards 尚未启用、JSON 不支持和 recent 中未知 server ID 的数量。只读预览不会初始化或修复 salt、state、平台 key，也不会覆盖 trust/history。普通业务读取无需 apply。
+
+首次启动或合法旧 Linux 安装缺少 `.crypto-state` 时，正式初始化按旧 bootstrap 的候选范围验证所有密文，再固定 provider；只有旧条件确实要求切换 backend 时才重新加密。错误身份、缺失盐、锁定或损坏材料会报错并保留原数据，不尝试 machine-id-only 的弱旧派生。
+
+## 额外 TOML 导入
+
+预览：
+
+```text
+GET /v1/config/migration/plan?source_path=/absolute/path/extra.toml&mode=fail_on_conflict
 ```
 
-Returns whether a legacy configuration is detected and available for migration.
+响应除脱敏 `items` 外，还返回 `source_revision`、`target_revision` 和按资源分类的 `id_mappings`。默认策略为 `fail_on_conflict`。应用必须带预览返回的两个 revision：
 
-### Preview Migration Plan
-
-```bash
-GET /v1/config/migration/plan
-```
-
-Returns a detailed plan showing:
-- Servers to be migrated
-- Keys to be migrated
-- Proxies to be migrated
-- Conflicts with existing configuration
-- Summary of changes
-
-### Apply Migration
-
-```bash
-POST /v1/config/migration/apply
-Content-Type: application/json
-
+```json
 {
-  "mode": "skip_existing"
+  "source_path": "/absolute/path/extra.toml",
+  "mode": "skip_existing",
+  "source_revision": "<preview source hash>",
+  "target_revision": "<preview target hash>"
 }
 ```
 
-Migration modes:
-- `skip_existing`: Keep existing knot-core config, only add new items from legacy
-- `overwrite`: Replace existing items with legacy configuration
-- `fail_on_conflict`: Abort if any conflicts are detected
+发送到 `POST /v1/config/migration/apply`。`target_revision` 在目标不存在时为 `absent`。来源或目标变化返回 409 CONFLICT，原件保留；重复提交旧 revision 也返回冲突。
 
-**Note**: The API does not automatically back up your configuration. You must manually back up your configurations before applying migration (see step 1 below).
+| 策略 | 冲突行为 |
+| --- | --- |
+| fail_on_conflict | 任一 ID / alias 冲突拒绝提交 |
+| skip_existing | 保留目标对象；源引用映射到匹配的目标 ID |
+| overwrite | 更新匹配对象；alias 匹配时复用目标 ID，重映射 key/proxy/jump/default provider 引用 |
 
-## Migration Process
+ID 与 alias 分别命中不同目标对象属于歧义冲突，三种策略都拒绝。所有来源资源先解密、校验、映射，秘密用目标 provider 加密后再提交；已有目标密文保持不变。备份为 `config.toml.import.bak`，保存精确原件，然后通过锁和原子替换提交单个 TOML。解密、加密、校验、备份或替换失败不会写入半份配置。
 
-### 1. Backup Current Configuration
+额外导入只合并业务 TOML，不自动合并/复制来源 trust、recent 或平台加密材料；来源文件保持原样，`id_mappings` 明确提供引用映射。来源 SourcePath 是 core 所在机器的路径；扩展字段 `source_path`、`fingerprint`、`encrypted` 可在新 core 中保留，旧加载器忽略它们，旧版不能使用只有 SourcePath 的新 key。
 
-Before migrating, back up both your legacy and current configurations:
+有口令 OpenSSH 和传统加密 PEM 均可导入。未解锁 PEM 保留来源 type/length 作为未验证提示，fingerprint 留空，设置 `encrypted=true`；提供口令时才验证私钥内容。预览不索取或保存口令。来源默认同步 alias 不存在时，导入为空默认项并通过 plan 的 `warnings` 报告；原位置读取通过配置 metadata 的 `warnings` 报告，均不改写来源。
 
-```bash
-# Backup legacy config
-cp -r ~/.config/knot ~/.config/knot.backup
+没有 `source_path` 的旧 apply 请求保留兼容入口：原位置复用为只读返回 summary；自定义目标目录时使用发现的旧 TOML 进行即时预览并按当前 revision 提交。需要绑定用户审阅结果时使用显式来源和 revision。
 
-# Backup current knot-core config (if exists)
-cp -r ~/.config/knot-core ~/.config/knot-core.backup
-```
+## 中断与回退
 
-### 2. Review Migration Plan
+正常升级不搬移 trust/history。确需同时提交 backend 迁移的 TOML 和 crypto state 时，core 先保存 `config.toml.bootstrap.bak`，再发布仅含加密 TOML/探针的 `.bootstrap-recovery` 标记；下次启动先完成恢复。若 config 或 crypto state 已被外部编辑，恢复返回冲突，不覆盖新编辑。
 
-Use the migration API to preview what will be migrated:
+回退时先停止 core。正常读写后旧版可直接加载 TOML 和原凭据材料；需要恢复显式导入或 backend 迁移前的状态时使用对应备份并保持配套加密材料。恢复标记尚存在时，应先完成或检查该事务。
 
-```bash
-curl -H "Authorization: Bearer <token>" \
-  http://localhost:17898/v1/config/migration/plan
-```
-
-Review the plan carefully, especially:
-- Server aliases that might conflict
-- Key names and paths
-- Proxy configurations
-- Any warnings about data that cannot be automatically migrated
-
-### 3. Apply Migration
-
-Once you've reviewed the plan, apply the migration:
-
-```bash
-curl -X POST \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"mode": "skip_existing"}' \
-  http://localhost:17898/v1/config/migration/apply
-```
-
-### 4. Verify Migration
-
-After migration, verify your configuration:
-
-```bash
-curl -H "Authorization: Bearer <token>" \
-  http://localhost:17898/v1/config/servers
-```
-
-Test connections to ensure everything works as expected.
-
-## What Gets Migrated
-
-### Servers
-
-All server configurations are migrated, including:
-- Host, port, user
-- Aliases
-- Jump hosts (converted to jump_host_id references)
-- Proxy settings (converted to proxy_id references)
-- Tags
-- Authentication preferences
-
-### Keys
-
-SSH keys are migrated with:
-- Paths to private key files
-- Key types and metadata
-- Passphrases (re-encrypted with new platform provider)
-
-### Proxies
-
-Proxy configurations including:
-- SOCKS5 and HTTP proxies
-- Host, port, authentication
-
-### Secrets
-
-Encrypted secrets are:
-1. Decrypted using the legacy encryption provider
-2. Re-encrypted using the knot-core encryption provider
-3. Stored in the new format
-
-The migration handles platform-specific encryption:
-- macOS: Keychain access
-- Linux: Secret Service or machine-id fallback
-- Windows: DPAPI
-
-## What Does NOT Get Migrated
-
-The following legacy features require manual handling:
-
-### Port Forwarding Rules
-
-Legacy persistent forwarding rules are not automatically migrated. You will need to recreate them using the knot-core forwarding API once that feature is available.
-
-### Usage History
-
-The "last used" timestamps and usage history are not migrated. New usage tracking will start fresh.
-
-### Known Hosts
-
-The `known_hosts` file location may change. If you have a custom path configured, update your knot-core configuration to point to it. Otherwise, you may need to re-verify host keys on first connection.
-
-### Custom Shell Hooks
-
-If you used shell hooks for directory following or other automation, these need to be reconfigured for knot-core.
-
-## Troubleshooting
-
-### Migration Fails with Encryption Error
-
-If migration fails to decrypt legacy secrets:
-
-1. Ensure you can still access the legacy knot configuration
-2. Verify platform keychain/secret service access:
-   - macOS: Check Keychain Access.app for "knot" entries
-   - Linux: Verify Secret Service is running
-3. Try accessing legacy knot to ensure encryption is working
-4. Check logs for specific error messages
-
-### Alias Conflicts
-
-If you have conflicting aliases between legacy and knot-core:
-
-- Use `skip_existing` strategy to keep current knot-core configuration
-- Use `overwrite` strategy to prefer legacy configuration
-- Manually rename aliases before migration to avoid conflicts
-
-### Reference Resolution Errors
-
-If migration reports unresolved references (jump hosts, proxies):
-
-1. Check the migration plan for details
-2. Ensure all referenced servers and proxies exist in legacy config
-3. Migration will create new IDs for references; existing knot-core IDs are preserved when using `skip_existing`
-
-## Rolling Back
-
-If you need to roll back after migration:
-
-1. Stop knot-core
-2. Restore from backup:
-   ```bash
-   rm -rf ~/.config/knot-core
-   cp -r ~/.config/knot-core.backup ~/.config/knot-core
-   ```
-3. Restart knot-core
-
-Your legacy configuration remains untouched during migration, so you can always return to using legacy knot if needed.
-
-## Migration Limitations
-
-### Platform Credential Store Changes
-
-The migration re-encrypts secrets using the new platform provider names. This means:
-
-- macOS Keychain entries will be created with new service names
-- Linux Secret Service entries will use new attributes
-- The legacy keychain entries are not automatically cleaned up
-
-### Configuration Format Differences
-
-Some configuration options may have different names or structures in JSON format. The migration attempts to map these automatically, but review the migrated configuration for any unexpected changes.
-
-### Incomplete Feature Parity
-
-If you use legacy features not yet available in knot-core (forwarding, broadcast, sync, archive), migration will succeed but those features won't be functional until implemented in knot-core.
-
-## Best Practices
-
-1. **Test in a clean environment first**: Create a test user or VM to try migration before applying to your main configuration
-2. **Keep legacy config available**: Don't delete your legacy configuration until you've verified knot-core works for your use cases
-3. **Review the plan**: Always review the migration plan before applying
-4. **Back up both sides**: Keep backups of both legacy and knot-core configurations
-5. **Incremental migration**: Consider migrating a few servers first, verify they work, then migrate the rest
-
-## Getting Help
-
-If you encounter issues during migration:
-
-1. Check the knot-core logs for detailed error messages
-2. Review the migration plan for warnings and conflicts
-3. Consult the API documentation for manual configuration options
-4. File an issue with:
-   - Migration plan output (redact sensitive data)
-   - Error messages from logs
-   - Platform and version information
+验证包含旧实现生成的固定密文、只读文件 hash、旧加载器实际回读、真实 HTTP→SSH/SFTP 私钥认证与信任检查，以及子进程强制退出后的 bootstrap 恢复。macOS / Windows 原生凭据库互操作尚未执行；交叉构建仅证明编译通过。

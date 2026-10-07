@@ -503,3 +503,9 @@ attach WebSocket 帧方向总结：
 - 如果只需要观察状态变化，用 `/events`，不要占用 `/attach`
 - 如果已经 attach，就把 resize 和 detach 这类控制消息直接走 attach WebSocket，避免再发额外 HTTP 请求
 - 客户端应同时处理 `session.error` 事件和 attach 流中的 `type=error` 消息，这两者来源不同
+
+## 有口令私钥（B07）
+
+`allow_auth_retry=true` 时，缺少 passphrase 进入 `auth_pending`，challenge 带 `failed_method="key"` 和 `passphrase_required=true`；响应可只带 `passphrase`，默认使用当前 key_id。错误口令重新 challenge，正确口令进入真实 signer / SSH 认证。`remember` 不保存 passphrase，仅保存既有允许的 password / key_id 选择。
+
+同步 `POST /v1/sessions/exec` 可传 attempt-only `passphrase`；缺失口令结果为 `framework_code="passphrase_required"`。它不进入 exec 历史、普通 GET、事件或 TOML。SourcePath 在每次建立连接时由 core 读取；文件内容和本次口令参与 pool 身份摘要，避免复用旧身份。

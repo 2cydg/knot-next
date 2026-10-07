@@ -42,7 +42,7 @@ func (s *Service) saveCredentials(sessionID string, serverID string, resp Challe
 			return
 		}
 	}
-	// TODO: Handle passphrase saving when encrypted key support is added
+	// Passphrases are attempt-only and never persisted.
 }
 
 // publishWarning emits a sanitized, observable warning about a non-fatal

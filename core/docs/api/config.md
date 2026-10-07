@@ -40,6 +40,10 @@
 
 ### SettingsView
 
+磁盘 `default_sync_provider` 保存 alias，API 的该值继续为 ID。`recent_limit` 必须为非负整数；0 按旧配置规则归一为默认 5，不能用于关闭历史记录。
+
+磁盘默认 alias 无法匹配时，运行时视为未设置，并在 summary 的 `metadata.warnings` 和 `/v1/config/metadata` 的 `warnings` 中报告 `settings/default_sync_provider`；读取不改写磁盘。API 设置默认项时仍校验 ID 必须存在。
+
 每个普通设置字段都包装为：
 
 ```json
@@ -60,6 +64,8 @@
 ```
 
 ### ServerProfileView
+
+持久化的 `forwards` 当前不经配置 API 暴露，也不能经该 API 修改；普通 server 更新会保留原值，forwarding 引擎尚未接入。
 
 ```json
 {
@@ -93,6 +99,8 @@
 ```
 
 ### KeyMetadataView
+
+`private_key_set` 表示存在内联 private_key 或 SourcePath。新增 `fingerprint`（SHA256 公钥指纹）和 `encrypted`（SSH 私钥本身是否有口令）字段；后者与磁盘 `ENC:` 存储加密不同。普通创建/修改不能用任填 type/length 伪造 key 元数据；真实材料由 secret API 解析。
 
 ```json
 {
@@ -141,27 +149,9 @@
 
 ### Migration / MigrationPlan
 
-```json
-{
-  "legacy_path": "/path/to/knot/config.toml",
-  "legacy_exists": true,
-  "needs_migration": true,
-  "conflict_detected": false
-}
-```
+业务配置使用兼容旧 Knot 的 TOML；HTTP 保持 JSON。默认原位置 TOML 直接复用，`needs_migration=false`。`source="legacy-toml"`，`json_exists` 报告保留的另一份 JSON。plan 的 `items` 描述 reuse / preserve / conflict，不返回秘密。
 
-```json
-{
-  "migration": {},
-  "items": [
-    {
-      "resource": "servers/srv_prod/password",
-      "action": "migrate",
-      "reason": "secret exists in legacy config"
-    }
-  ]
-}
-```
+显式额外来源预览返回 `source_revision`、`target_revision` 和 `id_mappings`；详情见 [旧配置复用与导入](../migration.md)。
 
 ## HTTP 接口
 
@@ -226,33 +216,32 @@
 - `migration`
 - `updated_at`
 
+`warnings`（可选）包含读取兼容性警告，每条使用 `resource`、`field`、`message` 描述。
+
 ### GET `/v1/config/migration`
 
-返回迁移状态。
+返回原位置复用 / 额外来源状态。默认 TOML 用户无需 apply。未知 TOML 字段允许读取，但会丢字段的修改被拒绝。
 
 ### GET `/v1/config/migration/plan`
 
-返回迁移计划。
+无参数报告 active TOML 的复用和保留范围。额外 TOML 使用 `?source_path=/absolute/path/extra.toml&mode=fail_on_conflict`，返回脱敏计划、两端 hash revision 和 ID 映射；预览不写文件或初始化 crypto。JSON 来源明确拒绝。
 
 ### POST `/v1/config/migration/apply`
 
-执行迁移。
-
-请求体：
+显式导入请求：
 
 ```json
 {
-  "mode": "skip_existing"
+  "source_path": "/absolute/path/extra.toml",
+  "mode": "fail_on_conflict",
+  "source_revision": "<preview source hash>",
+  "target_revision": "<preview target hash>"
 }
 ```
 
-支持值：
+默认 `fail_on_conflict`；`skip_existing` 保留匹配目标，`overwrite` 更新匹配目标。alias 冲突复用目标 ID 并重映射引用；ID/alias 命中不同对象的歧义拒绝。revision 变化、重复旧 apply 返回 409。目标先备份为 `config.toml.import.bak` 再原子替换，来源和附属 trust/recent/material 不被改写。返回 config summary。
 
-- `skip_existing`
-- `overwrite`
-- `fail_on_conflict`
-
-返回迁移后的 config summary。
+没有 `source_path` 的旧请求保留兼容入口：默认原位置复用只返回 summary，自定义目标使用发现的旧 TOML。需要绑定已审阅预览时必须显式传 source/revision。
 
 ### Settings
 

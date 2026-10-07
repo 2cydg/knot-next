@@ -1,6 +1,7 @@
 package crypto
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"knot-core/internal/fileutil"
 	"knot-core/internal/paths"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -115,14 +117,11 @@ func (p *LocalProvider) Encrypt(plaintext []byte) ([]byte, error) {
 	out := make([]byte, 0, len(nonce)+len(plaintext)+gcm.Overhead())
 	out = append(out, nonce...)
 	out = gcm.Seal(out, nonce, plaintext, nil)
-	return []byte(base64.StdEncoding.EncodeToString(out)), nil
+	return out, nil
 }
 
 func (p *LocalProvider) Decrypt(ciphertext []byte) ([]byte, error) {
-	raw, err := base64.StdEncoding.DecodeString(string(ciphertext))
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrDecryptionFailed, err)
-	}
+	raw := ciphertext
 	block, err := aes.NewCipher(p.key)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrDecryptionFailed, err)
@@ -188,8 +187,7 @@ type KeyProvider struct {
 }
 
 func NewKeyProvider(name string, key []byte, limitations []string) *KeyProvider {
-	sum := sha256.Sum256(key)
-	return &KeyProvider{name: name, key: sum[:], limitations: append([]string(nil), limitations...)}
+	return &KeyProvider{name: name, key: append([]byte(nil), key...), limitations: append([]string(nil), limitations...)}
 }
 
 func (p *KeyProvider) Name() string {
@@ -217,32 +215,57 @@ func DeriveKey(material string, salt []byte) []byte {
 }
 
 func GetSalt(layout paths.Layout) ([]byte, error) {
-	if layout.ConfigDir == "" {
-		return nil, errors.New("config directory is required")
-	}
-	if err := os.MkdirAll(layout.ConfigDir, 0o700); err != nil {
+	configDir := layout.ConfigDir
+	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(layout.ConfigDir, saltFile)
-	if salt, err := os.ReadFile(path); err == nil {
-		if len(salt) != saltLength {
-			return nil, fmt.Errorf("invalid crypto salt length: %d", len(salt))
-		}
-		return salt, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
+
+	saltPath := filepath.Join(configDir, saltFile)
+
 	salt := make([]byte, saltLength)
 	if _, err := io.ReadFull(rand.Reader, salt); err != nil {
 		return nil, err
 	}
-	if err := atomicWriteFile(path, salt, 0o600); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return os.ReadFile(path)
-		}
+
+	if err := createSaltFile(saltPath, salt); err == nil {
+		return salt, nil
+	} else if !os.IsExist(err) {
 		return nil, err
 	}
-	return salt, nil
+
+	existing, err := os.ReadFile(saltPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(existing) != saltLength {
+		return nil, fmt.Errorf("invalid salt length: %d", len(existing))
+	}
+	return existing, nil
+}
+
+func createSaltFile(saltPath string, salt []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(saltPath), saltFile+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := f.Name()
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+
+	if _, err := f.Write(salt); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+
+	return os.Link(tmpPath, saltPath)
 }
 
 type State struct {
@@ -284,12 +307,21 @@ func PersistState(layout paths.Layout, provider Provider) error {
 	if err != nil {
 		return err
 	}
-	raw, err := json.MarshalIndent(state, "", "  ")
+	raw, err := MarshalState(state)
 	if err != nil {
 		return err
 	}
-	raw = append(raw, '\n')
 	return atomicWriteFile(filepath.Join(layout.ConfigDir, cryptoStateFile), raw, 0o600)
+}
+
+// MarshalState preserves the legacy state file's indentation and final newline.
+// Bootstrap stages these bytes in its transaction instead of persisting early.
+func MarshalState(state *State) ([]byte, error) {
+	raw, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(raw, '\n'), nil
 }
 
 func NewState(provider Provider) (*State, error) {
@@ -306,7 +338,7 @@ func NewState(provider Provider) (*State, error) {
 	return &State{
 		Version:         cryptoStateVersion,
 		Provider:        provider.Name(),
-		ProbeCiphertext: string(ciphertext),
+		ProbeCiphertext: base64.StdEncoding.EncodeToString(ciphertext),
 		ProbeHash:       hex.EncodeToString(sum[:]),
 		CreatedAt:       now,
 		UpdatedAt:       now,
@@ -317,7 +349,11 @@ func ValidateState(state *State, provider Provider) error {
 	if state.Provider != provider.Name() {
 		return fmt.Errorf("crypto provider state is %q, got %q", state.Provider, provider.Name())
 	}
-	plaintext, err := provider.Decrypt([]byte(state.ProbeCiphertext))
+	raw, err := base64.StdEncoding.DecodeString(state.ProbeCiphertext)
+	if err != nil {
+		return ErrDecryptionFailed
+	}
+	plaintext, err := provider.Decrypt(raw)
 	if err != nil {
 		return fmt.Errorf("crypto state probe decrypt failed: %w", err)
 	}
@@ -328,29 +364,29 @@ func ValidateState(state *State, provider Provider) error {
 	return nil
 }
 
+// NewDefaultProvider is the explicit initializing path used by daemon startup.
 func NewDefaultProvider(layout paths.Layout) (Provider, error) {
-	state, err := LoadState(layout)
-	if err != nil {
-		return nil, err
-	}
-	if state != nil {
-		provider, err := providerForState(layout, state.Provider)
-		if err != nil {
-			return nil, err
+	return openPlatformProvider(layout, true)
+}
+
+// OpenExistingProvider never creates or repairs salt, state, or platform keys.
+// Migration preview and inspection must use this path.
+func OpenExistingProvider(layout paths.Layout) (Provider, error) {
+	return openPlatformProvider(layout, false)
+}
+
+func readSalt(layout paths.Layout, initialize bool) ([]byte, error) {
+	raw, err := os.ReadFile(filepath.Join(layout.ConfigDir, saltFile))
+	if err == nil {
+		if len(raw) != saltLength {
+			return nil, fmt.Errorf("invalid crypto salt length")
 		}
-		if err := ValidateState(state, provider); err != nil {
-			return nil, err
-		}
-		return provider, nil
+		return raw, nil
 	}
-	provider, err := selectDefaultProvider(layout)
-	if err != nil {
+	if !errors.Is(err, os.ErrNotExist) || !initialize {
 		return nil, err
 	}
-	if err := PersistState(layout, provider); err != nil {
-		return nil, err
-	}
-	return provider, nil
+	return GetSalt(layout)
 }
 
 func localKeyPath(layout paths.Layout) string {
@@ -373,14 +409,11 @@ func encryptWithKey(plaintext []byte, key []byte) ([]byte, error) {
 	out := make([]byte, 0, len(nonce)+len(plaintext)+gcm.Overhead())
 	out = append(out, nonce...)
 	out = gcm.Seal(out, nonce, plaintext, nil)
-	return []byte(base64.StdEncoding.EncodeToString(out)), nil
+	return out, nil
 }
 
 func decryptWithKey(ciphertext []byte, key []byte) ([]byte, error) {
-	raw, err := base64.StdEncoding.DecodeString(string(ciphertext))
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrDecryptionFailed, err)
-	}
+	raw := ciphertext
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrDecryptionFailed, err)
@@ -402,43 +435,22 @@ func decryptWithKey(ciphertext []byte, key []byte) ([]byte, error) {
 }
 
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+	return fileutil.AtomicWriteFile(path, data, perm)
+}
+
+// Legacy provider identifiers and primitives retain the original raw-byte contract.
+const (
+	ProviderLinuxSecretService = ProviderLinuxSecret
+	ProviderLinuxMachineID     = ProviderLinuxMachine
+)
+
+func EncryptWithKey(plaintext, key []byte) ([]byte, error)  { return encryptWithKey(plaintext, key) }
+func DecryptWithKey(ciphertext, key []byte) ([]byte, error) { return decryptWithKey(ciphertext, key) }
+
+func allowSaltInitialization(layout paths.Layout, initialize bool) bool {
+	if !initialize {
+		return false
 	}
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return err
-	}
-	cleanup = false
-	if dirFile, err := os.Open(dir); err == nil {
-		_ = dirFile.Sync()
-		_ = dirFile.Close()
-	}
-	return nil
+	raw, err := os.ReadFile(filepath.Join(layout.ConfigDir, "config.toml"))
+	return errors.Is(err, os.ErrNotExist) || err == nil && !bytes.Contains(raw, []byte("ENC:"))
 }

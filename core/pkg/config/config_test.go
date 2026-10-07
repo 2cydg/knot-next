@@ -97,7 +97,7 @@ func TestMigrationPlanAndApplyLegacyConfig(t *testing.T) {
 	}
 	legacy := `
 [settings]
-default_sync_provider = "sync_legacy"
+default_sync_provider = "cloud"
 
 [servers.srv_legacy]
 id = "srv_legacy"
@@ -119,6 +119,9 @@ password = "ENC:` + mustLegacyEncodedSecret(t, layout, "old") + `"
 		t.Fatalf("write legacy: %v", err)
 	}
 	svc := NewService(layout, crypto.NewStaticProvider([]byte("test-key")))
+	svc.importProvider = func(l paths.Layout) (crypto.Provider, error) {
+		return crypto.NewLocalProvider(filepath.Join(l.ConfigDir, "secret.key"))
+	}
 	plan := svc.MigrationPlan()
 	if len(plan.Items) == 0 || plan.Migration.ConflictDetected {
 		t.Fatalf("unexpected plan: %+v", plan)
@@ -169,14 +172,15 @@ password = "ENC:` + base64.StdEncoding.EncodeToString(legacyCipher) + `"
 
 	currentProvider := crypto.NewStaticProvider([]byte("current-key"))
 	svc := NewService(layout, currentProvider)
+	svc.importProvider = func(l paths.Layout) (crypto.Provider, error) { return legacyProvider, nil }
 	if _, err := svc.ApplyMigration("skip_existing"); err != nil {
 		t.Fatalf("apply migration: %v", err)
 	}
-	raw, err := os.ReadFile(filepath.Join(layout.ConfigDir, "config.json"))
+	raw, err := os.ReadFile(filepath.Join(layout.ConfigDir, "config.toml"))
 	if err != nil {
 		t.Fatalf("read migrated config: %v", err)
 	}
-	if !bytes.Contains(raw, []byte(`"password": "ENC:`)) {
+	if !bytes.Contains(raw, []byte(`password = "ENC:`)) {
 		t.Fatalf("migrated config missing encrypted password: %s", raw)
 	}
 	if bytes.Contains(raw, []byte("legacy-secret")) {
@@ -223,8 +227,8 @@ auth_method = "agent"
 	if !plan.Migration.ConflictDetected {
 		t.Fatalf("conflict signal lost: %+v", plan)
 	}
-	if !migrationPlanHasItem(plan.Items, "config", "info") {
-		t.Fatalf("current config conflict info item missing: %+v", plan.Items)
+	if plan.SourceRevision == "" || plan.TargetRevision == "" {
+		t.Fatal("preview missing revisions")
 	}
 }
 

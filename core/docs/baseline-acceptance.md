@@ -287,3 +287,30 @@ R-1 采用报告建议 (b)：继续跟踪真实收尾，未采用超时提前归
 - 四个 Go overlay 独立恢复旧压缩、去掉 prefix once、去掉 deferred release、去掉 nil 检查，对应回归均以退出码 1 确定失败。工件 `/tmp/knot-b06-followup-{n1,n2-once,n2-defer,n3}.{json,go}`，未修改工作区生产源码。
 - `go vet ./...`、`git diff --check`、六目标 `CGO_ENABLED=0 go build ./cmd/core` 通过。产物 `/tmp/knot-b06-followup-core-{linux,darwin,windows}-{amd64,arm64}`，Windows 带 `.exe`；Windows/macOS 原生运行及外部 SSH smoke 未执行。
 - `BenchmarkHistoryWithinCapacity` 的 4096 条未超限历史约 14.9 µs/op、0 B/op、0 allocs/op。容量压力分支有意复制存活项以保留输入；benchmark 仅测 policy 的未超限扫描，不作为服务整体吞吐或零分配声明。
+
+## B07 / B08：旧 TOML、加密和私钥 / 导入
+
+2026-10-07 已实现：默认原位置 TOML 与旧 ENC/provider 复用、完整兼容字段保留、secret/API 分离、真实私钥元数据、attempt-only passphrase 贯通 SSH/SFTP/exec、SourcePath/cache 失效，以及额外 TOML 三策略导入、引用映射、revision/备份/原子替换和必要 bootstrap 恢复。公开行为见 [migration](migration.md)、[config](api/config.md)、[secrets](api/secrets.md)。
+
+新增固定 fixture 由旧 Knot `e0b4d51eea6647e192371059381039b99fb301a2` 的 `Config.SaveToPath` / `EncryptWithKey` / `DeriveKey` / `NewState` 一次生成，测试读取提交的原密文。人工 key/身份与预期明文 hash 在 `pkg/config/testdata/legacy/README.md`；独立执行旧 `Config.LoadFromPath` 回读新 core 修改后的 TOML 成功。
+
+验证包含读取/GET/status/plan/已有 provider 启动的文件集合与 hash 不变，forwards/客户端偏好/同步默认 alias 写回，未知字段拒绝有损写入，故障原件保持与跨 Service 并发 CRUD；三种导入策略、ID/alias 歧义与引用映射、两端 revision 冲突、重复 apply 和备份失败；bootstrap 子进程强制 kill 后恢复；真实 HTTP→SSH/SFTP 的缺/错/对口令、exec、SourcePath 替换/丢失、hashed/non-default-port/explicit trust 与变更 host key strict 拒绝。
+
+Linux amd64、Go 1.27.1，使用 `GOWORK=off GOCACHE=/tmp/knot-plan-20261006-go-build`：
+
+```bash
+go test -count=1 -timeout=180s ./...
+go test -race -count=1 -timeout=180s \
+  ./pkg/config ./pkg/crypto ./pkg/session ./pkg/sftp ./pkg/sshpool \
+  ./internal/api/http ./tests/integration
+
+go test -race -count=5 -timeout=180s \
+  -run 'Test(Legacy|Import|Explicit|EncryptedPrivate|PrivateKey|Passphrase|Bootstrap|ExistingLinux|PinnedLinux|UnknownTOML|ConfigFailures|ConcurrentTOML|ReferencedDeletion)' \
+  ./pkg/config ./pkg/crypto ./tests/integration
+
+go vet ./...
+```
+
+完整测试通过，受影响包一次完整 race 及新增用例五次 race 通过，无 race 报告；最终 metadata/presence/SourcePath/已有 provider 启动只读/recent_limit 默认值与整数校验检查另跑 config/crypto/paths race，通过。`git diff --check` 和 Linux/macOS/Windows × amd64/arm64 的六目标 `CGO_ENABLED=0 go build ./cmd/core` 通过。日志在 `/tmp/knot-b07-b08-{delivery-all,race,final-race,followup-race}.log`，构建产物在 `/tmp/knot-b07-b08-core-*`。
+
+按本轮用户许可，macOS Keychain / Windows DPAPI 原生同账号互操作未运行；交叉构建不替代 B10/B12 平台验收。JSON 显式导入未实现，明确拒绝且保留来源。原 state.json/ID/trust 已复用；recent 成功回调在 B09 接入，额外 TOML 导入不自动搬移或合并历史和信任。SourcePath/fingerprint/encrypted 扩展可由新 core 保存，旧 loader 忽略字段，旧版不能使用 SourcePath-only key。forwards 仍 planned，客户端偏好未提前拆分。无新增依赖，旧项目未修改，未 Git 提交。

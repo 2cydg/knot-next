@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"knot-core/internal/keyutil"
 	"knot-core/internal/resourcepolicy"
 	"knot-core/pkg/config"
 	"knot-core/pkg/sshpool"
@@ -247,6 +248,7 @@ type CWDNotify struct {
 }
 
 type ExecRequest struct {
+	Passphrase    string `json:"passphrase,omitempty"`
 	ServerRef     string `json:"server_ref"`
 	Command       string `json:"command"`
 	TimeoutMS     int64  `json:"timeout_ms,omitempty"`
@@ -277,20 +279,21 @@ type ControlRequest struct {
 }
 
 type Challenge struct {
-	SessionID      string    `json:"session_id"`
-	Type           string    `json:"type"`
-	Pending        bool      `json:"pending"`
-	Prompt         string    `json:"prompt,omitempty"`
-	Fingerprint    string    `json:"fingerprint,omitempty"`
-	Host           string    `json:"host,omitempty"`
-	KeyType        string    `json:"key_type,omitempty"`
-	Risk           string    `json:"risk,omitempty"`
-	ServerAlias    string    `json:"server_alias,omitempty"`
-	FailedMethod   string    `json:"failed_method,omitempty"`
-	AllowedMethods []string  `json:"allowed_methods,omitempty"`
-	RetryCount     int       `json:"retry_count,omitempty"`
-	CreatedAt      time.Time `json:"created_at,omitempty"`
-	UpdatedAt      time.Time `json:"updated_at,omitempty"`
+	PassphraseRequired bool      `json:"passphrase_required,omitempty"`
+	SessionID          string    `json:"session_id"`
+	Type               string    `json:"type"`
+	Pending            bool      `json:"pending"`
+	Prompt             string    `json:"prompt,omitempty"`
+	Fingerprint        string    `json:"fingerprint,omitempty"`
+	Host               string    `json:"host,omitempty"`
+	KeyType            string    `json:"key_type,omitempty"`
+	Risk               string    `json:"risk,omitempty"`
+	ServerAlias        string    `json:"server_alias,omitempty"`
+	FailedMethod       string    `json:"failed_method,omitempty"`
+	AllowedMethods     []string  `json:"allowed_methods,omitempty"`
+	RetryCount         int       `json:"retry_count,omitempty"`
+	CreatedAt          time.Time `json:"created_at,omitempty"`
+	UpdatedAt          time.Time `json:"updated_at,omitempty"`
 }
 
 type ChallengeResponse struct {
@@ -1275,16 +1278,17 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 	now := s.policy.Now().UTC()
 	challenge := &pendingChallenge{
 		Challenge: Challenge{
-			SessionID:      sessionID,
-			Type:           "auth",
-			Pending:        true,
-			Prompt:         "authentication failed, provide new credentials to retry",
-			ServerAlias:    server.Alias,
-			FailedMethod:   failedMethod,
-			AllowedMethods: cloneStrings(allowedMethods),
-			RetryCount:     retryCount,
-			CreatedAt:      now,
-			UpdatedAt:      now,
+			SessionID:          sessionID,
+			Type:               "auth",
+			Pending:            true,
+			Prompt:             "authentication failed, provide new credentials to retry",
+			ServerAlias:        server.Alias,
+			FailedMethod:       failedMethod,
+			PassphraseRequired: errors.Is(err, keyutil.ErrPassphraseRequired),
+			AllowedMethods:     cloneStrings(allowedMethods),
+			RetryCount:         retryCount,
+			CreatedAt:          now,
+			UpdatedAt:          now,
 		},
 		response: make(chan ChallengeResponse, 1),
 	}
@@ -1329,6 +1333,7 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 		if session, ok := s.sessions[sessionID]; ok {
 			if resp.Remember {
 				candidate := resp
+				candidate.Passphrase = ""
 				session.pendingCredentials = &candidate
 			} else {
 				session.pendingCredentials = nil
@@ -1367,7 +1372,19 @@ func (s *Service) runtimeConfigForAuthResponse(cfg config.RuntimeConfig, server 
 		// Note: Do NOT save here - wait for authentication success
 	}
 
-	if resp.Password == "" && resp.KeyID == "" {
+	if resp.Passphrase != "" {
+		if profile.KeyID == "" {
+			return cfg, fmt.Errorf("%w: passphrase requires a key", ErrValidation)
+		}
+		key, ok := next.Keys[profile.KeyID]
+		if !ok {
+			return cfg, ErrNotFound
+		}
+		key.Passphrase = resp.Passphrase
+		next.Keys[profile.KeyID] = key
+		profile.AuthMethod = config.AuthMethodKey
+	}
+	if resp.Password == "" && resp.KeyID == "" && resp.Passphrase == "" {
 		profile.AuthMethod = config.AuthMethodAgent
 	}
 
@@ -1969,6 +1986,9 @@ func runtimeSecrets(cfg config.RuntimeConfig) []string {
 		}
 	}
 	for _, key := range cfg.Keys {
+		if key.Passphrase != "" {
+			out = append(out, key.Passphrase)
+		}
 		if key.PrivateKey != "" {
 			out = append(out, key.PrivateKey)
 		}

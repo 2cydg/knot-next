@@ -522,3 +522,7 @@ query：
 Transfer 最多 4096 个 queued/running/待收尾 worker。终态结果从 `completed_at` 起保留 10 分钟、最多 4096 条；容量压力可提前裁剪最旧已收尾任务。运行中的任务不会因 TTL 或数量裁剪。关闭 session 会先取消任务、释放 backend/follower；任务最终结果仍通过原 session ID + transfer ID 单项 GET 查询。单项 GET 的保留窗口独立于 session 历史，列表和重新订阅则要求所属 session 仍可查询。
 
 连接取得时通过 lease 一并持有整条链路的引用，由实际 backend/worker owner 幂等释放，释放绑定原条目而不是可复用的 pool key。连接断开由每个 SFTP client 自行观察，不依赖事件通知是否送达。关闭单个 SFTP session 不主动关闭共享 SSH transport，其他 subsystem 可继续使用；整个 SSH transport 断开时，关联 session 分别收尾。Shutdown 停止新建、并行关闭资源并等待实际 worker/清理 loop，超出预算返回错误，不把 `state=closed` 当作已完全释放。
+
+## 有口令私钥（B07）
+
+SFTP 与 SSH 使用相同的 signer 构建和 attempt-only passphrase。`allow_auth_retry=true` 时，`GET /v1/sftp/{id}/challenges/auth` 的 `passphrase_required=true` 表示需要私钥口令；POST 到该地址可只传 `passphrase`。错误口令再次 challenge，正确口令完成 SSH 认证及 subsystem 打开后进入 open。`remember` 不持久化 passphrase。
