@@ -253,9 +253,12 @@ func mergeResources[T any](source, target map[string]T, mode, resource string, i
 	for id, v := range target {
 		out[id] = v
 		_, alias := identity(v)
-		aliases[alias] = id
+		if alias != "" && (aliases[alias] == "" || id < aliases[alias]) {
+			aliases[alias] = id
+		}
 	}
 	mapping := map[string]string{}
+	reserved := map[string]string{}
 	items := []MigrationItem{}
 	ids := make([]string, 0, len(source))
 	for id := range source {
@@ -286,6 +289,11 @@ func mergeResources[T any](source, target map[string]T, mode, resource string, i
 				action = "conflict"
 			}
 		}
+		if previous, exists := reserved[targetID]; exists {
+			items = append(items, MigrationItem{Resource: resource + "/" + id, Action: "conflict", Reason: "destination is already reserved by source " + previous})
+			continue
+		}
+		reserved[targetID] = id
 		mapping[id] = targetID
 		if action == "create" || action == "overwrite" {
 			out[targetID] = setID(v, targetID)

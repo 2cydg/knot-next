@@ -46,3 +46,17 @@ func AfterFunc(ctx context.Context, fn func()) func() bool {
 		return false
 	}
 }
+
+// WithGroup tracks helper workers in a service group and preserves the caller's
+// ownership callback, including late cleanup after the public operation ends.
+func WithGroup(ctx context.Context, group *Group) context.Context {
+	parent, _ := ctx.Value(workKey{}).(func() func())
+	return WithWork(ctx, func() func() {
+		finish := func() {}
+		if parent != nil {
+			finish = parent()
+		}
+		group.Add()
+		return func() { group.Done(); finish() }
+	})
+}

@@ -146,12 +146,12 @@
 
 默认路径规则：
 
-- `config_dir = os.UserConfigDir()/knot-core`
-- `state_dir = XDG_STATE_HOME/knot-core`，若未设置则在 Linux 使用 `~/.local/state/knot-core`
-- Windows 的 `state_dir` 使用 `%LOCALAPPDATA%\\knot-core`
-- macOS 的 `config_dir` 与 `state_dir` 都位于 `~/Library/Application Support/knot-core`
+- 所有平台沿用旧 Knot 路径：`config_dir = {XDG_CONFIG_HOME}/knot`，未设置时为 `~/.config/knot`。
+- `state_dir = {XDG_STATE_HOME}/knot`，未设置时为 `~/.local/state/knot`。
 - `runtime_file = {state_dir}/runtime/core.json`
-- `token_file = {config_dir}/token`
+- `token_file = {state_dir}/runtime/token`
+- `config_file = {config_dir}/config.toml`
+- 显式启动参数可覆盖目录；客户端读取实际 runtime 内的 `token_path`，不猜测平台目录。
 
 推荐的首次连接顺序：
 
@@ -268,3 +268,7 @@ HTTP 错误统一返回：
 - 需要交互字节流或持续事件订阅时使用 WebSocket
 - 处理写操作时，客户端应同时根据 HTTP 状态码和错误 envelope 的 `error.code` 做分支
 - 配置与 secret 必须分开处理，不要尝试通过 config endpoint 直接提交 secret 明文
+
+### 基线客户端交接
+
+可运行的公开 API 工作流见 [示例说明](../../examples/baseline/README.md)；正式客户端接入见 [CLI 交接清单](../cli-handoff.md)。HTTP JSON 请求最多 1 MiB，严格拒绝未知字段、超限及多对象；WS 完整数据消息最多 1 MiB，支持 continuation 和片间控制帧，所有发送最多等待 5 秒。

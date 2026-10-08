@@ -239,7 +239,7 @@
 }
 ```
 
-默认 `fail_on_conflict`；`skip_existing` 保留匹配目标，`overwrite` 更新匹配目标。alias 冲突复用目标 ID 并重映射引用；ID/alias 命中不同对象的歧义拒绝。revision 变化、重复旧 apply 返回 409。目标先备份为 `config.toml.import.bak` 再原子替换，来源和附属 trust/recent/material 不被改写。返回 config summary。
+同一来源的多个对象映射到同一目标时，所有策略（含 `skip_existing`）均整体返回 409；需先消除来源映射冲突。默认 `fail_on_conflict`；`skip_existing` 保留匹配目标，`overwrite` 更新匹配目标。alias 冲突复用目标 ID 并重映射引用；ID/alias 命中不同对象的歧义拒绝。revision 变化、重复旧 apply 返回 409。目标先备份为 `config.toml.import.bak` 再原子替换，来源和附属 trust/recent/material 不被改写。返回 config summary。
 
 没有 `source_path` 的旧请求保留兼容入口：默认原位置复用只返回 summary，自定义目标使用发现的旧 TOML。需要绑定已审阅预览时必须显式传 source/revision。
 
@@ -495,3 +495,5 @@ query 说明：
 隔离先以 `O_CREATE|O_EXCL` 创建空占位文件，再 rename 原件；进程若在两步之间终止，可能留下空的 `.corrupt.N` 并占用一个备份位，损坏原件仍在 `state.json`。此类空位也不自动清理；确认并保存所需证据后可手动移走或删除以释放位置。
 
 `default_sftp_local_path` 等客户端偏好保持旧字段兼容，core 不据此改变本地进程 cwd。独立客户端配置在 CLI 阶段承接。
+
+`log_level` 是启动配置，修改后需重启 core 才生效；关键生命周期和失败诊断仍保留。

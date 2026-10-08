@@ -101,3 +101,7 @@ DELETE `/v1/sftp/{id}/transfers/{transfer_id}` 返回取消时的快照，取消
 session 终态关闭订阅并清空映射，保留的 session events 可再次读取终态快照后结束。全局事件总线在 core shutdown 时关闭。慢消费者不会阻塞业务锁，事件和回调是通知，最终状态以 GET 为准。
 
 服务内部回调在业务锁外通过有界队列串行调用，panic 不会阻断其他通知。每个 dispatcher 最多一个观察者调用与 256 条待处理通知，队列满时可丢通知。Shutdown 丢弃待处理的服务和连接池回调，不等待调用者提供的当前回调，以允许回调自己查询/关闭服务；这一边界不影响对业务 worker、pool ref、连接、follow 和清理 loop 的等待。
+
+## WebSocket 消息和资源期限
+
+支持合法 binary/text continuation 与片间 ping/pong。每个完整消息累计最多 1 MiB，控制帧必须 FIN 且最多 125 字节；text/close reason 必须有效 UTF-8。握手只接受版本 13 和 16 字节 nonce。协议错误发送 1002，消息或单帧过大发送 1009 后关闭。所有发送均在连接级串行并设置 5 秒期限，失败关闭连接；客户端自身也应设置期限。warning 的脱敏 kind/message 同时保留在全局事件。

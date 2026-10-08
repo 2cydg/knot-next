@@ -12,37 +12,20 @@ import (
 // connection itself, and a failure leaves the working connection untouched: the
 // client learns about it through a sanitized warning instead.
 func (s *Service) saveCredentials(sessionID string, serverID string, resp ChallengeResponse) {
-	if resp.Password != "" {
-		if _, err := s.config.SetServerPassword(serverID, resp.Password); err != nil {
-			s.publishWarning(sessionID, WarningCredentialSaveFailed, "password was not saved")
-			return
-		}
+	if serverID == "" || (resp.Password == "" && resp.KeyID == "") {
 		return
 	}
-	if resp.KeyID != "" {
-		// For KeyID, we need to update the server profile
-		cfg, err := s.config.RuntimeConfig()
-		if err != nil {
-			s.publishWarning(sessionID, WarningCredentialSaveFailed, "key was not saved")
-			return
-		}
-
-		server, ok := cfg.Servers[serverID]
-		if !ok {
-			return
-		}
-
-		profile := server
-		profile.AuthMethod = config.AuthMethodKey
-		profile.KeyID = resp.KeyID
-		profile.Password = "" // Clear password when switching to key
-
-		if _, err := s.config.UpdateServer(serverID, profile); err != nil {
-			s.publishWarning(sessionID, WarningCredentialSaveFailed, "key was not saved")
-			return
-		}
+	choice := config.AuthChoice{}
+	label := "authentication choice"
+	switch {
+	case resp.KeyID != "":
+		choice.Method, choice.KeyID, label = config.AuthMethodKey, resp.KeyID, "key"
+	case resp.Password != "":
+		choice.Method, choice.Password, label = config.AuthMethodPassword, resp.Password, "password"
 	}
-	// Passphrases are attempt-only and never persisted.
+	if err := s.config.RememberServerAuth(serverID, choice); err != nil {
+		s.publishWarning(sessionID, WarningCredentialSaveFailed, label+" was not saved")
+	}
 }
 
 // publishWarning emits a sanitized, observable warning about a non-fatal

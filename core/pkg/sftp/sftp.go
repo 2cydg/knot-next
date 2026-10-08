@@ -43,8 +43,7 @@ const (
 
 type configProvider interface {
 	RuntimeConfig() (config.RuntimeConfig, error)
-	SetServerPassword(id string, password string) (config.ServerProfileView, error)
-	UpdateServer(id string, server config.ServerProfile) (config.ServerProfileView, error)
+	RememberServerAuth(id string, choice config.AuthChoice) error
 }
 
 type sessionProvider interface {
@@ -955,7 +954,7 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 			// The session may have been closed while the challenge was pending; a
 			// terminal one must not take a new candidate that a later attempt
 			// could still persist.
-			if resp.Remember {
+			if resp.Remember && (resp.Password != "" || resp.KeyID != "") {
 				candidate := resp
 				candidate.Passphrase = ""
 				res.pendingCredentials = &candidate
@@ -1166,38 +1165,6 @@ func isTerminalSessionState(state string) bool {
 	return state == "closed" || state == "failed" || state == "disconnected"
 }
 
-// saveCredentials persists a verified credential candidate after the SFTP
-// subsystem opened. It runs off the request path, and a failure never disturbs
-// the working connection: the client is told through a sanitized warning.
-func (s *Service) saveCredentials(sessionID string, serverID string, resp ChallengeResponse) {
-	if serverID == "" {
-		return
-	}
-	if resp.Password != "" {
-		if _, err := s.config.SetServerPassword(serverID, resp.Password); err != nil {
-			s.publishWarning(sessionID, session.WarningCredentialSaveFailed, "password was not saved")
-		}
-		return
-	}
-	if resp.KeyID != "" {
-		cfg, err := s.config.RuntimeConfig()
-		if err != nil {
-			s.publishWarning(sessionID, session.WarningCredentialSaveFailed, "key was not saved")
-			return
-		}
-		profile, ok := cfg.Servers[serverID]
-		if !ok {
-			return
-		}
-		profile.AuthMethod = config.AuthMethodKey
-		profile.KeyID = resp.KeyID
-		profile.Password = ""
-		if _, err := s.config.UpdateServer(serverID, profile); err != nil {
-			s.publishWarning(sessionID, session.WarningCredentialSaveFailed, "key was not saved")
-		}
-	}
-}
-
 // publishWarning emits a sanitized, observable warning about a non-fatal
 // condition. Secrets handed to it are removed from the message first, so a
 // config-writer error that echoes a credential cannot leak it.
@@ -1341,6 +1308,7 @@ func (s *Service) closeSessionLocked(res *resource, state string, cause string, 
 	s.cancelSessionTransfersLocked(res.ID)
 	client := res.client
 	res.client = nil
+	res.cache.Close()
 	res.cache = nil
 	poolKeys := res.poolKeys
 	res.poolKeys = nil
@@ -1603,15 +1571,10 @@ func (s *Service) Mkdir(id string, remotePath string, recursive bool) (Entry, er
 		return Entry{}, err
 	}
 	if res.client != nil {
-		if recursive {
-			err = res.client.MkdirAll(clean)
-		} else {
-			err = res.client.Mkdir(clean)
-		}
+		err = mkdirRemote(res, clean, recursive)
 		if err != nil {
 			return Entry{}, err
 		}
-		res.cache.Invalidate(clean, path.Dir(clean))
 		return s.Stat(id, clean)
 	}
 	local, _, err := s.resolve(id, clean)
@@ -2355,25 +2318,55 @@ func (s *Service) executeLocalUploadPlan(ctx context.Context, res *backendView, 
 			}
 			return "", err
 		}
-		if err := s.copyWithProgress(ctx, work, file.target, src, dst, file.size, 0); err != nil {
-			_ = src.Close()
-			_ = dst.Close()
+		copyErr := s.copyWithProgress(ctx, work, file.target, src, dst, file.size, 0)
+		_ = src.Close()
+		if err := errors.Join(copyErr, dst.Close()); err != nil {
 			return "", err
 		}
-		_ = src.Close()
-		_ = dst.Close()
 		work.FilesDone++
 		s.publishWorkerProgress(work)
 	}
 	return "completed", nil
 }
 
+// mkdirRemote invalidates every directory a recursive mutation can touch, both
+// before the request and after completion (including partial failure).
+func mkdirRemote(res *backendView, target string, recursive bool) error {
+	invalidate := func() {
+		if res.cache == nil {
+			return
+		}
+		for dir := path.Clean(target); ; dir = path.Dir(dir) {
+			res.cache.Invalidate(dir, path.Dir(dir))
+			if !recursive || dir == "/" || dir == "." {
+				break
+			}
+		}
+	}
+	invalidate()
+	defer invalidate()
+	if recursive {
+		return res.client.MkdirAll(target)
+	}
+	return res.client.Mkdir(target)
+}
+
 func (s *Service) executeRemoteUploadPlan(ctx context.Context, res *backendView, work *transferWork, plan transferPlan, overwrite bool) (string, error) {
+	// Invalidate before and after each attempted mutation, including partial
+	// failures, so in-flight reads cannot repopulate stale child listings.
+	invalidate := func(target string) {
+		if res.cache != nil {
+			res.cache.Invalidate(target, path.Dir(target))
+		}
+	}
+	mkdir := func(target string) error {
+		return mkdirRemote(res, target, true)
+	}
 	for _, dir := range plan.dirs {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		if err := res.client.MkdirAll(dir.target); err != nil {
+		if err := mkdir(dir.target); err != nil {
 			return "", err
 		}
 	}
@@ -2393,7 +2386,7 @@ func (s *Service) executeRemoteUploadPlan(ctx context.Context, res *backendView,
 				return "", fmt.Errorf("%w: target already exists", ErrConflict)
 			}
 		}
-		if err := res.client.MkdirAll(path.Dir(file.target)); err != nil {
+		if err := mkdir(path.Dir(file.target)); err != nil {
 			_ = src.Close()
 			return "", err
 		}
@@ -2403,21 +2396,23 @@ func (s *Service) executeRemoteUploadPlan(ctx context.Context, res *backendView,
 		} else {
 			flag |= os.O_EXCL
 		}
+		invalidate(file.target)
 		dst, err := res.client.OpenFile(file.target, flag)
 		if err != nil {
+			invalidate(file.target)
 			_ = src.Close()
 			if errors.Is(err, os.ErrExist) {
 				return "", fmt.Errorf("%w: target already exists", ErrConflict)
 			}
 			return "", err
 		}
-		if err := s.copyWithProgress(ctx, work, file.target, src, dst, file.size, 0); err != nil {
-			_ = src.Close()
-			_ = dst.Close()
+		copyErr := s.copyWithProgress(ctx, work, file.target, src, dst, file.size, 0)
+		_ = src.Close()
+		closeErr := dst.Close()
+		invalidate(file.target)
+		if err := errors.Join(copyErr, closeErr); err != nil {
 			return "", err
 		}
-		_ = src.Close()
-		_ = dst.Close()
 		work.FilesDone++
 		s.publishWorkerProgress(work)
 	}
@@ -2467,13 +2462,11 @@ func (s *Service) executeLocalDownloadPlan(ctx context.Context, work *transferWo
 			}
 			return "", err
 		}
-		if err := s.copyWithProgress(ctx, work, file.source, src, dst, file.size, file.mode); err != nil {
-			_ = src.Close()
-			_ = dst.Close()
+		copyErr := s.copyWithProgress(ctx, work, file.source, src, dst, file.size, file.mode)
+		_ = src.Close()
+		if err := errors.Join(copyErr, dst.Close()); err != nil {
 			return "", err
 		}
-		_ = src.Close()
-		_ = dst.Close()
 		work.FilesDone++
 		s.publishWorkerProgress(work)
 	}
@@ -2521,13 +2514,11 @@ func (s *Service) executeRemoteDownloadPlan(ctx context.Context, res *backendVie
 			}
 			return "", err
 		}
-		if err := s.copyWithProgress(ctx, work, file.source, src, dst, file.size, file.mode); err != nil {
-			_ = src.Close()
-			_ = dst.Close()
+		copyErr := s.copyWithProgress(ctx, work, file.source, src, dst, file.size, file.mode)
+		_ = src.Close()
+		if err := errors.Join(copyErr, dst.Close()); err != nil {
 			return "", err
 		}
-		_ = src.Close()
-		_ = dst.Close()
 		work.FilesDone++
 		s.publishWorkerProgress(work)
 	}
@@ -2925,15 +2916,11 @@ func (t *transferState) snapshot() Transfer {
 }
 
 func resolveServer(cfg config.RuntimeConfig, ref string) (config.ServerProfile, error) {
-	if server, ok := cfg.Servers[ref]; ok {
-		return server, nil
+	server, err := config.ResolveRuntimeServer(cfg, ref)
+	if err != nil {
+		return config.ServerProfile{}, ErrNotFound
 	}
-	for _, server := range cfg.Servers {
-		if server.Alias == ref {
-			return server, nil
-		}
-	}
-	return config.ServerProfile{}, ErrNotFound
+	return server, nil
 }
 
 func prepareUploadSource(localPath string) (uploadSource, error) {

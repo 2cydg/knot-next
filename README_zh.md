@@ -30,7 +30,7 @@ knot-core 可被以下客户端使用：
 
 ## 系统要求
 
-- Go 1.26.2 或更高版本
+- Go 1.27.1 或更高版本
 - Linux、macOS 或 Windows
 - 支持的架构：amd64、arm64
 

@@ -268,3 +268,7 @@ func TestReviewShutdownIsIdempotent(t *testing.T) {
 		t.Fatalf("the second shutdown rewrote the close time: %v then %v", first.ClosedAt, second.ClosedAt)
 	}
 }
+
+func (p *shutdownTestConfig) RememberServerAuth(id string, choice config.AuthChoice) error {
+	return nil
+}

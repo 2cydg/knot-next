@@ -174,7 +174,7 @@ func (s *Service) UseLogger(file *logger.File) {
 	s.logFile = file
 }
 func (s *Service) PublishEvent(event Event) {
-	// Log only stable resource/state/error context; never event payloads.
+	// Log stable resource/state/error context and fixed sanitized warning fields.
 	state, _ := event.Data["state"].(string)
 	failure, _ := event.Data["error"].(string)
 	// SFTP historically carries a normal close cause in Event.Error.
@@ -182,16 +182,20 @@ func (s *Service) PublishEvent(event Event) {
 	failed := (failure != "" && !normalClose) || state == "failed" || state == "partial_failed"
 	if failure != "" || (!strings.Contains(event.Type, "progress") && !strings.Contains(event.Type, "cwd")) {
 		level := slog.LevelInfo
-		if failed {
+		warning, hasWarning := event.Data["warning"].(session.Warning)
+		if failed || hasWarning {
 			level = slog.LevelWarn
 		}
 		args := []any{"resource", event.Resource, "resource_id", event.ResourceID, "state", state, "error", logger.Redact(failure)}
+		if hasWarning {
+			args = append(args, "warning_kind", warning.Kind, "warning_message", logger.Redact(warning.Message))
+		}
 		for _, key := range []string{"closed", "count", "active_sessions", "active_sftp_sessions"} {
 			if n, ok := event.Data[key]; ok {
 				args = append(args, key, n)
 			}
 		}
-		if failed || event.Type == "core.shutdown_started" {
+		if failed || hasWarning || event.Type == "core.shutdown_started" {
 			logger.Diagnostic(level, event.Type, args...)
 		} else {
 			slog.Log(context.Background(), level, event.Type, args...)
@@ -343,11 +347,16 @@ func (s *Service) handleSessionEvent(event session.Event) {
 	if event.Challenge != nil {
 		data["challenge"] = event.Challenge
 	}
+	level := eventLevel(event.State, event.Error)
+	if event.Warning != nil {
+		data["warning"] = *event.Warning
+		level = "warn"
+	}
 	s.PublishEvent(Event{
 		Type:       event.Type,
 		Resource:   "session",
 		ResourceID: event.SessionID,
-		Level:      "info",
+		Level:      level,
 		Time:       event.Time,
 		Data:       data,
 	})
@@ -378,11 +387,16 @@ func (s *Service) handleSFTPEvent(event sftp.Event) {
 	if event.Challenge != nil {
 		data["challenge"] = event.Challenge
 	}
+	level := eventLevel(event.State, event.Error)
+	if event.Warning != nil {
+		data["warning"] = *event.Warning
+		level = "warn"
+	}
 	s.PublishEvent(Event{
 		Type:       event.Type,
 		Resource:   resource,
 		ResourceID: resourceID,
-		Level:      eventLevel(event.State, event.Error),
+		Level:      level,
 		Time:       event.Time,
 		Data:       data,
 	})

@@ -3,6 +3,7 @@ package http
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -1648,7 +1649,17 @@ func openTestWebSocket(t *testing.T, ts *httptest.Server, path string) (net.Conn
 
 func maskedClientFrame(opcode int, payload []byte) []byte {
 	mask := []byte{1, 2, 3, 4}
-	frame := []byte{0x80 | byte(opcode), 0x80 | byte(len(payload))}
+	frame := []byte{0x80 | byte(opcode)}
+	switch {
+	case len(payload) < 126:
+		frame = append(frame, 0x80|byte(len(payload)))
+	case len(payload) <= 65535:
+		frame = append(frame, 0x80|126)
+		frame = binary.BigEndian.AppendUint16(frame, uint16(len(payload)))
+	default:
+		frame = append(frame, 0x80|127)
+		frame = binary.BigEndian.AppendUint64(frame, uint64(len(payload)))
+	}
 	frame = append(frame, mask...)
 	for i, b := range payload {
 		frame = append(frame, b^mask[i%4])

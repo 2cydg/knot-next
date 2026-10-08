@@ -41,6 +41,7 @@ type Server struct {
 	ptyRequests   []PTYRequest
 	windowChanges []WindowSize
 	envRequests   []EnvRequest
+	rejectEnv     bool
 	signals       []string
 	shell         ShellBehavior
 	exec          ExecBehavior
@@ -149,6 +150,8 @@ func (s *Server) ExecCommands() []string {
 
 // Config holds server configuration.
 type Config struct {
+	// RejectEnv simulates an SSH server without an AcceptEnv allowlist.
+	RejectEnv         bool
 	User              string
 	Password          string
 	PublicKeyCallback func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error)
@@ -199,6 +202,7 @@ func newServer(t *testing.T, cfg Config, listener net.Listener) *Server {
 		closing:      make(chan struct{}),
 		sftpRoot:     cfg.SFTPRoot,
 		sftpHandlers: cfg.SFTPHandlers,
+		rejectEnv:    cfg.RejectEnv,
 	}
 
 	// The auth callbacks consult the server's barrier, so they are installed
@@ -540,7 +544,7 @@ func (s *Server) handleSession(newCh ssh.NewChannel) {
 			s.mu.Lock()
 			s.envRequests = append(s.envRequests, EnvRequest{Name: envReq.Name, Value: envReq.Value})
 			s.mu.Unlock()
-			_ = req.Reply(true, nil)
+			_ = req.Reply(!s.rejectEnv, nil)
 		case "signal":
 			var signalReq struct {
 				Signal string

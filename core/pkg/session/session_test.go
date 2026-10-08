@@ -192,3 +192,10 @@ func TestObservedReaderReportsPaths(t *testing.T) {
 		t.Fatal("timed out waiting for observed path")
 	}
 }
+
+func (s *testConfigService) RememberServerAuth(id string, choice config.AuthChoice) error {
+	profile := s.runtime.Servers[id]
+	profile.AuthMethod, profile.KeyID, profile.Password = choice.Method, choice.KeyID, choice.Password
+	s.runtime.Servers[id] = profile
+	return nil
+}

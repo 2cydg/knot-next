@@ -645,8 +645,12 @@ func (p *Pool) getRouteClient(ctx context.Context, route routeStep, cfg config.R
 			return nil, key, false, errors.New("ssh pool is closed")
 		}
 		p.workers.Add()
+		releasePrefix := p.retainPrefixLocked(prefix)
 		p.mu.Unlock()
 		defer p.workers.Done()
+		trackedCtx := resourcepolicy.WithGroup(attemptCtx, &p.workers)
+		dialCtx, dialWork := resourcepolicy.Scope(trackedCtx)
+		defer p.releaseDialPrefix(trackedCtx, dialWork, releasePrefix)
 
 		effectiveConfirm := func(prompt HostKeyPrompt) bool {
 			if opts.prompt != nil {
@@ -663,7 +667,7 @@ func (p *Pool) getRouteClient(ctx context.Context, route routeStep, cfg config.R
 				return false
 			}
 		}
-		client, err := dialClient(attemptCtx, route.server, cfg, jump, effectiveConfirm, opts)
+		client, err := dialClient(dialCtx, route.server, cfg, jump, effectiveConfirm, opts)
 		if err != nil {
 			return nil, key, false, err
 		}
@@ -727,10 +731,10 @@ func (p *Pool) getRouteClient(ctx context.Context, route routeStep, cfg config.R
 // waiting on this connection.
 func (p *Pool) runCreation(ctx context.Context, key string, route routeStep, identity []byte, cfg config.RuntimeConfig, jump *ssh.Client, opts DialOptions, inflight *inflightRoute, releasePrefix func()) {
 	defer p.workers.Done()
-	if releasePrefix != nil {
-		defer releasePrefix()
-	}
-	client, err := dialClient(ctx, route.server, cfg, jump, nil, opts)
+	trackedCtx := resourcepolicy.WithGroup(ctx, &p.workers)
+	dialCtx, dialWork := resourcepolicy.Scope(trackedCtx)
+	defer p.releaseDialPrefix(trackedCtx, dialWork, releasePrefix)
+	client, err := dialClient(dialCtx, route.server, cfg, jump, nil, opts)
 	if err == nil && ctx.Err() != nil {
 		// The creation outlived its purpose; do not publish a client nobody is
 		// waiting for any more.
@@ -748,12 +752,8 @@ func (p *Pool) runCreation(ctx context.Context, key string, route routeStep, ide
 		}
 	}
 
-	// The actual dial/setup has ended. Return the worker's prefix references
-	// before publishing completion to callers, including canceled ones. The
-	// deferred, idempotent release also covers future early returns.
-	if releasePrefix != nil {
-		releasePrefix()
-	}
+	// Prefix references stay owned until any abandoned channel-open workers
+	// and their late cleanup settle, even after callers receive this result.
 	p.mu.Lock()
 	inflight.key = publishedKey
 	inflight.client = client
@@ -770,6 +770,20 @@ func (p *Pool) runCreation(ctx context.Context, key string, route routeStep, ide
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// releaseDialPrefix leaves shared jump clients intact and retained while a late
+// channel-open result is pending. Pool shutdown closes transport and waits for
+// this tracked release instead of claiming that the public timeout freed it.
+func (p *Pool) releaseDialPrefix(ctx context.Context, work *resourcepolicy.Group, release func()) {
+	if release == nil {
+		return
+	}
+	if work.Count() == 0 {
+		release()
+		return
+	}
+	resourcepolicy.Go(ctx, func() { _ = work.Wait(context.Background()); release() })
 }
 
 // awaitInflight waits for a shared creation to finish. A caller that gives up
@@ -1154,7 +1168,12 @@ func dialTransport(ctx context.Context, addr string, server config.ServerProfile
 		return nil, err
 	}
 	if jump != nil {
-		return dialViaJump(ctx, jump, addr)
+		if timeout <= 0 {
+			timeout = 15 * time.Second
+		}
+		stageCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		return dialViaJump(stageCtx, jump, addr)
 	}
 	dialer := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
 	if server.ProxyID == "" {
@@ -1184,19 +1203,19 @@ func dialViaJump(ctx context.Context, jump *ssh.Client, addr string) (net.Conn, 
 		err  error
 	}
 	done := make(chan result, 1)
-	go func() {
+	resourcepolicy.Go(ctx, func() {
 		conn, err := jump.Dial("tcp", addr)
 		done <- result{conn: conn, err: err}
-	}()
+	})
 	select {
 	case res := <-done:
 		return res.conn, res.err
 	case <-ctx.Done():
-		go func() {
+		resourcepolicy.Go(ctx, func() {
 			if res := <-done; res.conn != nil {
 				_ = res.conn.Close()
 			}
-		}()
+		})
 		return nil, ctx.Err()
 	}
 }
@@ -1398,6 +1417,9 @@ func hostKeyCallback(server config.ServerProfile, confirm func(HostKeyPrompt) bo
 }
 
 func normalizeHostKeyPolicy(policy string) (string, error) {
+	if policy == "ask" {
+		return HostKeyPolicyAsk, nil
+	}
 	switch policy {
 	case HostKeyPolicyAsk, HostKeyPolicyFail, HostKeyPolicyStrict, HostKeyPolicyAcceptNew, HostKeyPolicyInsecureSkip:
 		return policy, nil

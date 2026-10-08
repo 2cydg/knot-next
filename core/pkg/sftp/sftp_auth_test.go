@@ -420,3 +420,20 @@ func waitForSFTPWarning(t *testing.T, events <-chan Event, sessionID string) ses
 		}
 	}
 }
+
+func (p *recordingConfigProvider) RememberServerAuth(id string, choice config.AuthChoice) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.saveFail != "" {
+		return errors.New(p.saveFail + choice.Password + choice.KeyID)
+	}
+	profile := p.cfg.Servers[id]
+	profile.AuthMethod, profile.KeyID, profile.Password = choice.Method, choice.KeyID, choice.Password
+	p.cfg.Servers[id] = profile
+	p.saves = append(p.saves, savedSFTPCredential{ServerID: id, Password: choice.Password, KeyID: choice.KeyID})
+	select {
+	case p.saved <- struct{}{}:
+	default:
+	}
+	return nil
+}

@@ -548,3 +548,5 @@ SFTP session 新增 `server_id`、`follow_state`、`follow_error`、`cwd_updated
 `follow_state` 为 `active`、`paused` 或 `invalid`；未关联时省略。每次跟随先绕过目录缓存执行实际读取权限校验。本地测试后端读取至多一个条目；远端目前使用库的完整 `ReadDirContext`（取消随服务退出，关闭客户端也终止 I/O），省去 Entry 构造、排序和分页。`Stat` 只能确认路径类型，无法证明可列出；现有库未公开目录句柄或限量读取接口，因此远端大目录的全量读取开销仍保留。失败保留最后可用目录，`follow_error=directory_unavailable`，发布 `sftp.cwd.follow_error`；有效的新观察/恢复成功清除错误。关闭源会停止 follower，保持最后目录，`follow_state=invalid` 并发布 `sftp.follow.invalidated`，不能恢复该关联。
 
 相关事件：`sftp.cwd.changed`、`sftp.cwd.follow`、`sftp.cwd.follow_error`、`sftp.follow.paused`、`sftp.follow.invalidated`。事件有界，恢复以 session GET 为准。源停止时不会将目录重置到 `/`。本轮不自动注入 shell hook，也不使用客户端默认本地目录设置改变 core cwd。
+
+缓存保留上限为 256 项/4 MiB 估算成本，超大目录不缓存。失效同时阻止在途旧结果回填，递归及部分失败上传覆盖所有修改目录。文件完成要求 copy 和目标 Close 均成功。失败 cd 保留旧 CWD/follow 状态；成功 cd 才暂停 follow。Remember 采用与 SSH 相同的原子认证选择事务。

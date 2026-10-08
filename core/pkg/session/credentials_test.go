@@ -245,3 +245,19 @@ func TestCredentialNotSavedIfRememberFalse(t *testing.T) {
 		t.Errorf("SetServerPassword should not be called when Remember=false, got %d calls", calls)
 	}
 }
+
+func (s *spyConfigWriter) RememberServerAuth(id string, choice config.AuthChoice) error {
+	if choice.Method == config.AuthMethodPassword {
+		s.savePasswordCalls.Add(1)
+		s.mu.Lock()
+		s.savedPasswords = append(s.savedPasswords, choice.Password)
+		s.mu.Unlock()
+		select {
+		case s.saved <- struct{}{}:
+		default:
+		}
+	} else {
+		s.updateServerCalls.Add(1)
+	}
+	return nil
+}

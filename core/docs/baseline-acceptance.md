@@ -1,5 +1,7 @@
 # 基线验收证据
 
+> 当前工具链：2026-10-08 按用户要求将 module 最低 Go 版本与 CI 固定版本统一升级为 **Go 1.27.1**。下文 Go 1.26.2 的描述属于升级前的历史验收记录。
+
 按 `docs/core基线开发计划.md` §19.2 记录每个工作项的验收证据。受控测试结果与真实环境结果分开列出，不互相替代。
 
 ## B03：PTY 数据、退出与 attach 生命周期
@@ -110,7 +112,7 @@ GOWORK=off go test -count=40 -run TestAttachReportsTruncated ./internal/api/http
 
 ### B04 审阅逐项修复与证据（2026-10-07）
 
-审阅来源：workspace `docs/running/B04-implementation-plan.md` 第 56 行起。原始日志 `/tmp/knot-b04-full-test.log` 明确含 `socket: operation not permitted`；审阅日志 `/tmp/b04-fullsuite.log` 明确含 `TestExecConnectionDeadlineDoesNotStartCommand` 的 barrier 清理挂起。因此“所有失败只是权限问题”的归纳不完整；“历史权限错误不存在，全部替换为单测挂起”也与原日志不符。保留两类事实，当前修复环境复跑依然拒绝监听，不将其他环境的通过冒充本次修复后的运行结果。
+审阅来源：workspace `docs/history/B04-implementation-plan.md` 第 56 行起。原始日志 `/tmp/knot-b04-full-test.log` 明确含 `socket: operation not permitted`；审阅日志 `/tmp/b04-fullsuite.log` 明确含 `TestExecConnectionDeadlineDoesNotStartCommand` 的 barrier 清理挂起。因此“所有失败只是权限问题”的归纳不完整；“历史权限错误不存在，全部替换为单测挂起”也与原日志不符。保留两类事实，当前修复环境复跑依然拒绝监听，不将其他环境的通过冒充本次修复后的运行结果。
 
 | 审阅项 | 判定与处理 | 回归证据 |
 | --- | --- | --- |
@@ -178,7 +180,7 @@ GOWORK=off go test -count=40 -run TestAttachReportsTruncated ./internal/api/http
 
 ### 审阅修复后的验证
 
-逐项结论见 workspace `docs/running/B05-transfer-recovery-plan.md` 的“审阅报告逐项核查与处理”。初版命令结果保留在上节；修复版使用同一环境与 Go 参数执行：
+逐项结论见 workspace `docs/history/B05-transfer-recovery-plan.md` 的“审阅报告逐项核查与处理”。初版命令结果保留在上节；修复版使用同一环境与 Go 参数执行：
 
 - `go test -count=1 -timeout=60s -run '^TestSFTPProtocol' ./tests/integration`：通过（0.959 秒）。
 - `go test -race -count=20 -timeout=90s -run '^TestSFTPProtocol' ./tests/integration`：13 个叶用例全部通过（22.651 秒），无 race。
@@ -253,7 +255,7 @@ go tool cover -func=/tmp/knot-b06-cover.out
 
 ### B06 审阅修复后的验证
 
-逐项结论与理由见 workspace `docs/running/B06-resource-lifecycle-plan.md` 的“审阅报告逐项核查与处理”。上节为初版验收；下列是本轮修复后的最终结果，仍以 `9e7fd0f` + 未提交工作区为基线，无新增依赖。
+逐项结论与理由见 workspace `docs/history/B06-resource-lifecycle-plan.md` 的“审阅报告逐项核查与处理”。上节为初版验收；下列是本轮修复后的最终结果，仍以 `9e7fd0f` + 未提交工作区为基线，无新增依赖。
 
 本轮修复无容量压力时反复排序及辅助 worker 重复裁剪 Transfer 的开销、exec 数量裁剪被 TTL 掩盖的测试、重复上限常量、pool 退出保留排队 observer、ActiveCount 判定重复，以及 core 的 GetClient/IncRef 取得窗口。连接 lease 返回前已经持有整条链路，释放绑定原条目且幂等；shared 拨号拥有独立的跳板引用，调用者取消后仍持有到实际拨号结束。shared 创建返回实际 revision publication key。仍保留兼容的 unowned GetClient / key-based IncRef/DecRef；core 资源均已迁移至 Acquire/lease。
 
@@ -277,7 +279,7 @@ R-1 采用报告建议 (b)：继续跟踪真实收尾，未采用超时提前归
 
 ### B06 复审 N-1–N-4 修复后的验证
 
-逐项结论见 workspace `docs/running/B06-resource-lifecycle-plan.md` 的“复审 N-1–N-4 的处理”。原报告判断成立：N-1 的测试只把过期项放在末尾，不能证明原地压缩不改输入。本轮使 `Expired` 对所有输入保留内容和顺序，仅需要容量排序时复制存活项；prefix 释放加 once 和 defer；watcher 对 nil lease 防御；stop 显式禁止请求退出 disconnect 通知，与既定通知契约一致。pending cleanup 数量和最老待释放时长记录为 B07 候选，未提前增加 stats/event 字段。
+逐项结论见 workspace `docs/history/B06-resource-lifecycle-plan.md` 的“复审 N-1–N-4 的处理”。原报告判断成立：N-1 的测试只把过期项放在末尾，不能证明原地压缩不改输入。本轮使 `Expired` 对所有输入保留内容和顺序，仅需要容量排序时复制存活项；prefix 释放加 once 和 defer；watcher 对 nil lease 防御；stop 显式禁止请求退出 disconnect 通知，与既定通知契约一致。pending cleanup 数量和最老待释放时长记录为 B07 候选，未提前增加 stats/event 字段。
 
 沿用 Linux amd64、Go 1.27.1 与 `GOWORK=off GOCACHE=/tmp/knot-plan-20261006-go-build`；module 保持 Go 1.26.2，无新增依赖，未 Git 提交。真实协议用例在已获准的 loopback 环境执行，无 skip。
 
@@ -317,7 +319,7 @@ go vet ./...
 
 ## B09–B11：客户端数据、Agent 与日志（2026-10-08）
 
-本轮实现与 Linux 受控验收完成；完整证据见 [完成报告](../../../docs/running/B09-B11-completion-report.md)，开工前计划见 [实施计划](../../../docs/running/B09-B11-implementation-plan.md)。工作区基线 `2c6e1b82cfcf70463857c679717d1e81b7b240fd`，未提交。
+本轮实现与 Linux 受控验收完成；完整证据见 workspace 历史完成报告 `docs/history/B09-B11-completion-report.md`，开工前计划见 workspace 历史实施计划 `docs/history/B09-B11-implementation-plan.md`。工作区基线 `2c6e1b82cfcf70463857c679717d1e81b7b240fd`，未提交。
 
 最近使用沿用旧 state.json，真实目标成功节点更新、跳板/失败不更新；last_used/排序和 server_id 候选可供客户端使用。OSC7 有界旁路观察保留 PTY bytes；SFTP control 明确 cd/pause/resume，目录访问校验和源关闭失效可查询。Unix/Windows Agent 共用 context 拨号，认证连接临时持有、forwarding handler 按共享 client 持有，显式 setup 失败有 typed 状态。文件日志实际落盘、权限、脱敏、有限历史与明确关闭已接入。
 
@@ -326,3 +328,51 @@ Linux 全量测试、相关 race/跨包 cover（profile 合计 79.9%，重点函
 用户本轮明确不要求其他平台原生单元测试，Windows/macOS 代码逻辑审核与交叉构建完成，原生 Agent/凭据库/ACL/终端测试留到 CLI。用户明确授权后，两个真实 SSH 端点的显式 OSC7、strict SFTP follow、暂停/恢复与源关闭失效均通过；默认 shell 在 cd 后未观察到自动 OSC7，未修改登录脚本。首次审批拒绝及后续授权结果、接收 bytes/hash 见完成报告。不能把交叉编译宣称为其他平台原生运行通过。
 
 自动 hook、客户端配置拆分、默认本地目录行为和日志 tail/follow 后置；本轮不宣布 B12 完整基线验收通过。
+
+## 2026-10-08 审核修复后的当前交付
+
+本节是当前状态，前文保留历史批次当时的测试和环境记录，不再用旧的未验收标记描述现在的代码。
+
+R01–R15 修复落地：完整 WS 分片/校验/写期限、导入目标占用、跳板与交互阶段期限、认证选择窄事务、传输 Close 失败、目录缓存容量/代际/关闭、统一 alias、未就绪控制拒绝、严格 JSON 上限、全局 warning、文档/示例和 CI。额外修正失败 cd 的状态提交、公开 `ask` 策略归一化；拆出 WS 和认证事务文件，未扩大到后置产品能力。
+
+公开 API 示例覆盖创建、auth/host-key challenge、就绪、attach、exec、SFTP、上传、snapshot/GET 和关闭；标准 x/net 客户端加传输分片适配验证原始 binary 输入完整。测试 crypto 和凭据均为隔离人工数据。
+
+最终命令与结果在本节下方补充。原生 macOS/Windows Agent、凭据库、ACL 和真实终端测试仍按用户确定的 CLI 阶段执行；本轮不把 cross-build 或 Linux 协议测试计为这些原生验证。CI 文件已完善，远端 Actions 运行尚未触发。
+
+### 本次最终运行结果
+
+Linux amd64 / Go 1.27.1，module 与 CI 当前均为 Go 1.27.1，`GOWORK=off GOCACHE=/tmp/knot-fix-build`。本地监听测试获得自动审核许可，不访问外部服务器。
+
+| 验证 | 结果 |
+| --- | --- |
+| `../scripts/test.sh`：`go test -count=1 -timeout=240s ./...` | 全部通过，日志 `/tmp/knot-fix-final-tests.log` |
+| `go test -race -count=1 -timeout=240s ./...` | 全部通过，包含进程入口、真实 loopback SSH/SFTP、标准 WS 和公开示例，日志 `/tmp/knot-fix-final-race.log` |
+| 修复相关六包 race ×10 | 通过，日志 `/tmp/knot-fix-race-repeat.log` |
+| 部分失败递归 upload/cache 真实协议 race ×10 | 通过，日志 `/tmp/knot-fix-cache-partial.log` |
+| `go vet ./...`、gofmt、diff 检查、bash 脚本语法、文档链接 | 通过 |
+| `../scripts/build.sh --all` | 六 OS/arch CGO=0 通过，Windows `.exe`，日志 `/tmp/knot-fix-final-crossbuild.log` |
+| `FuzzLegacyDecode` / `FuzzImportDestinationReservation`，各 20 秒 | 分别 304,823 / 438,618 次，通过 |
+
+本次新增 30 个回归测试入口和 2 个 fuzz target，另保留原有 auth、PTY、exec、传输、生命周期、迁移和平台抽象回归。补充用例含真实 CLOSE 失败后子目录缓存更新、失败 cd 状态、原子认证选择和实际 15 秒交互阶段期限。CI 当前固定 Go 1.27.1 的 gofmt/vet；远端 workflow 状态尚未执行。本次无外部 OpenSSH smoke 或原生非 Linux 运行，不更新为这些验收已通过。
+
+### GitHub lint 工具链失败修复
+
+旧 `golangci-lint-action@v4` 的 `version: latest` 下载 v1.64.8，二进制由 Go 1.24 构建，低于 module 的 Go 1.26.2，因此在分析代码前退出。punycode 和缓存警告不是本次失败原因。
+
+当前 lint 使用 setup-go 固定的 Go 1.27.1，设置 `GOTOOLCHAIN=local`，调用 `scripts/lint.sh` 执行 gofmt/vet，并保存 `lint.log` artifact。不再依赖旧预编译 golangci-lint；检查范围为格式和 Go vet，不声称保留全部第三方 lint 规则。本地 Go 1.27.1 执行脚本通过，日志 `/tmp/knot-ci-lint-fix.log`；Go 1.27.1 的远端运行须在提交推送后验证。
+
+### Go 1.27.1 升级验证
+
+`core/go.mod` 的 `go` 指令、四个 CI job、中英文 README 和 CLI handoff 均已切换为 1.27.1，依赖版本未改动。Linux amd64 本机工具链为 Go 1.27.1，设置 `GOTOOLCHAIN=local GOCACHE=/tmp/knot-fix-build`：
+
+- `./scripts/test.sh --race`：完整全包通过，日志 `/tmp/knot-go1271-tests.log`。
+- `./scripts/lint.sh`：格式与 vet 通过，日志 `/tmp/knot-go1271-lint.log`。
+- `./scripts/build.sh --all`：六个 OS/arch 构建通过，日志 `/tmp/knot-go1271-build.log`；`go version -m` 确认产物由 go1.27.1 构建。
+
+远端 GitHub Actions 尚未触发；其他平台交叉构建继续只作为编译证据。
+
+### 基线修复复审处理
+
+再次对照 workspace《基线修复-代码审核.md》处理：env 拒绝降为可观察 warning，整个 env 阶段共享 15 秒且最多 64 项；SSH/SFTP 空 Remember 和 passphrase-only 不写盘；attach Close 回显完成后再关闭 TCP；公开递归 Mkdir 与上传共用祖先缓存失效；WS 超限使用 1009，调用参数错误不关闭健康连接。补 12 个测试入口并修正扩展长度辅助编码、CLOSE 原因断言、并发配置事务验证和测试替身。
+
+Linux Go 1.27.1 全量测试、全量 race、新修复四包 race ×10、gofmt/vet 和六目标构建通过，日志 `/tmp/knot-rereview-{tests,full-race,race-repeat,lint,build}.log`。最后 attach Close 竞争等待由完整 HTTP 包 race ×10 验证（`/tmp/knot-rereview-http-final-race.log`）。仍未执行远端 Actions 或原生非 Linux/外部 OpenSSH 验证。

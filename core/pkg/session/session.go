@@ -42,8 +42,7 @@ var attachDrainTimeout = 5 * time.Second
 
 type configWriter interface {
 	RuntimeConfig() (config.RuntimeConfig, error)
-	SetServerPassword(id string, password string) (config.ServerProfileView, error)
-	UpdateServer(id string, server config.ServerProfile) (config.ServerProfileView, error)
+	RememberServerAuth(id string, choice config.AuthChoice) error
 }
 
 type Service struct {
@@ -239,6 +238,7 @@ type Warning struct {
 // a specific condition instead of matching on message text.
 const (
 	WarningCredentialSaveFailed = "credential_save_failed"
+	WarningEnvironmentRejected  = "environment_rejected"
 )
 
 type CWDNotify struct {
@@ -349,6 +349,10 @@ func (s *Service) Create(req CreateRequest) (Resource, error) {
 	if len(req.Term) > 64 {
 		return Resource{}, fmt.Errorf("%w: term is too long", ErrValidation)
 	}
+	if len(req.Env) > maxSSHEnvironmentEntries {
+		return Resource{}, fmt.Errorf("%w: too many environment variables (maximum %d)", ErrValidation, maxSSHEnvironmentEntries)
+	}
+	req.Env = cloneEnv(req.Env)
 	if req.Rows == 0 {
 		req.Rows = 24
 	}
@@ -685,6 +689,10 @@ func (s *Service) Control(id string, req ControlRequest) (Resource, error) {
 	// Validate with the lock held so invalid parameters never reach the remote,
 	// then capture the backend the operation applies to.
 	backend := session.backend
+	if backend == nil && (req.Type == "resize" || req.Type == "signal" || req.Type == "close_stdin") {
+		s.mu.Unlock()
+		return Resource{}, fmt.Errorf("%w: session is not ready", ErrConflict)
+	}
 	var op func() error
 	switch req.Type {
 	case "resize":
@@ -1069,55 +1077,6 @@ func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig, st
 	s.closeSubscribersLocked(session)
 }
 
-// openSSHSession opens a channel on a pooled client under ctx. x/crypto/ssh has
-// no cancellation for this call, so a cancelled attempt abandons the pending open
-// and closes whatever channel it eventually returns; the shared client itself is
-// never closed here, because another session may be using it.
-func openSSHSession(ctx context.Context, client *ssh.Client) (*ssh.Session, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	type result struct {
-		session *ssh.Session
-		err     error
-	}
-	done := make(chan result, 1)
-	resourcepolicy.Go(ctx, func() {
-		session, err := client.NewSession()
-		done <- result{session: session, err: err}
-	})
-	select {
-	case res := <-done:
-		return res.session, res.err
-	case <-ctx.Done():
-		resourcepolicy.Go(ctx, func() {
-			if res := <-done; res.session != nil {
-				_ = res.session.Close()
-			}
-		})
-		return nil, ctx.Err()
-	}
-}
-
-// sessionSetup runs one blocking setup step on a session this attempt owns. A
-// cancelled attempt closes that session, which unblocks the step; the step's own
-// result is drained so the goroutine cannot leak.
-func sessionSetup(ctx context.Context, session *ssh.Session, step func() error) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	done := make(chan error, 1)
-	resourcepolicy.Go(ctx, func() { done <- step() })
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		_ = session.Close()
-		resourcepolicy.Go(ctx, func() { <-done })
-		return ctx.Err()
-	}
-}
-
 func (s *Service) openInteractive(ctx context.Context, sessionID string, req CreateRequest, server config.ServerProfile, cfg config.RuntimeConfig, pool *sshpool.Pool, dialOpts DialOptions) (*interactiveBackend, []string, config.RuntimeConfig, error) {
 	var currentCfg = cfg
 	for attempt := 0; attempt <= maxAuthRetryCount; attempt++ {
@@ -1162,35 +1121,45 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 		if err := sessionSetup(ownedCtx, sshSession, func() error {
 			return sshSession.RequestPty(req.Term, req.Rows, req.Cols, sshTerminalModes())
 		}); err != nil {
-			_ = sshSession.Close()
+			closeSSHSession(ownedCtx, sshSession)
 			release()
 			return nil, nil, currentCfg, err
 		}
-		setSSHSessionEnvironment(sshSession, req.Env)
+		warnedEnvironment := false
+		if err := setSSHSessionEnvironment(ownedCtx, sshSession, req.Env, func() {
+			if !warnedEnvironment {
+				s.publishWarning(sessionID, WarningEnvironmentRejected, "server rejected optional environment variables")
+				warnedEnvironment = true
+			}
+		}); err != nil {
+			closeSSHSession(ownedCtx, sshSession)
+			release()
+			return nil, nil, currentCfg, err
+		}
 		if req.ForwardAgent {
 			if err := sessionSetup(ownedCtx, sshSession, func() error {
 				return pool.ForwardAgent(ownedCtx, client, sshSession, dialOpts.AgentSocket, dialOpts.Timeout)
 			}); err != nil {
-				_ = sshSession.Close()
+				closeSSHSession(ownedCtx, sshSession)
 				release()
 				return nil, nil, currentCfg, err
 			}
 		}
 		stdin, err := sshSession.StdinPipe()
 		if err != nil {
-			_ = sshSession.Close()
+			closeSSHSession(ownedCtx, sshSession)
 			release()
 			return nil, nil, currentCfg, err
 		}
 		stdout, err := sshSession.StdoutPipe()
 		if err != nil {
-			_ = sshSession.Close()
+			closeSSHSession(ownedCtx, sshSession)
 			release()
 			return nil, nil, currentCfg, err
 		}
 		stderr, err := sshSession.StderrPipe()
 		if err != nil {
-			_ = sshSession.Close()
+			closeSSHSession(ownedCtx, sshSession)
 			release()
 			return nil, nil, currentCfg, err
 		}
@@ -1201,7 +1170,7 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 			s.updateCurrentDir(sessionID, path)
 		})
 		if err := sessionSetup(ownedCtx, sshSession, sshSession.Shell); err != nil {
-			_ = sshSession.Close()
+			closeSSHSession(ownedCtx, sshSession)
 			release()
 			return nil, nil, currentCfg, err
 		}
@@ -1343,7 +1312,7 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 		// never survives into a later successful connection.
 		s.mu.Lock()
 		if session, ok := s.sessions[sessionID]; ok {
-			if resp.Remember {
+			if resp.Remember && (resp.Password != "" || resp.KeyID != "") {
 				candidate := resp
 				candidate.Passphrase = ""
 				session.pendingCredentials = &candidate
@@ -1704,15 +1673,11 @@ func (r *resource) snapshot() Resource {
 }
 
 func resolveServer(cfg config.RuntimeConfig, ref string) (config.ServerProfile, error) {
-	if server, ok := cfg.Servers[ref]; ok {
-		return server, nil
+	server, err := config.ResolveRuntimeServer(cfg, ref)
+	if err != nil {
+		return config.ServerProfile{}, ErrNotFound
 	}
-	for _, server := range cfg.Servers {
-		if server.Alias == ref {
-			return server, nil
-		}
-	}
-	return config.ServerProfile{}, ErrNotFound
+	return server, nil
 }
 
 // newSessionBackend builds the backend of a session created in test mode. It is a
@@ -1773,14 +1738,6 @@ func sshTerminalModes() ssh.TerminalModes {
 		ssh.ECHO:          1,
 		ssh.TTY_OP_ISPEED: 38400,
 		ssh.TTY_OP_OSPEED: 38400,
-	}
-}
-
-func setSSHSessionEnvironment(session *ssh.Session, env map[string]string) {
-	for key, value := range env {
-		if validSSHEnvName(key) && validSSHEnvValue(value) {
-			_ = session.Setenv(key, value)
-		}
 	}
 }
 

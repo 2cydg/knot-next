@@ -93,26 +93,14 @@ See [core/docs/api/README.md](core/docs/api/README.md) for complete API referenc
 
 ## Current Status
 
-This project is being refactored from the original knot codebase. The current phase (M0-M6) focuses on:
-
-1. **M0: Migration baseline** ✅ (current)
-   - Core code migrated
-   - Build and test infrastructure
-   - Documentation
-
-2. **M1-M6: Core capabilities** (planned)
-   - M1: Session state machine and API contracts
-   - M2: Migration and service baseline
-   - M3: Port forwarding
-   - M4: Broadcast mode
-   - M5: Archive and sync
-   - M6: Update backend
-
-3. **M7-M8: CLI and release** (future)
-   - TUI design and development
-   - Complete product packaging
-
-See the project documentation for current capabilities and known issues.
+The SSH/SFTP core baseline is implemented, including asynchronous sessions,
+challenge/retry, raw PTY attach, exec, transfers and recovery, bounded resources,
+legacy TOML/crypto import, recent/CWD/follow, Agent and diagnostic logs. See
+`core/docs/baseline-acceptance.md` for current evidence and `core/docs/cli-handoff.md`
+for the public API handoff. CLI/TUI, forwarding resources, broadcast, archive,
+sync, update, task, automatic shell hooks and log-tail API remain future work.
+Native macOS/Windows credential-store, Agent, ACL and terminal verification is
+explicitly deferred to CLI; six-platform builds are compile evidence only.
 
 ## Code Organization
 
@@ -179,15 +167,10 @@ JSON import is unsupported and existing JSON is preserved. Native macOS/Windows
 credential-store interoperability remains unexecuted. See the migration and
 baseline acceptance documents for exact behavior and validation.
 
-## Known Issues
+## Validation boundaries
 
-The following issues are documented for future phases:
-
-- **P0**: SSH/SFTP async session state handling
-- **P0**: SFTP transfer event completion detection
-- **P0**: exec command timeout alignment
-- SFTP directory follow is implemented with explicit pause/resume and access validation.
-- **P1**: Legacy config migration platform compatibility
-- Windows Agent code is implemented; native runtime testing is deferred to CLI integration.
-
-These will be addressed in M1-M2 phases. See project documentation for details.
+Use the acceptance record for actual test results. A timed-out SSH channel open
+cannot be withdrawn through x/crypto/ssh; late workers remain tracked and retain
+shared client leases until the protocol settles or transport closes. Do not
+claim a public timeout means cleanup already finished. Native non-Linux runtime
+validation and a formal terminal client remain outside this baseline batch.

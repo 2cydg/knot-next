@@ -1,6 +1,7 @@
 package http
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -500,7 +501,17 @@ func splitPath(path string) []string {
 
 func decodeJSON(w stdhttp.ResponseWriter, r *stdhttp.Request, dst any) bool {
 	defer r.Body.Close()
-	decoder := json.NewDecoder(io.LimitReader(r.Body, maxJSONBody+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBody+1))
+	if err != nil || len(body) > maxJSONBody {
+		writeAPIError(w, stdhttp.StatusBadRequest, response.RiskReadOnly, r.URL.Path, "INVALID_JSON", "request body exceeds the JSON size limit or cannot be read")
+		return false
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		writeAPIError(w, stdhttp.StatusBadRequest, response.RiskReadOnly, r.URL.Path, "INVALID_JSON", "request body must be a JSON object")
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(dst); err != nil {
 		writeAPIError(w, stdhttp.StatusBadRequest, response.RiskReadOnly, r.URL.Path, "INVALID_JSON", "request body must be valid JSON")

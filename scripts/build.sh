@@ -22,11 +22,30 @@ echo "  Commit: $COMMIT"
 echo "  Time: $BUILD_TIME"
 echo "  Dirty: $DIRTY"
 
-# Build for current platform
+# Native output and cross-build output share the same release metadata.
 cd "$ROOT_DIR/core"
-GOWORK=off CGO_ENABLED=0 go build \
-  -ldflags="-s -w -X knot-core/pkg/core.DefaultVersion=$VERSION -X knot-core/pkg/core.BuildCommit=$COMMIT -X knot-core/pkg/core.BuildTime=$BUILD_TIME -X knot-core/pkg/core.BuildDirty=$DIRTY" \
-  -o "$BIN_DIR/knot-core" \
-  ./cmd/core
-
-echo "✓ Built: $BIN_DIR/knot-core"
+build_target() {
+  local target_os="$1" target_arch="$2" output="$3"
+  GOWORK=off CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch" go build \
+    -ldflags="-s -w -X knot-core/pkg/core.DefaultVersion=$VERSION -X knot-core/pkg/core.BuildCommit=$COMMIT -X knot-core/pkg/core.BuildTime=$BUILD_TIME -X knot-core/pkg/core.BuildDirty=$DIRTY" \
+    -o "$output" ./cmd/core
+}
+if [[ "${1:-}" == "--all" ]]; then
+  for target_os in linux darwin windows; do
+    for target_arch in amd64 arm64; do
+      suffix=""
+      if [[ "$target_os" == "windows" ]]; then suffix=".exe"; fi
+      output="$BIN_DIR/knot-core-$target_os-$target_arch$suffix"
+      build_target "$target_os" "$target_arch" "$output"
+      echo "Built: $output"
+    done
+  done
+else
+  target_os="$(go env GOOS)"
+  target_arch="$(go env GOARCH)"
+  suffix=""
+  if [[ "$target_os" == "windows" ]]; then suffix=".exe"; fi
+  output="$BIN_DIR/knot-core$suffix"
+  build_target "$target_os" "$target_arch" "$output"
+  echo "Built: $output"
+fi

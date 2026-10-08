@@ -37,12 +37,8 @@ func (s *Service) Control(id string, req ControlRequest) (Session, error) {
 			target = path.Join(res.CurrentDir, target)
 		}
 		target = path.Clean(target)
-		// Advance before I/O so an older follow lookup cannot overwrite manual cd.
-		res.cwdGeneration++
+		// Validate first; a failed cd leaves the directory and follow state intact.
 		generation := res.cwdGeneration
-		if res.FollowSessionID != "" && res.FollowState != "invalid" {
-			res.FollowState = "paused"
-		}
 		s.mu.Unlock()
 		if err := s.directoryAccessible(id, target); err != nil {
 			return Session{}, err
@@ -52,6 +48,10 @@ func (s *Service) Control(id string, req ControlRequest) (Session, error) {
 		if res == nil || res.State != "open" || res.cwdGeneration != generation {
 			s.mu.Unlock()
 			return Session{}, ErrConflict
+		}
+		res.cwdGeneration++
+		if res.FollowSessionID != "" && res.FollowState != "invalid" {
+			res.FollowState = "paused"
 		}
 		now := s.policy.Now().UTC()
 		res.CurrentDir = target

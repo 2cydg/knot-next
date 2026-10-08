@@ -58,9 +58,6 @@ func (w *wsFrameWriter) run() {
 }
 
 func (w *wsFrameWriter) write(frame wsFrame) error {
-	if attachWriteTimeout > 0 {
-		_ = w.conn.SetWriteDeadline(time.Now().Add(attachWriteTimeout))
-	}
 	return w.conn.WriteFrame(frame.opcode, frame.payload)
 }
 

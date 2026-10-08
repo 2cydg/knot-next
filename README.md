@@ -30,19 +30,19 @@ Scripts / Terminal / AI / Third-party Clients
 
 ## Requirements
 
-- Go 1.26.2 or later
+- Go 1.27.1 or later
 - Linux, macOS, or Windows
 - Supported architectures: amd64, arm64
 
 ## Building from Source
 
 ```bash
-# Build knot-core
-cd core
-go build -o ../bin/knot-core ./cmd/core
-
-# Or use the build script
+# From the repository root
 ./scripts/build.sh
+./scripts/test.sh
+./scripts/lint.sh
+# Build all six platform/architecture targets
+./scripts/build.sh --all
 ```
 
 ## Installation
@@ -72,7 +72,7 @@ See [API documentation](core/docs/api/README.md) for complete API reference.
 
 ## Project Status
 
-This is a work in progress. The project is being refactored from the original knot codebase.
+The SSH/SFTP core baseline is implemented and its audit fixes include protocol validation, bounded resources and atomic credential persistence. The public API [workflow example](core/examples/baseline/README.md) and [CLI handoff](core/docs/cli-handoff.md) are available. Current validation and native platform boundaries are recorded in [acceptance evidence](core/docs/baseline-acceptance.md).
 
 Current capabilities:
 - ✅ Server configuration management

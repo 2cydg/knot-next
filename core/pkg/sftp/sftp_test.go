@@ -268,3 +268,10 @@ func waitTransferState(t *testing.T, svc *Service, sessionID string, transferID 
 	t.Fatalf("timed out waiting for transfer %s", transferID)
 	return Transfer{}
 }
+
+func (p *testRuntimeConfigProvider) RememberServerAuth(id string, choice config.AuthChoice) error {
+	profile := p.cfg.Servers[id]
+	profile.AuthMethod, profile.KeyID, profile.Password = choice.Method, choice.KeyID, choice.Password
+	p.cfg.Servers[id] = profile
+	return nil
+}

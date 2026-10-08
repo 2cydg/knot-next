@@ -28,11 +28,15 @@ func (s *Server) eventsWS(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
 	go conn.drainControlFrames(cancel)
 	go pingAttach(ctx, conn, func(opcode int, payload []byte) bool {
 		return conn.WriteFrame(opcode, payload) == nil
 	})
-	_ = conn.WriteFrame(wsOpcodeText, []byte(`{"type":"core.snapshot","api_version":"v1"}`))
+	if err := conn.WriteFrame(wsOpcodeText, []byte(`{"type":"core.snapshot","api_version":"v1"}`)); err != nil {
+		return
+	}
 	for {
 		select {
 		case <-ctx.Done():

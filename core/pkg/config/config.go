@@ -550,16 +550,11 @@ func (s *Service) ResolveServer(ref string) (ServerProfileView, error) {
 	if err != nil {
 		return ServerProfileView{}, err
 	}
-	if server, ok := cfg.Servers[ref]; ok {
-		return s.serverViewWithRecent(cfg, server), nil
+	server, err := ResolveRuntimeServer(RuntimeConfig{Servers: cfg.Servers}, ref)
+	if err != nil {
+		return ServerProfileView{}, err
 	}
-	// Stable alias order, while an exact ID always wins over an alias collision.
-	for _, view := range serverViews(cfg) {
-		if view.Alias == ref {
-			return s.serverViewWithRecent(cfg, cfg.Servers[view.ID]), nil
-		}
-	}
-	return ServerProfileView{}, ErrNotFound
+	return s.serverViewWithRecent(cfg, server), nil
 }
 
 func (s *Service) RuntimeConfig() (RuntimeConfig, error) {

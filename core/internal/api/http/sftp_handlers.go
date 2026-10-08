@@ -222,12 +222,16 @@ func (s *Server) handleSFTPSessionEvents(w stdhttp.ResponseWriter, r *stdhttp.Re
 	defer conn.Close()
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
 	go conn.drainControlFrames(cancel)
 	payload, _ := json.Marshal(map[string]any{
 		"type":    "sftp.session.snapshot",
 		"session": data,
 	})
-	_ = conn.WriteFrame(wsOpcodeText, payload)
+	if err := conn.WriteFrame(wsOpcodeText, payload); err != nil {
+		return
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -262,6 +266,8 @@ func (s *Server) handleSFTPTransferEvents(w stdhttp.ResponseWriter, r *stdhttp.R
 	defer conn.Close()
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
 	go conn.drainControlFrames(cancel)
 
 	// Send snapshot as first frame

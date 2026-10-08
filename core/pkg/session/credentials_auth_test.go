@@ -319,3 +319,20 @@ func waitForWarning(t *testing.T, events <-chan Event, sessionID string) Warning
 		}
 	}
 }
+
+func (s *recordingConfigService) RememberServerAuth(id string, choice config.AuthChoice) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.saveFail != "" {
+		return errors.New(s.saveFail + choice.Password + choice.KeyID)
+	}
+	profile := s.runtime.Servers[id]
+	profile.AuthMethod, profile.KeyID, profile.Password = choice.Method, choice.KeyID, choice.Password
+	s.runtime.Servers[id] = profile
+	s.saves = append(s.saves, savedCredential{ServerID: id, Password: choice.Password, KeyID: choice.KeyID})
+	select {
+	case s.saved <- struct{}{}:
+	default:
+	}
+	return nil
+}

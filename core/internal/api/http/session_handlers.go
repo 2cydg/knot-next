@@ -1,15 +1,10 @@
 package http
 
 import (
-	"bufio"
 	"context"
-	"crypto/sha1"
-	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	stdhttp "net/http"
 	"strings"
 	"sync"
@@ -30,11 +25,6 @@ const (
 	// path. It is a failure bound, not a tail-flush delay.
 	attachDrainTimeout = 5 * time.Second
 )
-
-// attachWriteTimeout bounds a single frame write. A client that stops reading
-// must not be able to block a writer forever; the zero value disables the bound
-// and is only used by tests.
-var attachWriteTimeout = 30 * time.Second
 
 func (s *Server) handleSessions(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	sessionService := s.core.Session()
@@ -231,7 +221,9 @@ func (s *Server) attachSessionWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 	if err != nil {
 		stream.Cancel()
 		stream.Release()
-		_ = conn.WriteFrame(wsOpcodeText, errorFrame("ATTACH_FAILED", err.Error()))
+		if err := conn.WriteFrame(wsOpcodeText, errorFrame("ATTACH_FAILED", err.Error())); err != nil {
+			return
+		}
 		return
 	}
 	defer cancelEvents()
@@ -281,7 +273,7 @@ func (s *Server) attachSessionWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 	beginFinish := func() bool {
 		lifecycleMu.Lock()
 		defer lifecycleMu.Unlock()
-		if terminated {
+		if finishing || terminated {
 			return false
 		}
 		finishing = true
@@ -483,7 +475,19 @@ func (s *Server) attachSessionWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 				return
 			}
 		case wsOpcodeClose:
-			_ = writer.enqueue(wsOpcodeClose, nil)
+			if !beginFinish() {
+				// A remote exit may already own the final frames. Let that
+				// writer finish before this handler's deferred TCP close.
+				writer.wait(attachDrainTimeout)
+				return
+			}
+			cancel()
+			// Stop producers and drain prior frames before echoing Close. Keep
+			// the connection open until the echo has actually been written.
+			writer.close()
+			if writer.wait(attachDrainTimeout) {
+				_ = conn.WriteFrame(wsOpcodeClose, payload)
+			}
 			return
 		}
 		select {
@@ -563,12 +567,16 @@ func (s *Server) sessionEventsWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 	defer conn.Close()
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopClose()
 	go conn.drainControlFrames(cancel)
 	payload, _ := json.Marshal(map[string]any{
 		"type":    "session.snapshot",
 		"session": data,
 	})
-	_ = conn.WriteFrame(wsOpcodeText, payload)
+	if err := conn.WriteFrame(wsOpcodeText, payload); err != nil {
+		return
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -584,204 +592,6 @@ func (s *Server) sessionEventsWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 			if err := conn.WriteFrame(wsOpcodeText, payload); err != nil {
 				return
 			}
-		}
-	}
-}
-
-const (
-	wsOpcodeText   = 1
-	wsOpcodeBinary = 2
-	wsOpcodeClose  = 8
-	wsOpcodePing   = 9
-	wsOpcodePong   = 10
-)
-
-type websocketConn struct {
-	rw      *bufio.ReadWriter
-	c       net.Conn
-	writeMu sync.Mutex
-	// tracker is the registry this connection was handed to at upgrade, so
-	// Close removes it and teardown never closes it twice.
-	tracker *ConnTracker
-}
-
-// SetWriteDeadline bounds a single frame write so a client that stops reading
-// cannot block a writer forever. The deadline is per write, not per connection.
-func (c *websocketConn) SetWriteDeadline(t time.Time) error {
-	return c.c.SetWriteDeadline(t)
-}
-
-// upgradeWebSocket hijacks the connection and, when a tracker is configured,
-// registers it so service teardown can close it. A connection that arrives
-// after teardown began is closed instead of served.
-func (s *Server) upgradeWebSocket(w stdhttp.ResponseWriter, r *stdhttp.Request) (*websocketConn, error) {
-	// Refuse before the upgrade when teardown has begun: an upgraded connection
-	// would already have received a 101 that teardown is about to invalidate.
-	if s.tracker != nil && !s.tracker.accepting() {
-		return nil, errServerShuttingDown
-	}
-	if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		return nil, errors.New("missing websocket upgrade header")
-	}
-	if !strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
-		return nil, errors.New("missing connection upgrade header")
-	}
-	key := r.Header.Get("Sec-WebSocket-Key")
-	if key == "" {
-		return nil, errors.New("missing Sec-WebSocket-Key")
-	}
-	hijacker, ok := w.(stdhttp.Hijacker)
-	if !ok {
-		return nil, errors.New("response writer does not support hijacking")
-	}
-	conn, rw, err := hijacker.Hijack()
-	if err != nil {
-		return nil, err
-	}
-	accept := websocketAccept(key)
-	_, err = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Accept: " + accept + "\r\n\r\n")
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	if err := rw.Flush(); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	ws := &websocketConn{rw: rw, c: conn}
-	if s.tracker != nil {
-		// Publish the back-reference before the connection becomes reachable
-		// through the tracker, so a concurrent CloseAll can never observe a
-		// tracked connection that does not yet know how to deregister itself.
-		ws.tracker = s.tracker
-		if !s.tracker.track(ws) {
-			_ = conn.Close()
-			return nil, errServerShuttingDown
-		}
-	}
-	return ws, nil
-}
-
-var errServerShuttingDown = errors.New("server is shutting down")
-
-func websocketAccept(key string) string {
-	sum := sha1.Sum([]byte(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-	return base64.StdEncoding.EncodeToString(sum[:])
-}
-
-func (c *websocketConn) Close() error {
-	if c.tracker != nil {
-		c.tracker.release(c)
-	}
-	return c.c.Close()
-}
-
-func (c *websocketConn) ReadFrame() (int, []byte, error) {
-	first, err := c.rw.ReadByte()
-	if err != nil {
-		return 0, nil, err
-	}
-	if first&0x70 != 0 {
-		return 0, nil, errors.New("websocket RSV bits are not supported")
-	}
-	second, err := c.rw.ReadByte()
-	if err != nil {
-		return 0, nil, err
-	}
-	opcode := int(first & 0x0f)
-	masked := second&0x80 != 0
-	if !masked {
-		return 0, nil, errors.New("client websocket frames must be masked")
-	}
-	length := uint64(second & 0x7f)
-	switch length {
-	case 126:
-		b1, err := c.rw.ReadByte()
-		if err != nil {
-			return 0, nil, err
-		}
-		b2, err := c.rw.ReadByte()
-		if err != nil {
-			return 0, nil, err
-		}
-		length = uint64(b1)<<8 | uint64(b2)
-	case 127:
-		var n uint64
-		for range 8 {
-			b, err := c.rw.ReadByte()
-			if err != nil {
-				return 0, nil, err
-			}
-			n = n<<8 | uint64(b)
-		}
-		length = n
-	}
-	if length > maxWSFrameSize {
-		return 0, nil, errors.New("websocket frame is too large")
-	}
-	var mask [4]byte
-	if masked {
-		if _, err := io.ReadFull(c.rw, mask[:]); err != nil {
-			return 0, nil, err
-		}
-	}
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(c.rw, payload); err != nil {
-		return 0, nil, err
-	}
-	if masked {
-		for i := range payload {
-			payload[i] ^= mask[i%4]
-		}
-	}
-	return opcode, payload, nil
-}
-
-func (c *websocketConn) WriteFrame(opcode int, payload []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if len(payload) > maxWSFrameSize {
-		return errors.New("websocket frame is too large")
-	}
-	header := []byte{0x80 | byte(opcode)}
-	switch {
-	case len(payload) < 126:
-		header = append(header, byte(len(payload)))
-	case len(payload) <= 0xffff:
-		header = append(header, 126, byte(len(payload)>>8), byte(len(payload)))
-	default:
-		var length [8]byte
-		binary.BigEndian.PutUint64(length[:], uint64(len(payload)))
-		header = append(header, 127)
-		header = append(header, length[:]...)
-	}
-	if _, err := c.rw.Write(header); err != nil {
-		return err
-	}
-	if _, err := c.rw.Write(payload); err != nil {
-		return err
-	}
-	return c.rw.Flush()
-}
-
-func (c *websocketConn) drainControlFrames(cancel context.CancelFunc) {
-	defer cancel()
-	for {
-		opcode, payload, err := c.ReadFrame()
-		if err != nil {
-			return
-		}
-		switch opcode {
-		case wsOpcodePing:
-			if err := c.WriteFrame(wsOpcodePong, payload); err != nil {
-				return
-			}
-		case wsOpcodeClose:
-			_ = c.WriteFrame(wsOpcodeClose, nil)
-			return
 		}
 	}
 }
