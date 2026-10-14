@@ -1,0 +1,146 @@
+package forward
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"golang.org/x/crypto/ssh"
+	"io"
+	"net"
+	"strings"
+	"unicode"
+)
+
+type socks5ReplyError struct {
+	code byte
+}
+
+func (e socks5ReplyError) Error() string {
+	return fmt.Sprintf("socks5 reply code %d", e.code)
+}
+
+func socks5FailureCode(err error) (byte, bool) {
+	replyErr, ok := err.(socks5ReplyError)
+	if !ok {
+		return 0, false
+	}
+	return replyErr.code, true
+}
+
+func readSocks5Greeting(conn net.Conn) (bool, error) {
+	buf := make([]byte, 512)
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
+		return false, err
+	}
+	if buf[0] != 0x05 {
+		return false, fmt.Errorf("invalid socks version")
+	}
+
+	nMethods := int(buf[1])
+	if nMethods == 0 {
+		return false, nil
+	}
+	if _, err := io.ReadFull(conn, buf[:nMethods]); err != nil {
+		return false, err
+	}
+
+	for i := 0; i < nMethods; i++ {
+		if buf[i] == 0x00 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func readSocks5Request(conn net.Conn) (string, error) {
+	buf := make([]byte, 512)
+	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+		return "", err
+	}
+	if buf[0] != 0x05 || buf[1] != 0x01 || buf[2] != 0x00 {
+		return "", socks5ReplyError{code: 0x07}
+	}
+
+	var host string
+	switch buf[3] {
+	case 0x01:
+		if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+			return "", err
+		}
+		host = net.IP(buf[:4]).String()
+	case 0x03:
+		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
+			return "", err
+		}
+		addrLen := int(buf[0])
+		if addrLen == 0 {
+			return "", socks5ReplyError{code: 0x08}
+		}
+		if _, err := io.ReadFull(conn, buf[:addrLen]); err != nil {
+			return "", err
+		}
+		host = string(buf[:addrLen])
+		if invalidSocks5Domain(host) {
+			return "", socks5ReplyError{code: 0x08}
+		}
+	case 0x04:
+		if _, err := io.ReadFull(conn, buf[:16]); err != nil {
+			return "", err
+		}
+		host = net.IP(buf[:16]).String()
+	default:
+		return "", socks5ReplyError{code: 0x08}
+	}
+
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
+		return "", err
+	}
+	port := int(buf[0])<<8 | int(buf[1])
+	if port == 0 {
+		return "", socks5ReplyError{code: 0x08}
+	}
+	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
+}
+
+func invalidSocks5Domain(host string) bool {
+	if strings.TrimSpace(host) != host {
+		return true
+	}
+	for _, r := range host {
+		if r < 0x20 || r == 0x7f || unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func writeSocks5NoAuth(conn net.Conn) error {
+	_, err := conn.Write([]byte{0x05, 0x00})
+	return err
+}
+
+func writeSocks5Failure(conn net.Conn, code byte) error {
+	_, err := conn.Write([]byte{0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	return err
+}
+
+func writeSocks5Success(conn net.Conn) error {
+	_, err := conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	return err
+}
+
+// SSH communicates channel refusal as ConnectionFailed without an OS errno.
+func dialFailureCode(err error) byte {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return 6
+	}
+	var timeout net.Error
+	if errors.As(err, &timeout) && timeout.Timeout() {
+		return 6
+	}
+	var channel *ssh.OpenChannelError
+	if errors.As(err, &channel) && channel.Reason == ssh.Prohibited {
+		return 2
+	}
+	return 1 // general failure: do not invent a more specific remote cause
+}

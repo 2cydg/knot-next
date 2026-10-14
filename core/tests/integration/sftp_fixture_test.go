@@ -15,6 +15,7 @@ import (
 	"knot-core/pkg/config"
 	"knot-core/pkg/core"
 	"knot-core/pkg/crypto"
+	"knot-core/pkg/forward"
 	"knot-core/pkg/secret"
 	"knot-core/pkg/session"
 	"knot-core/pkg/sftp"
@@ -30,20 +31,23 @@ import (
 // subsystems on the remote, so both sessions see the same remote filesystem.
 // This fixture does not wire process context, API shutdown, or runtime discovery;
 // it covers resource API behavior, not process-level shutdown of in-flight work.
-func newSFTPAPI(t *testing.T, handlers protocolsftp.Handlers) (*sftpAPIClient, *sshserver.Server) {
+func newSFTPAPI(t *testing.T, handlers protocolsftp.Handlers, additionalPasswords ...string) (*sftpAPIClient, *sshserver.Server) {
+	return newSFTPAPIWithDeadline(t, handlers, 0, additionalPasswords...)
+}
+func newSFTPAPIWithDeadline(t *testing.T, handlers protocolsftp.Handlers, deadline time.Duration, additionalPasswords ...string) (*sftpAPIClient, *sshserver.Server) {
 	t.Helper()
 	remote := sshserver.New(t, sshserver.Config{
-		User: "sftp-test", Password: "artificial-password", SFTPHandlers: &handlers,
+		User: "sftp-test", Password: "artificial-password", SFTPHandlers: &handlers, AdditionalPasswords: additionalPasswords,
 	})
 	root := t.TempDir()
 	layout := paths.NewLayout(filepath.Join(root, "config"), filepath.Join(root, "state"))
 	provider := crypto.NewStaticProvider([]byte("sftp-integration-key"))
 	cfg := config.NewService(layout, provider)
 	pool := sshpool.NewPool()
-	sshSessions := session.NewService()
+	sshSessions := session.NewService(session.Options{ChallengeTimeout: deadline})
 	sshSessions.UseConfig(cfg)
 	sshSessions.UsePool(pool)
-	files := sftp.NewService(filepath.Join(root, "sftp"))
+	files := sftp.NewService(filepath.Join(root, "sftp"), sftp.Options{ChallengeTimeout: deadline})
 	files.UseConfig(cfg)
 	files.UsePool(pool)
 	files.UseSession(sshSessions)
@@ -53,6 +57,9 @@ func newSFTPAPI(t *testing.T, handlers protocolsftp.Handlers) (*sftpAPIClient, *
 	service.UseSession(sshSessions)
 	service.UseSFTP(files)
 	service.UseSSHPool(pool)
+	forwards := forward.NewService(pool)
+	pool.UseTargetHook(forwards.EnsureAutoForwards)
+	service.UseForward(forwards)
 	tracker := apihttp.NewConnTracker()
 	api := apihttp.NewServer(service, nil, auth.NewVerifier("sftp-test-token"), auth.NewOriginChecker([]string{sftpTestOrigin}), apihttp.WithConnTracker(tracker))
 	httpServer := httptest.NewServer(api.Handler())

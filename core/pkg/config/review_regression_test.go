@@ -72,12 +72,6 @@ func TestReviewEncryptedPEMImportRoundTrip(t *testing.T) {
 				t.Fatal(err)
 			}
 			material := []byte(cfg.Keys["key"].PrivateKey)
-			if sourcePath {
-				material, err = os.ReadFile(cfg.Keys["key"].SourcePath)
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
 			if !bytes.Equal(material, raw) || cfg.Keys["key"].Passphrase != "" {
 				t.Fatal("original PEM changed or passphrase retained")
 			}
@@ -104,11 +98,21 @@ func TestReviewEncryptedPEMSourceRegistration(t *testing.T) {
 	if err := os.WriteFile(path, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	view, err := svc.CreateKey(KeyMetadata{ID: "key", Alias: "deploy", SourcePath: path})
+	if _, err := svc.CreateKey(KeyMetadata{ID: "key", Alias: "deploy", SourcePath: path}); !errors.Is(err, ErrValidation) {
+		t.Fatal("ordinary metadata accepted private source input")
+	}
+	// Preserve an existing legacy disk record; GET must not convert it.
+	if err := svc.withConfig(func(cfg *Config) error {
+		cfg.Keys["key"] = KeyMetadata{ID: "key", Alias: "deploy", SourcePath: path, Encrypted: true}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	view, err := svc.GetKey("key")
 	if err != nil || !view.Encrypted || !view.PrivateKeySet || view.Fingerprint != "" || view.Type != "" || view.Length != 0 {
 		t.Fatalf("locked PEM cannot be registered without metadata: %+v, %v", view, err)
 	}
-	if _, err := svc.SetKeyPrivate("key", "", path); err != nil {
+	if _, err := svc.SetKeyPrivate("key", "", path); !errors.Is(err, keyutil.ErrPassphraseRequired) {
 		t.Fatal(err)
 	}
 	before, _ := os.ReadFile(svc.path)

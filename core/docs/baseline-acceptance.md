@@ -376,3 +376,7 @@ Linux amd64 / Go 1.27.1，module 与 CI 当前均为 Go 1.27.1，`GOWORK=off GOC
 再次对照 workspace《基线修复-代码审核.md》处理：env 拒绝降为可观察 warning，整个 env 阶段共享 15 秒且最多 64 项；SSH/SFTP 空 Remember 和 passphrase-only 不写盘；attach Close 回显完成后再关闭 TCP；公开递归 Mkdir 与上传共用祖先缓存失效；WS 超限使用 1009，调用参数错误不关闭健康连接。补 12 个测试入口并修正扩展长度辅助编码、CLOSE 原因断言、并发配置事务验证和测试替身。
 
 Linux Go 1.27.1 全量测试、全量 race、新修复四包 race ×10、gofmt/vet 和六目标构建通过，日志 `/tmp/knot-rereview-{tests,full-race,race-repeat,lint,build}.log`。最后 attach Close 竞争等待由完整 HTTP 包 race ×10 验证（`/tmp/knot-rereview-http-final-race.log`）。仍未执行远端 Actions 或原生非 Linux/外部 OpenSSH 验证。
+
+## 2026-10-14 core 缺口补齐交付
+
+连接身份、挑战过期、动态跨连接跟随、私钥原文导入、代理测试、真实临时/自动 L/R/D 转发及配置/文件修正已交付。最新契约、已执行验证和平台边界见 [本轮验收](gap-acceptance.md)。前文的 SourcePath 注册、forwards planned 等描述保留其原日期历史范围，本轮接口变更以新记录/API 分册为准。

@@ -18,20 +18,24 @@
 
 ```json
 {
-  "id": "sftp_1",
+  "id": "sftp_0123456789abcdef",
   "server_ref": "prod",
   "alias": "prod",
   "state": "open",
   "backend": "ssh-sftp",
   "root": "/",
   "current_dir": "/var/log",
-  "follow_session_id": "session_1",
+  "follow_source_dir": "/var/log",
+  "follow_state": "active",
+  "connection_id": "conn_0123456789abcdef",
+  "follow_session_id": "ssh_0123456789abcdef",
+  "follow_connection_id": "conn_fedcba9876543210",
   "host_key_policy": "ask",
   "host_key_pending": false,
   "auth_pending": false,
   "disconnect_cause": "",
-  "events_url": "/v1/sftp/sftp_1/events",
-  "transfer_events_url": "/v1/sftp/sftp_1/transfers/events",
+  "events_url": "/v1/sftp/sftp_0123456789abcdef/events",
+  "transfer_events_url": "/v1/sftp/sftp_0123456789abcdef/transfers/events",
   "created_at": "2026-05-15T12:00:00Z",
   "updated_at": "2026-05-15T12:00:10Z",
   "closed_at": null
@@ -66,16 +70,16 @@
 `type` 由实现推导，常见值为：
 
 - `file`
-- `dir`
+- `directory`
 - `symlink`
-- 其他底层文件类型的字符串表示
+其他非目录/非链接对象仍按 file 表示，实际 mode 可进一步识别。
 
 ### Transfer
 
 ```json
 {
   "id": "transfer_2",
-  "session_id": "sftp_1",
+  "session_id": "sftp_0123456789abcdef",
   "direction": "upload",
   "source": "/local/file.txt",
   "target": "/remote/file.txt",
@@ -113,7 +117,7 @@
 ```json
 {
   "type": "sftp.session.opened",
-  "session_id": "sftp_1",
+  "session_id": "sftp_0123456789abcdef",
   "state": "open",
   "path": "",
   "error": "",
@@ -134,7 +138,7 @@
 ```json
 {
   "type": "sftp.transfer.progress",
-  "session_id": "sftp_1",
+  "session_id": "sftp_0123456789abcdef",
   "transfer_id": "transfer_2",
   "direction": "upload",
   "state": "running",
@@ -155,6 +159,7 @@
 - `POST /v1/sftp`
 - `GET /v1/sftp/{id}`
 - `DELETE /v1/sftp/{id}`
+- `POST /v1/sftp/{id}/control`
 - `GET /v1/sftp/{id}/files`
 - `POST /v1/sftp/{id}/files`
 - `HEAD /v1/sftp/{id}/files`
@@ -185,7 +190,9 @@
 {
   "server_ref": "prod",
   "alias": "prod",
-  "follow_session_id": "session_1",
+  "connection_id": "conn_0123456789abcdef",
+  "follow_session_id": "ssh_0123456789abcdef",
+  "follow_connection_id": "conn_fedcba9876543210",
   "host_key_policy": "ask",
   "agent_socket": "/tmp/agent.sock",
   "allow_auth_retry": true
@@ -224,7 +231,7 @@ query：
 
 - `path`: 目标路径
 - `show_hidden`: 是否显示隐藏文件
-- `sort`: 排序字段
+- `sort`: `name`（默认）、`size`、`mod_time`、`type`；加 `-` 前缀降序，如 `-size`
 - `limit`: 分页大小
 - `offset`: 偏移
 - `cache`: 是否使用目录缓存，默认 `true`
@@ -463,7 +470,7 @@ query：
 ```json
 {
   "type": "sftp.transfer.snapshot",
-  "session_id": "sftp_1",
+  "session_id": "sftp_0123456789abcdef",
   "transfers": []
 }
 ```
@@ -539,14 +546,42 @@ SFTP session 新增 `server_id`、`follow_state`、`follow_error`、`cwd_updated
 
 | op | 行为 |
 | --- | --- |
-| `cd` | 校验目录存在且可列出后更新 SFTP CWD，相对路径按当前 SFTP CWD 解析；有有效 follow 时自动暂停。即使目录验证失败，也暂停 follow，避免用户操作被旧观察覆盖。 |
+| `cd` | 校验目录存在且可列出后更新 SFTP CWD，相对路径按当前 SFTP CWD 解析；有有效 follow 时自动暂停。目录验证失败保留原 CWD 和 follow；成功 cd 才暂停。 |
 | `pause-follow` | 保留关联、最后目录和源订阅；后续观察不更新 SFTP CWD。 |
-| `resume-follow` | 从关联 SSH session GET 最新目录并重新验证，成功后立即跟随；源未知目录时保持旧值。 |
+| `resume-follow` | 先恢复 active 绑定，返回 200 和已提交 View，再以 follow_error/GET/events 表达最新目录校验结果；源未知目录时保持旧值。 |
 
-无 follow 的暂停/恢复、已失效来源和未 open 的 session 返回 `409 CONFLICT`；无效 op/path、目录不可访问返回 `400 VALIDATION_FAILED`。不存在的 session 为 `404 NOT_FOUND`。
+无 follow 的暂停/恢复、已失效来源和未 open 的 session 返回 `409 CONFLICT`；无效 op/path、cd 目录不可访问返回 `400 VALIDATION_FAILED`。不存在的 session 为 `404 NOT_FOUND`。
 
-`follow_state` 为 `active`、`paused` 或 `invalid`；未关联时省略。每次跟随先绕过目录缓存执行实际读取权限校验。本地测试后端读取至多一个条目；远端目前使用库的完整 `ReadDirContext`（取消随服务退出，关闭客户端也终止 I/O），省去 Entry 构造、排序和分页。`Stat` 只能确认路径类型，无法证明可列出；现有库未公开目录句柄或限量读取接口，因此远端大目录的全量读取开销仍保留。失败保留最后可用目录，`follow_error=directory_unavailable`，发布 `sftp.cwd.follow_error`；有效的新观察/恢复成功清除错误。关闭源会停止 follower，保持最后目录，`follow_state=invalid` 并发布 `sftp.follow.invalidated`，不能恢复该关联。
+`follow_state` 为 `active`、`paused` 或 `invalid`；未关联时省略。每次跟随先绕过目录缓存执行实际读取权限校验。本地测试后端读取至多一个条目；远端目前使用库的完整 `ReadDirContext`（取消随服务退出，关闭客户端也终止 I/O），省去 Entry 构造、排序和分页。`Stat` 只能确认路径类型，无法证明可列出；现有库未公开目录句柄或限量读取接口，因此远端大目录的全量读取开销仍保留。失败保留最后可用目录，`follow_error=directory_unavailable`，发布 `sftp.cwd.follow_error`；有效的新观察/恢复成功清除错误。关闭源会停止 follower，保持最后目录，`follow_state=invalid` 并发布 `sftp.follow.invalidated`，不能恢复该已失效来源；可 set-follow 换为新的就绪来源。
 
-相关事件：`sftp.cwd.changed`、`sftp.cwd.follow`、`sftp.cwd.follow_error`、`sftp.follow.paused`、`sftp.follow.invalidated`。事件有界，恢复以 session GET 为准。源停止时不会将目录重置到 `/`。本轮不自动注入 shell hook，也不使用客户端默认本地目录设置改变 core cwd。
+相关事件：`sftp.cwd.changed`、`sftp.cwd.follow`、`sftp.cwd.follow_error`、`sftp.follow.paused`、`sftp.follow.invalidated`、`sftp.follow.changed`、`sftp.follow.cleared`。事件有界，恢复以 session GET 为准。源停止时不会将目录重置到 `/`。本轮不自动注入 shell hook，也不使用客户端默认本地目录设置改变 core cwd。
 
 缓存保留上限为 256 项/4 MiB 估算成本，超大目录不缓存。失效同时阻止在途旧结果回填，递归及部分失败上传覆盖所有修改目录。文件完成要求 copy 和目标 Close 均成功。失败 cd 保留旧 CWD/follow 状态；成功 cd 才暂停 follow。Remember 采用与 SSH 相同的原子认证选择事务。
+
+## 跨连接绑定与精确文件操作
+
+创建可带 `connection_id`（SFTP 传输连接）、`follow_session_id`、`follow_connection_id`（来源连接）。不传传输连接仍走配置连接流程，选择来源不会暗中切换 transport；前端首次希望复用来源时显式把来源连接 ID 同时填入 connection_id。来源会话须 connected/attached/detached，属于同一服务器，且携带的来源连接 ID 实际配对；不要求等于 SFTP 连接。省略来源连接 ID 的旧创建调用由 core 从真实来源补齐。
+
+control 新增：
+
+```json
+{"op":"set-follow","follow_session_id":"ssh_0123456789abcdef","follow_connection_id":"conn_0123456789abcdef"}
+```
+
+`set-follow` 可新增/切换，包括旧来源已失效；验证/订阅容量/并发提交失败保持原关联。相同有效来源幂等，不额外占用订阅。提交后目录验证由新订阅 worker 异步执行；HTTP 200 表示关联成功，GET/events 表达目录应用结果，不能把它当作目录已经应用。换源不新建 SFTP ID/transport。`{"op":"clear-follow"}` 清关联、follow_state/error/source_dir，取消订阅并保留当前目录与目录时间；pause 保留来源。代际保护阻止旧验证/关闭通知迟到回写。
+
+View 新增自己的 connection_id、follow_connection_id、follow_source_dir。follow_state=active 且 follow_source_dir 空表示等待 OSC7；current_dir 初始 `/` 不表示已经跟随。权限失败保留关联及最后目录，follow_error=directory_unavailable，用 SFTP 自己的身份验证。
+
+batch-download 新增 `source_mode=literal|glob`，省略保留 glob。literal 逐个验证绝对来源，不解释 `[]*?`；include_dirs/recursive/overwrite 继续显式传递。UI 文件选择应使用 literal。目录递归使用现有遍历，远端可能跟随链接，未提供跨服务端统一的链接循环/目录沙箱保证；客户端选择可信来源，循环/权限失败按传输结果处理。
+
+`GET files?stat=true&follow_symlinks=false` 提供 Lstat；默认 Stat 跟随。列表识别 symlink、directory、file。DELETE files 删除链接本身；DELETE dirs 仅真实目录，非空仍拒绝。rename 请求新增 overwrite，省略保留旧默认 true；false 预检已有目标并报 409，远端使用普通 SFTP rename；true 在服务端支持时用 posix-rename。标准 SFTP 和本机通用 os.Rename 缺少统一的原子 no-replace，预检不能消除并发竞争。rename 返回链接自身属性。
+
+-size/-mod_time 排序使用严格比较及 name/path 次关键字，相等对象不会互相判为小于。大目录列表和目录访问验证仍有完整 ReadDir 成本，缓存/分页不等于服务端增量遍历。挑战身份、60 秒期限及明确过期机器码与 [SSH](sessions.md) 相同。
+
+每个 SFTP 同时最多 8 个 follow worker（含仍在收尾的旧来源）；达到上限的换源返回 409 并保留原关联。换源/clear 取消原目录校验 context 和订阅，旧 RPC 的迟到结果受 generation 保护。库的目录句柄 Close 仍可能等待协议回复；取消不声称远端句柄/全部 I/O 已同步释放，关闭目标 subsystem/shutdown 才能中断相应传输。
+
+follow 与 cwd 事件携带当前 `follow_session_id`、`follow_connection_id`、`follow_source_dir`、`follow_state`、`follow_error`（非空时输出）；clear 事件中这些字段省略表示清空。事件通知丢失时以 GET 的完整 View 替换旧模型。串行和并发同源 set-follow 都幂等成功。
+
+literal 下载选择目录却未提供 include_dirs=true 时，任务失败明确说明目录选项缺失，不冒称来源不存在。batch-upload 只支持 literal 来源（空 source_mode 等价 literal），glob 或未知 source_mode 返回 400，上传不会静默忽略该字段。
+
+overwrite=true 在无 posix-rename 扩展的服务端使用标准 rename；若服务端拒绝且目标确实存在，返回 409 CONFLICT，不删除目标再重试，不承诺不受支持的原子覆盖。目标已消失或真实权限/连接错误继续保留实际错误。

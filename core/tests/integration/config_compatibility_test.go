@@ -288,7 +288,7 @@ func TestEncryptedPrivateKeyChallengesThroughHTTP(t *testing.T) {
 					if err := os.WriteFile(path, rawPEM, 0600); err != nil {
 						t.Fatal(err)
 					}
-					c.call(t, http.MethodPut, "/v1/secrets/keys/key_legacy/private", map[string]any{"source_path": path}, http.StatusOK, nil)
+					c.call(t, http.MethodPut, "/v1/secrets/keys/key_legacy/private", map[string]any{"source_path": path, "passphrase": "attempt-only-passphrase"}, http.StatusOK, nil)
 				}
 				before := configFiles(t, fixture.layout)
 				var resource struct {
@@ -383,15 +383,15 @@ func TestEncryptedPrivateKeyExecAndSourceChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.call(t, http.MethodPost, "/v1/sessions/exec", map[string]any{"server_ref": "prod", "command": "test", "host_key_policy": "strict"}, http.StatusOK, &result)
-	if result.State != "failed" || result.FrameworkCode != "authentication_failed" {
-		t.Fatal("changed SourcePath reused cached signer/client")
+	if result.State != "completed" {
+		t.Fatal("source replacement changed imported private material")
 	}
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
 	c.call(t, http.MethodPost, "/v1/sessions/exec", map[string]any{"server_ref": "prod", "command": "test", "host_key_policy": "strict"}, http.StatusOK, &result)
-	if result.State != "failed" {
-		t.Fatal("missing SourcePath reused cached client")
+	if result.State != "completed" {
+		t.Fatal("source deletion changed imported private material")
 	}
 	// No ordinary response exposes the passphrase or private key.
 	req, _ := http.NewRequest(http.MethodGet, c.baseURL+"/v1/config", nil)

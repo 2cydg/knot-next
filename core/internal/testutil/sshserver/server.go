@@ -62,6 +62,9 @@ type Server struct {
 	beforeExec      chan struct{}
 	beforeExit      chan struct{}
 	beforeSubsystem chan struct{}
+	beforeForward   chan struct{}
+	forwardStarted  chan struct{}
+	rejectForward   bool
 }
 
 // PTYRequest records one accepted pty-req.
@@ -87,6 +90,7 @@ type EnvRequest struct {
 // ShellBehavior programs a shell session. The zero value keeps the default echo
 // behaviour; set Scripted to take control of the session.
 type ShellBehavior struct {
+	Started chan struct{}
 	// Scripted switches the shell from echo to a programmed session.
 	Scripted bool
 	// Writes are emitted in order after stdin handling. Each write may be gated,
@@ -150,6 +154,7 @@ func (s *Server) ExecCommands() []string {
 
 // Config holds server configuration.
 type Config struct {
+	AdditionalPasswords []string
 	// RejectEnv simulates an SSH server without an AcceptEnv allowlist.
 	RejectEnv         bool
 	User              string
@@ -213,7 +218,13 @@ func newServer(t *testing.T, cfg Config, listener net.Listener) *Server {
 			if !srv.waitBarrier(func(s *Server) chan struct{} { return s.beforeAuth }) {
 				return nil, net.ErrClosed
 			}
-			if meta.User() != cfg.User || string(pass) != cfg.Password {
+			accepted := string(pass) == cfg.Password
+			for _, alternative := range cfg.AdditionalPasswords {
+				if string(pass) == alternative {
+					accepted = true
+				}
+			}
+			if meta.User() != cfg.User || !accepted {
 				return nil, fmt.Errorf("unauthorized")
 			}
 			return nil, nil
@@ -426,7 +437,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	s.goroutines.Add(1)
 	go func() {
 		defer s.goroutines.Done()
-		ssh.DiscardRequests(reqs)
+		s.handleGlobalRequests(serverConn, reqs)
 	}()
 
 	for newCh := range chans {
@@ -479,7 +490,10 @@ func (s *Server) handleDirectTCPIP(newCh ssh.NewChannel) {
 	if err != nil {
 		return
 	}
-	defer targetConn.Close()
+	s.mu.Lock()
+	s.transports[targetConn] = struct{}{}
+	s.mu.Unlock()
+	defer func() { _ = targetConn.Close(); s.mu.Lock(); delete(s.transports, targetConn); s.mu.Unlock() }()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -487,11 +501,15 @@ func (s *Server) handleDirectTCPIP(newCh ssh.NewChannel) {
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(targetConn, channel)
+		if tcp, ok := targetConn.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
 	}()
 
 	go func() {
 		defer wg.Done()
 		_, _ = io.Copy(channel, targetConn)
+		_ = channel.CloseWrite()
 	}()
 
 	wg.Wait()
@@ -679,6 +697,9 @@ func (h *sessionHandler) runShell() {
 	behavior := h.server.shell
 	beforePTY := h.server.beforePTY
 	h.server.mu.Unlock()
+	if behavior.Started != nil {
+		close(behavior.Started)
+	}
 
 	if beforePTY != nil {
 		select {
@@ -954,4 +975,32 @@ func (s *Server) SetSubsystemBarrier(barrier chan struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.beforeSubsystem = barrier
+}
+
+// SetForwardBarrier holds remote-forward request replies for cancellation tests.
+func (s *Server) SetForwardBarrier(barrier chan struct{}, started ...chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.beforeForward = barrier
+	if len(started) > 0 {
+		s.forwardStarted = started[0]
+	}
+}
+
+// DropTransports includes connections still waiting for host-key confirmation.
+func (s *Server) DropTransports() {
+	s.mu.Lock()
+	conns := make([]net.Conn, 0, len(s.transports))
+	for c := range s.transports {
+		conns = append(conns, c)
+	}
+	s.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+func (s *Server) SetRejectForward(reject bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rejectForward = reject
 }

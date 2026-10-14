@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"knot-core/pkg/config"
 	stdhttp "net/http"
 	"os"
 	"strconv"
@@ -67,13 +68,18 @@ func (s *Server) handleSFTP(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 			return
 		}
 		var body struct {
-			OldPath string `json:"old_path"`
-			NewPath string `json:"new_path"`
+			Overwrite *bool  `json:"overwrite,omitempty"`
+			OldPath   string `json:"old_path"`
+			NewPath   string `json:"new_path"`
 		}
 		if !decodeJSON(w, r, &body) {
 			return
 		}
-		data, err := sftpService.Rename(parts[0], body.OldPath, body.NewPath)
+		overwrite := true
+		if body.Overwrite != nil {
+			overwrite = *body.Overwrite
+		}
+		data, err := sftpService.RenameWithOptions(parts[0], body.OldPath, body.NewPath, overwrite)
 		writeSFTPResult(w, stdhttp.StatusOK, response.RiskRemoteMutation, "sftp/"+parts[0]+"/rename", data, err)
 	case len(parts) == 2 && parts[1] == "upload":
 		if !requireMethod(w, r, stdhttp.MethodPost) {
@@ -154,7 +160,7 @@ func handleSFTPFiles(w stdhttp.ResponseWriter, r *stdhttp.Request, sftpService *
 	switch r.Method {
 	case stdhttp.MethodGet:
 		if queryBoolDefault(r, "stat", false) || r.URL.Query().Get("op") == "stat" {
-			data, err := sftpService.Stat(id, remotePath)
+			data, err := sftpService.StatWithOptions(id, remotePath, queryBoolDefault(r, "follow_symlinks", true))
 			writeSFTPResult(w, stdhttp.StatusOK, response.RiskRemoteRead, "sftp/"+id+"/files", data, err)
 			return
 		}
@@ -382,11 +388,20 @@ func writeSFTPDeleted(w stdhttp.ResponseWriter, risk response.Risk, resource str
 }
 
 func writeSFTPError(w stdhttp.ResponseWriter, risk response.Risk, resource string, err error) {
+	var fields *config.ValidationFailure
+	if errors.As(err, &fields) {
+		response.JSONError(w, 400, response.Error{Code: "VALIDATION_FAILED", Message: fields.Error(), Risk: risk, Resource: resource, Details: map[string]any{"fields": fields.Errors}})
+		return
+	}
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		writeAPIError(w, stdhttp.StatusNotFound, risk, resource, "NOT_FOUND", "remote path was not found")
 	case isSFTPPermissionError(err):
 		writeAPIError(w, stdhttp.StatusForbidden, risk, resource, "PERMISSION_DENIED", err.Error())
+	case errors.Is(err, sftp.ErrHostKeyChallengeExpired):
+		writeAPIError(w, 409, risk, resource, "HOST_KEY_CHALLENGE_EXPIRED", err.Error())
+	case errors.Is(err, sftp.ErrAuthChallengeExpired):
+		writeAPIError(w, 409, risk, resource, "AUTH_CHALLENGE_EXPIRED", err.Error())
 	case errors.Is(err, sftp.ErrNotFound):
 		writeAPIError(w, stdhttp.StatusNotFound, risk, resource, "NOT_FOUND", "sftp resource was not found")
 	case errors.Is(err, sftp.ErrConflict):

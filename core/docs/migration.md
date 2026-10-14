@@ -13,7 +13,7 @@
 | Linux | 复用 `.salt`、`.crypto-state`，固定已选 provider；Secret Service 身份为 `knot` / `knot-master-key`，fallback 为旧 machine-id + NUL + UID 派生 |
 | macOS | 复用旧 Keychain 身份 `knot` / `knot-master-key` 与原 machine fallback；不删除或替换损坏的既有 Keychain item |
 | Windows | 保持旧 DPAPI flags=1、无额外 entropy，以及原 machine fallback；DPAPI 绑定原 Windows 账号 |
-| 持久 forwards | 完整保留在服务器的 TOML 中；引擎仍为 planned，不自动启动 |
+| 持久 forwards | 保留并兼容映射，目标 transport 首次取得时自动启用；扩展字段/备份及旧 loader 边界见 api/forwards.md |
 | 客户端偏好 | 当前完整保留；客户端配置拆分在客户端阶段处理 |
 | 默认同步 provider | TOML 保存 alias；HTTP 返回/接受 ID，读写时映射 |
 | core 发现文件 | state 目录下 `runtime/core.json` 和 `runtime/token`；不覆盖旧 daemon 的 PID、socket、发现文件 |
@@ -72,3 +72,13 @@ ID 与 alias 分别命中不同目标对象属于歧义冲突，三种策略都�
 回退时先停止 core。正常读写后旧版可直接加载 TOML 和原凭据材料；需要恢复显式导入或 backend 迁移前的状态时使用对应备份并保持配套加密材料。恢复标记尚存在时，应先完成或检查该事务。
 
 验证包含旧实现生成的固定密文、只读文件 hash、旧加载器实际回读、真实 HTTP→SSH/SFTP 私钥认证与信任检查，以及子进程强制退出后的 bootstrap 恢复。macOS / Windows 原生凭据库互操作尚未执行；交叉构建仅证明编译通过。
+
+新 secrets source_path 写入已改为原文导入；旧磁盘 SourcePath-only key 仍保留兼容读取，首次显式重新导入才清引用，不在 GET 自动迁移。转发扩展配置写入前保存 config.toml.pre-forwards.bak；回退旧版本应恢复备份，不能让旧 loader 静默忽略 bind/enabled 等新语义。
+
+## 私钥文件读取与 bind 校验的兼容性收窄
+
+旧 SourcePath-only 私钥仍不自动改成内联材料，旧相对路径仍相对于 core 工作目录解析。但认证、身份摘要和新导入现在共用普通文件/1 MiB 上限检查，手写配置引用设备、FIFO、目录或超限文件会被拒绝；新导入额外要求原输入为绝对路径。原位置只读配置不会因这项加固而改写文件。
+
+扩展 forward 的 bind 现在只接受有效 IP（IPv6 可带 zone）或精确的 `localhost`，不接受 `myhost:8080` 等 hostname bind。这相对于此前仅检查 host:port 的手写配置是兼容性收窄，保留它是为了在保存和创建实例前判定绑定地址，不隐含选择 DNS 解析出的接口。
+
+只读加载及 GET 仍可原样显示已有 hostname bind，但后续配置写入的最终校验、新运行实例创建和显式导入会拒绝它；自动启用时会留下失败结果，不静默改写或声称已启用。可先通过 GET/PUT forwards 整组把 bind 改为需要绑定的具体 IP（仅本机访问可用 `127.0.0.1`、`[::1]` 或 `localhost`），也可在停止 daemon 后编辑 TOML。其他普通配置写入须在修正后进行。target 仍接受合法 hostname，此收窄不适用于转发目标地址。

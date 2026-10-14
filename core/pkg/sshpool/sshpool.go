@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -20,13 +19,14 @@ import (
 	"time"
 
 	"knot-core/internal/keyutil"
+	"knot-core/internal/proxyproto"
+	"knot-core/internal/resourceid"
 	"knot-core/internal/resourcepolicy"
 	"knot-core/pkg/config"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
-	"golang.org/x/net/proxy"
 )
 
 var (
@@ -92,10 +92,14 @@ type DialOptions struct {
 }
 
 type Pool struct {
+	reservedIDs        map[string]time.Time
+	targetHook         func(string, string, []config.ForwardDefinition)
 	forwardAgents      map[*ssh.Client]string
 	workers            resourcepolicy.Group
 	callbacks          resourcepolicy.Callbacks
 	mu                 sync.Mutex
+	idGenerator        resourceid.Generator
+	sequence           uint64
 	entries            map[string]*entry
 	inflight           map[string]*inflightRoute
 	idleTimeout        time.Duration
@@ -111,6 +115,14 @@ type Pool struct {
 var attemptGrace = 2 * time.Second
 
 type entry struct {
+	done       chan struct{}
+	id         string
+	createdAt  time.Time
+	sequence   uint64
+	port       int
+	user       string
+	target     bool
+	parents    []*entry
 	client     *ssh.Client
 	lastAccess time.Time
 	refCount   int
@@ -144,13 +156,14 @@ type inflightRoute struct {
 }
 
 type EntryStat struct {
-	Key       string   `json:"key"`
-	ServerID  string   `json:"server_id"`
-	Alias     string   `json:"alias"`
-	Host      string   `json:"host"`
-	IdleTime  string   `json:"idle_time"`
-	RefCount  int      `json:"ref_count"`
-	ChainKeys []string `json:"chain_keys,omitempty"`
+	ConnectionID string   `json:"connection_id"`
+	Key          string   `json:"-"`
+	ServerID     string   `json:"server_id"`
+	Alias        string   `json:"alias"`
+	Host         string   `json:"host"`
+	IdleTime     string   `json:"idle_time"`
+	RefCount     int      `json:"ref_count"`
+	ChainKeys    []string `json:"-"`
 }
 
 var dialClient = dial
@@ -159,6 +172,7 @@ func NewPool() *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Pool{
 		entries:     map[string]*entry{},
+		reservedIDs: map[string]time.Time{},
 		inflight:    map[string]*inflightRoute{},
 		idleTimeout: 30 * time.Minute,
 		ctx:         ctx,
@@ -197,12 +211,14 @@ func (p *Pool) GetClientContext(ctx context.Context, server config.ServerProfile
 // tied to the original entries, so Clear/recreation cannot release a new owner.
 // Keep the lease until all channel and cleanup work has actually ended.
 type ClientLease struct {
-	Client   *ssh.Client
-	Keys     []string
-	Created  bool
-	releases []func()
-	entries  []*entry
-	once     sync.Once
+	Done         <-chan struct{}
+	ConnectionID string
+	Client       *ssh.Client
+	Keys         []string
+	Created      bool
+	releases     []func()
+	entries      []*entry
+	once         sync.Once
 }
 
 func (l *ClientLease) Release() {
@@ -247,6 +263,9 @@ func (p *Pool) getClientContext(ctx context.Context, server config.ServerProfile
 		}
 	}
 	lease := &ClientLease{Keys: make([]string, 0, len(routes))}
+	if !retain {
+		defer lease.Release()
+	}
 	for _, route := range routes {
 		for {
 			if err := ctx.Err(); err != nil {
@@ -258,13 +277,18 @@ func (p *Pool) getClientContext(ctx context.Context, server config.ServerProfile
 				lease.Release()
 				return nil, err
 			}
-			if retain {
+			{
 				ent, release, held := p.retainClient(key, client)
 				if !held {
 					// Idle replacement or Clear won before acquisition. Retry rather
 					// than returning the old client or incrementing its replacement.
 					continue
 				}
+				p.mu.Lock()
+				if p.entries[key] == ent {
+					ent.parents = append([]*entry(nil), lease.entries...)
+				}
+				p.mu.Unlock()
 				lease.entries = append(lease.entries, ent)
 				lease.releases = append(lease.releases, release)
 			}
@@ -275,6 +299,31 @@ func (p *Pool) getClientContext(ctx context.Context, server config.ServerProfile
 		}
 	}
 	p.setChainKeys(lease.Keys...)
+	p.mu.Lock()
+	target := p.entries[lease.Keys[len(lease.Keys)-1]]
+	if target == nil || target.client != lease.Client || p.closed {
+		p.mu.Unlock()
+		lease.Release()
+		return nil, ErrConnectionUnavailable
+	}
+	for i, e := range lease.entries {
+		if p.entries[lease.Keys[i]] != e {
+			p.mu.Unlock()
+			lease.Release()
+			return nil, ErrConnectionUnavailable
+		}
+	}
+	target.target = true
+	if len(lease.entries) > 0 {
+		target.parents = append([]*entry(nil), lease.entries[:len(lease.entries)-1]...)
+	}
+	lease.ConnectionID = target.id
+	lease.Done = target.done
+	hook := p.targetHook
+	p.mu.Unlock()
+	if hook != nil {
+		hook(lease.ConnectionID, server.ID, config.ForwardDefinitions(server))
+	}
 	return lease, nil
 }
 
@@ -412,7 +461,9 @@ func (p *Pool) Clear() int {
 	p.mu.Lock()
 	entries := p.entries
 	count := len(entries)
+	p.reserveClosedIDsLocked(entries)
 	p.entries = map[string]*entry{}
+	p.pruneIDsLocked()
 	p.mu.Unlock()
 	p.closeEntries(entries, true)
 	return count
@@ -431,7 +482,9 @@ func (p *Pool) stop() int {
 	// without waiting for the current observer; transport workers own cleanup.
 	p.callbacks.Close()
 	entries := p.entries
+	p.reserveClosedIDsLocked(entries)
 	p.entries = map[string]*entry{}
+	p.pruneIDsLocked()
 	p.workers.Add()
 	p.mu.Unlock()
 	// Shutdown suppresses advisory disconnects; Clear and idle cleanup still
@@ -461,13 +514,14 @@ func (p *Pool) statsLocked(now time.Time) []EntryStat {
 	stats := make([]EntryStat, 0, len(p.entries))
 	for key, ent := range p.entries {
 		stats = append(stats, EntryStat{
-			Key:       key,
-			ServerID:  ent.serverID,
-			Alias:     ent.alias,
-			Host:      ent.remoteHost,
-			IdleTime:  now.Sub(ent.lastAccess).Round(time.Second).String(),
-			RefCount:  ent.refCount,
-			ChainKeys: cloneStrings(ent.chainKeys),
+			Key:          key,
+			ConnectionID: ent.id,
+			ServerID:     ent.serverID,
+			Alias:        ent.alias,
+			Host:         ent.remoteHost,
+			IdleTime:     now.Sub(ent.lastAccess).Round(time.Second).String(),
+			RefCount:     ent.refCount,
+			ChainKeys:    cloneStrings(ent.chainKeys),
 		})
 	}
 	return stats
@@ -500,7 +554,7 @@ func (p *Pool) cleanupLoop() {
 	}
 }
 
-func (p *Pool) keepAliveLoop(key string, client *ssh.Client, cfg config.RuntimeConfig) {
+func (p *Pool) keepAliveLoopWithDone(key string, client *ssh.Client, cfg config.RuntimeConfig, publishedDone chan struct{}) {
 	interval := 20 * time.Second
 	if cfg.Settings.KeepaliveInterval != "" {
 		if d, err := time.ParseDuration(cfg.Settings.KeepaliveInterval); err == nil {
@@ -508,7 +562,7 @@ func (p *Pool) keepAliveLoop(key string, client *ssh.Client, cfg config.RuntimeC
 		}
 	}
 
-	done := make(chan struct{})
+	done := publishedDone
 	go func() {
 		_ = client.Wait()
 		close(done)
@@ -551,10 +605,12 @@ func (p *Pool) cleanupIdle() {
 	p.mu.Lock()
 	for key, ent := range p.entries {
 		if ent.refCount == 0 && now.Sub(ent.lastAccess) > p.idleTimeout {
+			p.reserveClosedIDsLocked(map[string]*entry{key: ent})
 			delete(p.entries, key)
 			stale[key] = ent
 		}
 	}
+	p.pruneIDsLocked()
 	p.mu.Unlock()
 	p.closeEntries(stale, true)
 }
@@ -566,7 +622,9 @@ func (p *Pool) dropEntryIfMatch(key string, client *ssh.Client, notify bool) boo
 		p.mu.Unlock()
 		return false
 	}
+	p.reserveClosedIDsLocked(map[string]*entry{key: ent})
 	delete(p.entries, key)
+	p.pruneIDsLocked()
 	p.mu.Unlock()
 
 	_ = client.Close()
@@ -733,7 +791,10 @@ func (p *Pool) runCreation(ctx context.Context, key string, route routeStep, ide
 	defer p.workers.Done()
 	trackedCtx := resourcepolicy.WithGroup(ctx, &p.workers)
 	dialCtx, dialWork := resourcepolicy.Scope(trackedCtx)
-	defer p.releaseDialPrefix(trackedCtx, dialWork, releasePrefix)
+	var prefixOnce sync.Once
+	settlePrefix := func() { prefixOnce.Do(func() { p.releaseDialPrefix(trackedCtx, dialWork, releasePrefix) }) }
+	defer settlePrefix()
+
 	client, err := dialClient(dialCtx, route.server, cfg, jump, nil, opts)
 	if err == nil && ctx.Err() != nil {
 		// The creation outlived its purpose; do not publish a client nobody is
@@ -751,6 +812,8 @@ func (p *Pool) runCreation(ctx context.Context, key string, route routeStep, ide
 			client = published
 		}
 	}
+
+	settlePrefix()
 
 	// Prefix references stay owned until any abandoned channel-open workers
 	// and their late cleanup settle, even after callers receive this result.
@@ -913,7 +976,33 @@ func (p *Pool) publish(base string, route routeStep, identity []byte, client *ss
 	if ent := p.entries[key]; ent != nil {
 		stale = ent.client
 	}
+	p.pruneIDsLocked()
+	id, idErr := resourceid.Allocate("conn", p.idGenerator, func(id string) bool {
+		if _, exists := p.reservedIDs[id]; exists {
+			return true
+		}
+		for _, e := range p.entries {
+			if e.id == id {
+				return true
+			}
+		}
+		return false
+	})
+	if idErr != nil {
+		p.mu.Unlock()
+		return base, nil, false, idErr
+	}
+	if p.reservedIDs == nil {
+		p.reservedIDs = map[string]time.Time{}
+	}
+	if old := p.entries[key]; old != nil {
+		p.reserveClosedIDsLocked(map[string]*entry{key: old})
+	}
+	p.reservedIDs[id] = now.UTC()
+	p.sequence++
 	p.entries[key] = &entry{
+		done: make(chan struct{}),
+		id:   id, createdAt: now.UTC(), sequence: p.sequence, port: route.server.Port, user: route.server.User,
 		client:     client,
 		lastAccess: now,
 		serverID:   route.server.ID,
@@ -922,6 +1011,8 @@ func (p *Pool) publish(base string, route routeStep, identity []byte, client *ss
 		chainKeys:  []string{key},
 		identity:   identity,
 	}
+	p.pruneIDsLocked()
+	publishedDone := p.entries[key].done
 	p.workers.Add()
 	p.mu.Unlock()
 
@@ -930,7 +1021,7 @@ func (p *Pool) publish(base string, route routeStep, identity []byte, client *ss
 		// The replaced entry was idle. Its key now belongs to the new client;
 		// a delayed disconnect callback would close that client's new owners.
 	}
-	go func() { defer p.workers.Done(); p.keepAliveLoop(key, client, cfg) }()
+	go func() { defer p.workers.Done(); p.keepAliveLoopWithDone(key, client, cfg, publishedDone) }()
 	p.notifyConnect(key, client)
 	return key, client, true, nil
 }
@@ -1003,7 +1094,7 @@ func sourceKeyDigest(path string) string {
 	if path == "" {
 		return ""
 	}
-	data, err := os.ReadFile(filepath.Clean(path))
+	data, err := keyutil.ReadLegacySource(path)
 	if err != nil {
 		return "unreadable"
 	}
@@ -1034,6 +1125,7 @@ func dial(ctx context.Context, server config.ServerProfile, cfg config.RuntimeCo
 	if err != nil {
 		return nil, err
 	}
+	conn = &promptConn{Conn: conn}
 	hostKeyCallback, err := hostKeyCallback(server, confirm, opts.HostKeyPolicy, &handshakeDeadline{conn: conn, timeout: timeout})
 	if err != nil {
 		_ = conn.Close()
@@ -1103,7 +1195,7 @@ func authMethodsContext(ctx context.Context, server config.ServerProfile, cfg co
 		}
 		privateKey := key.PrivateKey
 		if privateKey == "" && key.SourcePath != "" {
-			raw, err := os.ReadFile(key.SourcePath)
+			raw, err := keyutil.ReadLegacySource(key.SourcePath)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -1220,46 +1312,14 @@ func dialViaJump(ctx context.Context, jump *ssh.Client, addr string) (net.Conn, 
 	}
 }
 
-// fixedDialer hands out one already-connected socket, so the SOCKS5 negotiation
-// runs on the socket whose deadline bounds it rather than on a fresh connection.
-type fixedDialer struct {
-	conn net.Conn
-	used bool
-}
-
-func (d *fixedDialer) Dial(network, address string) (net.Conn, error) {
-	if d.used {
-		return nil, errors.New("proxy dialer is already used")
-	}
-	d.used = true
-	return d.conn, nil
-}
-
-func dialSOCKS5(ctx context.Context, proxyAddr string, targetAddr string, proxyCfg config.ProxyProfile, dialer *net.Dialer, timeout time.Duration) (net.Conn, error) {
+func dialSOCKS5(ctx context.Context, proxyAddr, targetAddr string, cfg config.ProxyProfile, dialer *net.Dialer, timeout time.Duration) (net.Conn, error) {
 	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
 		return nil, err
 	}
-	_ = conn.SetDeadline(time.Now().Add(timeout))
-	var auth *proxy.Auth
-	if proxyCfg.Username != "" {
-		auth = &proxy.Auth{User: proxyCfg.Username, Password: proxyCfg.Password}
-	}
-	d, err := proxy.SOCKS5("tcp", proxyAddr, auth, &fixedDialer{conn: conn})
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	target, err := d.Dial("tcp", targetAddr)
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	_ = target.SetDeadline(time.Time{})
-	return target, nil
+	return proxyproto.Negotiate(ctx, conn, proxyproto.Options{Type: "socks5", Username: cfg.Username, Password: cfg.Password}, targetAddr, timeout)
 }
-
-func dialHTTPProxy(ctx context.Context, proxyAddr string, targetAddr string, user string, pass string, dialer *net.Dialer, timeout time.Duration) (net.Conn, error) {
+func dialHTTPProxy(ctx context.Context, proxyAddr, targetAddr, user, pass string, dialer *net.Dialer, timeout time.Duration) (net.Conn, error) {
 	if strings.ContainsAny(targetAddr+user+pass, "\r\n") {
 		return nil, errors.New("invalid proxy CONNECT parameters")
 	}
@@ -1267,65 +1327,16 @@ func dialHTTPProxy(ctx context.Context, proxyAddr string, targetAddr string, use
 	if err != nil {
 		return nil, err
 	}
-	// The CONNECT exchange is a phase of its own: bound it, then hand the socket
-	// over to the handshake, which arms its own deadline.
-	_ = conn.SetDeadline(time.Now().Add(timeout))
-	authHeader := ""
-	if user != "" {
-		authHeader = "Proxy-Authorization: Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass)) + "\r\n"
-	}
-	req := "CONNECT " + targetAddr + " HTTP/1.1\r\nHost: " + targetAddr + "\r\n" + authHeader + "\r\n"
-	if _, err := io.WriteString(conn, req); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	reader := bufio.NewReader(conn)
-	status, err := reader.ReadString('\n')
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	parts := strings.SplitN(strings.TrimSpace(status), " ", 3)
-	if len(parts) < 2 || !strings.HasPrefix(parts[0], "HTTP/") || parts[1] != "200" {
-		_ = conn.Close()
-		return nil, fmt.Errorf("HTTP proxy connection failed: %s", strings.TrimSpace(status))
-	}
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			_ = conn.Close()
-			return nil, err
-		}
-		if line == "\r\n" || line == "\n" {
-			break
-		}
-	}
-	if err := ctx.Err(); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	_ = conn.SetDeadline(time.Time{})
-	if reader.Buffered() > 0 {
-		return &bufferedConn{Conn: conn, reader: reader}, nil
-	}
-	return conn, nil
-}
-
-type bufferedConn struct {
-	net.Conn
-	reader *bufio.Reader
-}
-
-func (c *bufferedConn) Read(p []byte) (int, error) {
-	return c.reader.Read(p)
+	return proxyproto.Negotiate(ctx, conn, proxyproto.Options{Type: "http", Username: user, Password: pass}, targetAddr, timeout)
 }
 
 type HostKeyPrompt struct {
-	Host        string `json:"host"`
-	KeyType     string `json:"key_type"`
-	Fingerprint string `json:"fingerprint"`
-	Changed     bool   `json:"changed"`
-	Message     string `json:"message"`
+	TransportDone <-chan struct{} `json:"-"`
+	Host          string          `json:"host"`
+	KeyType       string          `json:"key_type"`
+	Fingerprint   string          `json:"fingerprint"`
+	Changed       bool            `json:"changed"`
+	Message       string          `json:"message"`
 }
 
 // handshakeDeadline parks and re-arms the connection phase deadline around a host
@@ -1353,8 +1364,16 @@ func (d *handshakeDeadline) arm() {
 // ask runs confirm with the phase deadline parked, so the prompt may take as long
 // as the client needs, and re-arms it once the answer is in.
 func (d *handshakeDeadline) ask(confirm func(HostKeyPrompt) bool, prompt HostKeyPrompt) bool {
+	if d == nil {
+		return confirm(prompt)
+	}
 	d.park()
 	defer d.arm()
+	if c, ok := d.conn.(*promptConn); ok {
+		done, stop := c.observe()
+		prompt.TransportDone = done
+		defer stop()
+	}
 	return confirm(prompt)
 }
 

@@ -3,19 +3,9 @@ package config
 import (
 	"errors"
 	"fmt"
-	"os"
 
 	"knot-core/internal/keyutil"
 )
-
-func (s *Service) inspectKey(key *KeyMetadata) error {
-	raw, err := os.ReadFile(key.SourcePath)
-	if err != nil {
-		return fmt.Errorf("%w: private key source cannot be read", ErrValidation)
-	}
-	key.Type, key.Length, key.Fingerprint = "", 0, ""
-	return inspectStoredKey(key, raw, "")
-}
 
 // Stored/path-backed keys may remain locked until an authentication attempt.
 // PEM has no public envelope; retain historical type/length as unverified hints.
@@ -34,4 +24,14 @@ func inspectStoredKey(key *KeyMetadata, raw []byte, passphrase string) error {
 	key.Fingerprint = meta.Fingerprint
 	key.Encrypted = meta.Encrypted
 	return nil
+}
+
+const maxKeyBytes = keyutil.MaxSourceBytes
+
+func readPrivateKeySource(sourcePath string) ([]byte, error) {
+	raw, err := keyutil.ReadSource(sourcePath)
+	if err != nil {
+		return nil, fieldFailure("keys", "source_path", err.Error())
+	}
+	return raw, nil
 }

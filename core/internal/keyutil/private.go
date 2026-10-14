@@ -14,6 +14,8 @@ import (
 )
 
 var ErrPassphraseRequired = errors.New("private key passphrase required")
+var ErrUnsupportedPrivateKey = errors.New("encrypted PKCS#8 private keys are unsupported")
+
 var ErrInvalidPrivateKey = errors.New("invalid private key or passphrase")
 
 type Metadata struct {
@@ -27,6 +29,9 @@ type Metadata struct {
 // PEM has no public envelope: its metadata remains unknown until unlocked.
 func Inspect(raw []byte, passphrase string) (Metadata, error) {
 	signer, encrypted, err := parseSigner(raw, passphrase)
+	if errors.Is(err, ErrUnsupportedPrivateKey) {
+		return Metadata{}, err
+	}
 	var pub ssh.PublicKey
 	if err != nil {
 		var missing *ssh.PassphraseMissingError
@@ -74,6 +79,9 @@ func validLockedPEM(raw []byte) bool {
 
 // An unnecessary passphrase is harmless for a key that parses without one.
 func parseSigner(raw []byte, passphrase string) (ssh.Signer, bool, error) {
+	if block, _ := pem.Decode(raw); block != nil && block.Type == "ENCRYPTED PRIVATE KEY" {
+		return nil, true, ErrUnsupportedPrivateKey
+	}
 	signer, err := ssh.ParsePrivateKey(raw)
 	var missing *ssh.PassphraseMissingError
 	if !errors.As(err, &missing) {
@@ -108,8 +116,14 @@ func publicMetadata(pub ssh.PublicKey, encrypted bool) (Metadata, error) {
 }
 func Signer(raw []byte, passphrase string) (ssh.Signer, error) {
 	signer, _, err := parseSigner(raw, passphrase)
+	if errors.Is(err, ErrUnsupportedPrivateKey) {
+		return nil, err
+	}
 	var missing *ssh.PassphraseMissingError
 	if errors.As(err, &missing) {
+		if missing.PublicKey == nil && !validLockedPEM(raw) {
+			return nil, ErrInvalidPrivateKey
+		}
 		return nil, ErrPassphraseRequired
 	}
 	if err != nil {

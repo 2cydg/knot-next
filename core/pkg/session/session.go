@@ -8,13 +8,13 @@ import (
 	"net"
 	"net/url"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"knot-core/internal/keyutil"
 	"knot-core/internal/logger"
+	"knot-core/internal/resourceid"
 	"knot-core/internal/resourcepolicy"
 	"knot-core/pkg/config"
 	"knot-core/pkg/sshpool"
@@ -29,7 +29,6 @@ var (
 )
 
 const (
-	challengeTimeout       = 60 * time.Second
 	maxAuthRetryCount      = 3
 	maxSessionSubscribers  = 16
 	maxSessionCWDFollowers = 8
@@ -40,12 +39,22 @@ const (
 // reader cannot stall the transition, not as a tail-flush delay.
 var attachDrainTimeout = 5 * time.Second
 
+const challengeTimeout = 60 * time.Second
+
+// Options are fixed before service workers start. Zero uses the production deadline.
+type Options struct{ ChallengeTimeout time.Duration }
+
+var ErrHostKeyChallengeExpired = errors.New("host key challenge expired")
+var ErrAuthChallengeExpired = errors.New("authentication challenge expired")
+
 type configWriter interface {
 	RuntimeConfig() (config.RuntimeConfig, error)
 	RememberServerAuth(id string, choice config.AuthChoice) error
 }
 
 type Service struct {
+	challengeNow       func() time.Time
+	challengeDuration  time.Duration
 	execPolicy         resourcepolicy.Policy
 	policy             resourcepolicy.Policy
 	workers            resourcepolicy.Group
@@ -55,6 +64,7 @@ type Service struct {
 	maintenanceStarted bool
 	mu                 sync.RWMutex
 	nextID             int64
+	idGenerator        resourceid.Generator
 	sessions           map[string]*resource
 	execs              map[string]Exec
 	execCtx            context.Context
@@ -67,9 +77,14 @@ type Service struct {
 	onEvent            func(Event)
 }
 
-func NewService() *Service {
+func NewService(options ...Options) *Service {
 	execCtx, execCancel := context.WithCancelCause(context.Background())
+	duration := challengeTimeout
+	if len(options) > 0 && options[0].ChallengeTimeout > 0 {
+		duration = options[0].ChallengeTimeout
+	}
 	return &Service{
+		challengeNow: time.Now, challengeDuration: duration,
 		execPolicy: resourcepolicy.Execs(),
 		policy:     resourcepolicy.Sessions(),
 		nextID:     1,
@@ -129,12 +144,17 @@ type CreateRequest struct {
 }
 
 type ListOptions struct {
+	ServerID  string
+	Active    bool
 	ServerRef string
 	Alias     string
 	State     string
 }
 
 type Resource struct {
+	LastChallenge   *Challenge        `json:"last_challenge,omitempty"`
+	FailureCode     string            `json:"failure_code,omitempty"`
+	ConnectionID    string            `json:"connection_id,omitempty"`
 	ServerID        string            `json:"server_id,omitempty"`
 	ID              string            `json:"id"`
 	ServerRef       string            `json:"server_ref"`
@@ -163,6 +183,7 @@ type Resource struct {
 }
 
 type pendingChallenge struct {
+	deadline  time.Time
 	Challenge Challenge
 	response  chan ChallengeResponse
 }
@@ -170,11 +191,13 @@ type pendingChallenge struct {
 type resource struct {
 	workers int
 	Resource
-	serverID         string
-	hostKeyChallenge *pendingChallenge
-	authChallenge    *pendingChallenge
-	authRetryCount   int
-	authResponse     *ChallengeResponse
+	serverID             string
+	lastHostKeyChallenge *Challenge
+	lastAuthChallenge    *Challenge
+	hostKeyChallenge     *pendingChallenge
+	authChallenge        *pendingChallenge
+	authRetryCount       int
+	authResponse         *ChallengeResponse
 
 	// pendingCredentials holds credentials to save after successful authentication.
 	// This ensures we only save credentials that actually worked.
@@ -280,6 +303,10 @@ type ControlRequest struct {
 }
 
 type Challenge struct {
+	ID                 string    `json:"challenge_id"`
+	ExpiresAt          time.Time `json:"expires_at"`
+	Outcome            string    `json:"outcome,omitempty"`
+	FailureCode        string    `json:"failure_code,omitempty"`
 	PassphraseRequired bool      `json:"passphrase_required,omitempty"`
 	SessionID          string    `json:"session_id"`
 	Type               string    `json:"type"`
@@ -298,12 +325,13 @@ type Challenge struct {
 }
 
 type ChallengeResponse struct {
-	Accept     bool   `json:"accept,omitempty"`
-	Abort      bool   `json:"abort,omitempty"`
-	Password   string `json:"password,omitempty"`
-	KeyID      string `json:"key_id,omitempty"`
-	Remember   bool   `json:"remember,omitempty"`
-	Passphrase string `json:"passphrase,omitempty"`
+	ChallengeID string `json:"challenge_id,omitempty"`
+	Accept      bool   `json:"accept,omitempty"`
+	Abort       bool   `json:"abort,omitempty"`
+	Password    string `json:"password,omitempty"`
+	KeyID       string `json:"key_id,omitempty"`
+	Remember    bool   `json:"remember,omitempty"`
+	Passphrase  string `json:"passphrase,omitempty"`
 }
 
 // AttachStream is one attachment to an interactive session's PTY. Exactly one
@@ -376,8 +404,10 @@ func (s *Service) Create(req CreateRequest) (Resource, error) {
 	if s.stopped || s.activeLocked() >= s.policy.Active {
 		return Resource{}, fmt.Errorf("%w: session limit reached", ErrConflict)
 	}
-	id := strconv.FormatInt(s.nextID, 10)
-	s.nextID++
+	id, err := resourceid.Allocate("ssh", s.idGenerator, func(id string) bool { return s.sessions[id] != nil })
+	if err != nil {
+		return Resource{}, err
+	}
 	ctx, cancel := context.WithCancel(s.execCtx)
 	res := Resource{
 		ID:            id,
@@ -427,6 +457,12 @@ func (s *Service) ListWithOptions(opts ListOptions) []Resource {
 	out := make([]Resource, 0, len(s.sessions))
 	for _, session := range s.sessions {
 		snapshot := session.snapshot()
+		if opts.ServerID != "" && snapshot.ServerID != opts.ServerID {
+			continue
+		}
+		if opts.Active && snapshot.State != "connected" && snapshot.State != "attached" && snapshot.State != "detached" {
+			continue
+		}
 		if opts.ServerRef != "" && snapshot.ServerRef != opts.ServerRef && snapshot.Alias != opts.ServerRef {
 			continue
 		}
@@ -885,6 +921,13 @@ func (s *Service) challenge(id string, typ string) (Challenge, error) {
 		pending = session.authChallenge
 	}
 	if pending == nil {
+		last := session.lastAuthChallenge
+		if typ == "host_key" {
+			last = session.lastHostKeyChallenge
+		}
+		if last != nil {
+			return *cloneChallengePtr(last), nil
+		}
 		return Challenge{SessionID: id, Type: typ, Pending: false}, nil
 	}
 	out := pending.Challenge
@@ -894,52 +937,85 @@ func (s *Service) challenge(id string, typ string) (Challenge, error) {
 
 func (s *Service) respondChallenge(id string, typ string, resp ChallengeResponse) (Challenge, error) {
 	s.mu.Lock()
-	session, ok := s.sessions[id]
-	if !ok {
-		s.mu.Unlock()
+	defer s.mu.Unlock()
+	r := s.sessions[id]
+	if r == nil {
 		return Challenge{}, ErrNotFound
 	}
-	// Once terminal, a challenge is no longer submittable: answering one would
-	// let a late prompt move the session back out of its recorded outcome.
-	if isTerminalState(session.State) {
-		s.mu.Unlock()
-		return Challenge{}, fmt.Errorf("%w: session %s no longer accepts challenge responses", ErrConflict, id)
-	}
-	var pending *pendingChallenge
+	pending, last := r.authChallenge, r.lastAuthChallenge
 	if typ == "host_key" {
-		pending = session.hostKeyChallenge
-	} else {
-		pending = session.authChallenge
+		pending, last = r.hostKeyChallenge, r.lastHostKeyChallenge
+	}
+	if resp.ChallengeID != "" && (last == nil || last.ID != resp.ChallengeID) {
+		return Challenge{}, fmt.Errorf("%w: challenge identity mismatch", ErrConflict)
+	}
+	if pending == nil || isTerminalState(r.State) {
+		if last != nil && last.Outcome == "expired" {
+			if typ == "host_key" {
+				return *cloneChallengePtr(last), ErrHostKeyChallengeExpired
+			}
+			return *cloneChallengePtr(last), ErrAuthChallengeExpired
+		}
+		return Challenge{}, fmt.Errorf("%w: challenge is no longer pending", ErrConflict)
+	}
+	if !pending.deadline.IsZero() && !s.challengeNow().Before(pending.deadline) {
+		s.finishChallengeLocked(r, typ, "expired")
+		s.failChallengeLocked(r, typ, "challenge expired")
+		if typ == "host_key" {
+			return *cloneChallengePtr(r.lastHostKeyChallenge), ErrHostKeyChallengeExpired
+		}
+		return *cloneChallengePtr(r.lastAuthChallenge), ErrAuthChallengeExpired
+	}
+	outcome := "accepted"
+	if resp.Abort || (typ == "host_key" && !resp.Accept) {
+		outcome = "aborted"
+	}
+	c := s.finishChallengeLocked(r, typ, outcome)
+	r.State = "connecting"
+	r.UpdatedAt = s.policy.Now().UTC()
+	if typ == "auth" {
+		r.authResponse = &resp
+	}
+	// Delivery belongs to the same commit as resolution; the timer cannot expire
+	// an accepted answer after this point.
+	pending.response <- resp
+	s.publishSessionLocked(r, Event{Type: "session.challenge.resolved", SessionID: id, State: r.State, Challenge: &c, Time: r.UpdatedAt})
+	return c, nil
+}
+func (s *Service) finishChallengeLocked(r *resource, typ, outcome string) Challenge {
+	pending := r.authChallenge
+	if typ == "host_key" {
+		pending = r.hostKeyChallenge
 	}
 	if pending == nil {
-		s.mu.Unlock()
-		return Challenge{SessionID: id, Type: typ, Pending: false}, nil
+		return Challenge{}
 	}
-	challenge := pending.Challenge
+	c := pending.Challenge
+	c.Pending = false
+	c.Outcome = outcome
+	c.UpdatedAt = s.policy.Now().UTC()
+	if outcome == "expired" {
+		if typ == "host_key" {
+			c.FailureCode = "HOST_KEY_CHALLENGE_EXPIRED"
+		} else {
+			c.FailureCode = "AUTH_CHALLENGE_EXPIRED"
+		}
+	}
+	if outcome == "aborted" {
+		c.FailureCode = "CHALLENGE_ABORTED"
+		r.FailureCode = c.FailureCode
+	}
 	if typ == "host_key" {
-		session.hostKeyChallenge = nil
-		session.HostKeyPending = false
-		if session.State == "host_key_pending" {
-			session.State = "connecting"
-		}
+		r.hostKeyChallenge = nil
+		r.HostKeyPending = false
+		r.lastHostKeyChallenge = cloneChallengePtr(&c)
 	} else {
-		session.authChallenge = nil
-		session.AuthPending = false
-		session.authResponse = &resp
-		if session.State == "auth_pending" {
-			session.State = "connecting"
-		}
+		r.authChallenge = nil
+		r.AuthPending = false
+		r.lastAuthChallenge = cloneChallengePtr(&c)
 	}
-	session.UpdatedAt = s.policy.Now().UTC()
-	s.publishSessionLocked(session, Event{Type: "session.challenge.resolved", SessionID: id, State: session.State, Challenge: &challenge, Time: session.UpdatedAt})
-	s.mu.Unlock()
-	select {
-	case pending.response <- resp:
-	default:
-	}
-	challenge.Pending = false
-	challenge.UpdatedAt = s.policy.Now().UTC()
-	return challenge, nil
+	r.LastChallenge = cloneChallengePtr(&c)
+	return c
 }
 
 func (s *Service) dependencies() (configWriter, *sshpool.Pool, DialOptions, bool) {
@@ -1016,6 +1092,9 @@ func (s *Service) attachBackend(id string, backend *interactiveBackend, poolKeys
 	}
 	defer s.mu.Unlock()
 	session.backend = backend
+	if backend != nil && backend.lease != nil {
+		session.ConnectionID = backend.lease.ConnectionID
+	}
 	session.poolKeys = cloneStrings(poolKeys)
 	if session.Attached {
 		session.State = "attached"
@@ -1069,6 +1148,8 @@ func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig, st
 	}
 	// No credential candidate survives a failed connect attempt.
 	session.pendingCredentials = nil
+	s.finishChallengeLocked(session, "host_key", "aborted")
+	s.finishChallengeLocked(session, "auth", "aborted")
 	session.hostKeyChallenge = nil
 	session.authChallenge = nil
 	session.HostKeyPending = false
@@ -1108,6 +1189,11 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 			}
 			return nil, nil, currentCfg, err
 		}
+		s.mu.Lock()
+		if r := s.sessions[sessionID]; r != nil {
+			r.ConnectionID = lease.ConnectionID
+		}
+		s.mu.Unlock()
 		client, poolKeys := lease.Client, lease.Keys
 		ownedCtx, work := resourcepolicy.Scope(ctx)
 		release := func() {
@@ -1225,6 +1311,27 @@ func (s *Service) waitHostKeyResponse(ctx context.Context, sessionID string, ser
 		s.mu.Unlock()
 		return false
 	}
+	challengeID, idErr := resourceid.Allocate("challenge", s.idGenerator, func(id string) bool {
+		for _, r := range s.sessions {
+			for _, c := range []*Challenge{r.lastHostKeyChallenge, r.lastAuthChallenge} {
+				if c != nil && c.ID == id {
+					return true
+				}
+			}
+		}
+		return false
+	})
+	if idErr != nil {
+		s.mu.Unlock()
+		s.failSession(sessionID, idErr, config.RuntimeConfig{}, "failed")
+		return false
+	}
+	challenge.Challenge.ID = challengeID
+	challenge.deadline = s.challengeNow().Add(s.challengeDuration)
+	challenge.Challenge.ExpiresAt = now.Add(s.challengeDuration)
+	challenge.Challenge.Outcome = "pending"
+	session.LastChallenge = cloneChallengePtr(&challenge.Challenge)
+	session.lastHostKeyChallenge = cloneChallengePtr(&challenge.Challenge)
 	session.hostKeyChallenge = challenge
 	session.HostKeyPending = true
 	session.State = "host_key_pending"
@@ -1237,16 +1344,37 @@ func (s *Service) waitHostKeyResponse(ctx context.Context, sessionID string, ser
 		Time:      now,
 	})
 	s.mu.Unlock()
-	timer := time.NewTimer(challengeTimeout)
+	timer := time.NewTimer(challenge.deadline.Sub(s.challengeNow()))
 	defer timer.Stop()
 	select {
 	case resp := <-challenge.response:
 		return resp.Accept && !resp.Abort
 	case <-timer.C:
-		s.failPendingChallenge(sessionID, "host_key", "host key confirmation timed out")
+		if !s.failPendingChallenge(sessionID, "host_key", "host key confirmation timed out") {
+			select {
+			case resp := <-challenge.response:
+				return resp.Accept && !resp.Abort
+			default:
+			}
+		}
+		return false
+	case <-prompt.TransportDone:
+		if !s.failPendingChallenge(sessionID, "host_key", "connection closed during host key confirmation") {
+			select {
+			case resp := <-challenge.response:
+				return resp.Accept && !resp.Abort
+			default:
+			}
+		}
 		return false
 	case <-ctx.Done():
-		s.failPendingChallenge(sessionID, "host_key", "connecting cancelled")
+		if !s.failPendingChallenge(sessionID, "host_key", "connecting cancelled") {
+			select {
+			case resp := <-challenge.response:
+				return resp.Accept && !resp.Abort
+			default:
+			}
+		}
 		return false
 	}
 }
@@ -1285,6 +1413,26 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 		s.mu.Unlock()
 		return cfg, fmt.Errorf("%w: session is no longer connectable", ErrConflict)
 	}
+	challengeID, idErr := resourceid.Allocate("challenge", s.idGenerator, func(id string) bool {
+		for _, r := range s.sessions {
+			for _, c := range []*Challenge{r.lastHostKeyChallenge, r.lastAuthChallenge} {
+				if c != nil && c.ID == id {
+					return true
+				}
+			}
+		}
+		return false
+	})
+	if idErr != nil {
+		s.mu.Unlock()
+		return cfg, idErr
+	}
+	challenge.Challenge.ID = challengeID
+	challenge.deadline = s.challengeNow().Add(s.challengeDuration)
+	challenge.Challenge.ExpiresAt = now.Add(s.challengeDuration)
+	challenge.Challenge.Outcome = "pending"
+	session.LastChallenge = cloneChallengePtr(&challenge.Challenge)
+	session.lastAuthChallenge = cloneChallengePtr(&challenge.Challenge)
 	session.authRetryCount = retryCount
 	session.authChallenge = challenge
 	session.AuthPending = true
@@ -1298,10 +1446,25 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 		Time:      now,
 	})
 	s.mu.Unlock()
-	timer := time.NewTimer(challengeTimeout)
+	timer := time.NewTimer(challenge.deadline.Sub(s.challengeNow()))
 	defer timer.Stop()
+	var resp ChallengeResponse
 	select {
-	case resp := <-challenge.response:
+	case resp = <-challenge.response:
+	case <-timer.C:
+		if s.failPendingChallenge(sessionID, "auth", "authentication retry timed out") {
+			return cfg, ErrAuthChallengeExpired
+		}
+		select {
+		case resp = <-challenge.response:
+		default:
+			return cfg, ErrConflict
+		}
+	case <-ctx.Done():
+		s.failPendingChallenge(sessionID, "auth", "authentication retry cancelled")
+		return cfg, ctx.Err()
+	}
+	{
 		if resp.Abort {
 			return cfg, fmt.Errorf("%w: authentication retry aborted", ErrAuthRetryAborted)
 		}
@@ -1323,12 +1486,6 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 		s.mu.Unlock()
 
 		return s.runtimeConfigForAuthResponse(cfg, server, resp)
-	case <-timer.C:
-		s.failPendingChallenge(sessionID, "auth", "authentication retry timed out")
-		return cfg, fmt.Errorf("%w: authentication retry timed out", ErrConflict)
-	case <-ctx.Done():
-		s.failPendingChallenge(sessionID, "auth", "authentication retry cancelled")
-		return cfg, ctx.Err()
 	}
 }
 
@@ -1373,36 +1530,46 @@ func (s *Service) runtimeConfigForAuthResponse(cfg config.RuntimeConfig, server 
 	return next, nil
 }
 
-func (s *Service) failPendingChallenge(sessionID string, typ string, message string) {
-	now := s.policy.Now().UTC()
+func (s *Service) failPendingChallenge(sessionID string, typ string, message string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	session, ok := s.sessions[sessionID]
-	if !ok {
-		return
+	r := s.sessions[sessionID]
+	if r == nil || isTerminalState(r.State) {
+		return false
 	}
-	// A challenge that was cancelled by a terminal transition reports its
-	// failure here; the terminal state and its cause stand.
-	if isTerminalState(session.State) {
-		return
-	}
+	pending := r.authChallenge
 	if typ == "host_key" {
-		session.hostKeyChallenge = nil
-		session.HostKeyPending = false
-	} else {
-		session.authChallenge = nil
-		session.AuthPending = false
+		pending = r.hostKeyChallenge
 	}
-	if session.cancel != nil {
-		session.cancel()
+	if pending == nil {
+		return false
 	}
-	session.State = "failed"
-	session.FrameworkError = message
-	session.ExitedAt = &now
-	session.UpdatedAt = now
-	session.pendingCredentials = nil
-	s.publishSessionLocked(session, Event{Type: "session.error", SessionID: sessionID, State: session.State, Error: message, Time: now})
-	s.closeSubscribersLocked(session)
+	outcome := "aborted"
+	if strings.Contains(message, "timed out") {
+		outcome = "expired"
+	}
+	s.finishChallengeLocked(r, typ, outcome)
+	if strings.Contains(message, "connection closed") {
+		r.LastChallenge.FailureCode = "CONNECTION_FAILED"
+		r.lastHostKeyChallenge.FailureCode = "CONNECTION_FAILED"
+	}
+	s.failChallengeLocked(r, typ, message)
+	return true
+}
+func (s *Service) failChallengeLocked(r *resource, typ, message string) {
+	now := s.policy.Now().UTC()
+	if r.cancel != nil {
+		r.cancel()
+	}
+	r.State = "failed"
+	r.UpdatedAt = now
+	r.pendingCredentials = nil
+	r.FailureCode = r.LastChallenge.FailureCode
+	r.FrameworkError = message
+	r.FrameworkCode = strings.ToLower(r.FailureCode)
+	r.ExitedAt = &now
+	s.publishSessionLocked(r, Event{Type: "session.error", SessionID: r.ID, State: r.State, Error: message, Challenge: cloneChallengePtr(r.LastChallenge), Time: now})
+	s.closeSubscribersLocked(r)
 }
 
 func (s *Service) publishError(sessionID string, message string) {
@@ -1574,6 +1741,8 @@ func (s *Service) closeSessionLocked(session *resource, state string, outcome Ex
 	// Clear every pending marker, waiter and credential candidate so a late
 	// challenge, retry or background failure cannot resurrect the session or
 	// leave a secret waiting to be written.
+	s.finishChallengeLocked(session, "host_key", "aborted")
+	s.finishChallengeLocked(session, "auth", "aborted")
 	session.hostKeyChallenge = nil
 	session.authChallenge = nil
 	session.HostKeyPending = false
@@ -1650,6 +1819,7 @@ func (s *Service) publishSessionLocked(session *resource, event Event) {
 
 func (r *resource) snapshot() Resource {
 	out := r.Resource
+	out.LastChallenge = cloneChallengePtr(r.LastChallenge)
 	out.Env = cloneEnv(out.Env)
 	if out.CWDUpdatedAt != nil {
 		t := *out.CWDUpdatedAt

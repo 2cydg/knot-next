@@ -97,7 +97,8 @@ The SSH/SFTP core baseline is implemented, including asynchronous sessions,
 challenge/retry, raw PTY attach, exec, transfers and recovery, bounded resources,
 legacy TOML/crypto import, recent/CWD/follow, Agent and diagnostic logs. See
 `core/docs/baseline-acceptance.md` for current evidence and `core/docs/cli-handoff.md`
-for the public API handoff. CLI/TUI, forwarding resources, broadcast, archive,
+for the public API handoff. Connection identities, mutable cross-connection follow, proxy tests, original-byte
+key import and real L/R/D forwarding are also implemented. CLI/TUI, broadcast, archive,
 sync, update, task, automatic shell hooks and log-tail API remain future work.
 Native macOS/Windows credential-store, Agent, ACL and terminal verification is
 explicitly deferred to CLI; six-platform builds are compile evidence only.
@@ -120,7 +121,7 @@ core/
 │   ├── session/        # SSH sessions
 │   ├── sftp/           # SFTP operations
 │   ├── sshpool/        # Connection pooling
-│   ├── forward/        # Port forwarding (planned)
+│   ├── forward/        # Local/remote/dynamic forwarding resources
 │   ├── broadcast/      # Broadcast mode (planned)
 │   └── sync/           # Config sync (planned)
 └── docs/               # Documentation

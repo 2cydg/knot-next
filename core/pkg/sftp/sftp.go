@@ -17,6 +17,7 @@ import (
 
 	"knot-core/internal/keyutil"
 	"knot-core/internal/logger"
+	"knot-core/internal/resourceid"
 	"knot-core/internal/resourcepolicy"
 	"knot-core/pkg/config"
 	"knot-core/pkg/session"
@@ -33,13 +34,20 @@ var (
 )
 
 const (
-	challengeTimeout    = 60 * time.Second
 	maxAuthRetryCount   = 3
 	maxSessionSubs      = 16
 	maxTransferSubs     = 16
 	progressEmitEvery   = 250 * time.Millisecond
 	defaultSessionState = "connecting"
 )
+
+const challengeTimeout = 60 * time.Second
+
+// Options are fixed before service workers start. Zero uses the production deadline.
+type Options struct{ ChallengeTimeout time.Duration }
+
+var ErrHostKeyChallengeExpired = errors.New("host key challenge expired")
+var ErrAuthChallengeExpired = errors.New("authentication challenge expired")
 
 type configProvider interface {
 	RuntimeConfig() (config.RuntimeConfig, error)
@@ -52,6 +60,8 @@ type sessionProvider interface {
 }
 
 type Service struct {
+	challengeNow       func() time.Time
+	challengeDuration  time.Duration
 	policy             resourcepolicy.Policy
 	transferPolicy     resourcepolicy.Policy
 	workers            resourcepolicy.Group
@@ -64,6 +74,7 @@ type Service struct {
 	mu                 sync.RWMutex
 	root               string
 	nextID             int64
+	idGenerator        resourceid.Generator
 	sessions           map[string]*resource
 	transfers          map[string]*transferState
 	subs               map[string]map[chan Event]struct{}
@@ -76,22 +87,26 @@ type Service struct {
 }
 
 type resource struct {
-	lease       *sshpool.ClientLease
-	backendWork *resourcepolicy.Group
-	workers     int
-	releaseDone chan struct{}
+	followCtx     context.Context
+	followWorkers int
+	lease         *sshpool.ClientLease
+	backendWork   *resourcepolicy.Group
+	workers       int
+	releaseDone   chan struct{}
 	Session
-	client           *pkgsftp.Client
-	poolKeys         []string
-	followCancel     func()
-	followGeneration uint64
-	cwdGeneration    uint64
-	followPath       string
-	hostKeyChallenge *pendingChallenge
-	authChallenge    *pendingChallenge
-	authRetryCount   int
-	cancel           context.CancelFunc
-	cache            *remoteDirCache
+	client               *pkgsftp.Client
+	poolKeys             []string
+	followCancel         func()
+	followGeneration     uint64
+	cwdGeneration        uint64
+	followPath           string
+	lastHostKeyChallenge *Challenge
+	lastAuthChallenge    *Challenge
+	hostKeyChallenge     *pendingChallenge
+	authChallenge        *pendingChallenge
+	authRetryCount       int
+	cancel               context.CancelFunc
+	cache                *remoteDirCache
 
 	// serverID is the resolved profile ID this session authenticates against.
 	// It is display-independent: a client-supplied Alias never changes it.
@@ -116,6 +131,7 @@ func (r *resource) backendLocked() *backendView {
 }
 
 type pendingChallenge struct {
+	deadline  time.Time
 	Challenge Challenge
 	response  chan ChallengeResponse
 }
@@ -132,9 +148,14 @@ type transferWork struct {
 	Transfer
 }
 
-func NewService(root string) *Service {
+func NewService(root string, options ...Options) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
+	duration := challengeTimeout
+	if len(options) > 0 && options[0].ChallengeTimeout > 0 {
+		duration = options[0].ChallengeTimeout
+	}
 	return &Service{
+		challengeNow: time.Now, challengeDuration: duration,
 		policy:         resourcepolicy.Sessions(),
 		transferPolicy: resourcepolicy.Transfers(),
 		lifeCtx:        ctx, lifeCancel: cancel,
@@ -178,39 +199,50 @@ func (s *Service) OnEvent(callback func(Event)) {
 }
 
 type CreateRequest struct {
-	ServerRef       string `json:"server_ref"`
-	Alias           string `json:"alias,omitempty"`
-	FollowSessionID string `json:"follow_session_id,omitempty"`
-	HostKeyPolicy   string `json:"host_key_policy,omitempty"`
-	AgentSocket     string `json:"agent_socket,omitempty"`
-	AllowAuthRetry  bool   `json:"allow_auth_retry,omitempty"`
+	ConnectionID       string `json:"connection_id,omitempty"`
+	FollowConnectionID string `json:"follow_connection_id,omitempty"`
+	ServerRef          string `json:"server_ref"`
+	Alias              string `json:"alias,omitempty"`
+	FollowSessionID    string `json:"follow_session_id,omitempty"`
+	HostKeyPolicy      string `json:"host_key_policy,omitempty"`
+	AgentSocket        string `json:"agent_socket,omitempty"`
+	AllowAuthRetry     bool   `json:"allow_auth_retry,omitempty"`
 }
 
 type Session struct {
-	ServerID          string     `json:"server_id,omitempty"`
-	ID                string     `json:"id"`
-	ServerRef         string     `json:"server_ref"`
-	Alias             string     `json:"alias,omitempty"`
-	State             string     `json:"state"`
-	Backend           string     `json:"backend"`
-	Root              string     `json:"root,omitempty"`
-	CurrentDir        string     `json:"current_dir,omitempty"`
-	FollowState       string     `json:"follow_state,omitempty"`
-	FollowError       string     `json:"follow_error,omitempty"`
-	CWDUpdatedAt      *time.Time `json:"cwd_updated_at,omitempty"`
-	FollowSessionID   string     `json:"follow_session_id,omitempty"`
-	HostKeyPolicy     string     `json:"host_key_policy,omitempty"`
-	HostKeyPending    bool       `json:"host_key_pending"`
-	AuthPending       bool       `json:"auth_pending"`
-	DisconnectCause   string     `json:"disconnect_cause,omitempty"`
-	EventsURL         string     `json:"events_url"`
-	TransferEventsURL string     `json:"transfer_events_url"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
-	ClosedAt          *time.Time `json:"closed_at,omitempty"`
+	FollowSourceDir    string     `json:"follow_source_dir,omitempty"`
+	LastChallenge      *Challenge `json:"last_challenge,omitempty"`
+	FailureCode        string     `json:"failure_code,omitempty"`
+	ConnectionID       string     `json:"connection_id,omitempty"`
+	FollowConnectionID string     `json:"follow_connection_id,omitempty"`
+	ServerID           string     `json:"server_id,omitempty"`
+	ID                 string     `json:"id"`
+	ServerRef          string     `json:"server_ref"`
+	Alias              string     `json:"alias,omitempty"`
+	State              string     `json:"state"`
+	Backend            string     `json:"backend"`
+	Root               string     `json:"root,omitempty"`
+	CurrentDir         string     `json:"current_dir,omitempty"`
+	FollowState        string     `json:"follow_state,omitempty"`
+	FollowError        string     `json:"follow_error,omitempty"`
+	CWDUpdatedAt       *time.Time `json:"cwd_updated_at,omitempty"`
+	FollowSessionID    string     `json:"follow_session_id,omitempty"`
+	HostKeyPolicy      string     `json:"host_key_policy,omitempty"`
+	HostKeyPending     bool       `json:"host_key_pending"`
+	AuthPending        bool       `json:"auth_pending"`
+	DisconnectCause    string     `json:"disconnect_cause,omitempty"`
+	EventsURL          string     `json:"events_url"`
+	TransferEventsURL  string     `json:"transfer_events_url"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+	ClosedAt           *time.Time `json:"closed_at,omitempty"`
 }
 
 type Challenge struct {
+	ID                 string    `json:"challenge_id"`
+	ExpiresAt          time.Time `json:"expires_at"`
+	Outcome            string    `json:"outcome,omitempty"`
+	FailureCode        string    `json:"failure_code,omitempty"`
 	PassphraseRequired bool      `json:"passphrase_required,omitempty"`
 	SessionID          string    `json:"session_id"`
 	Type               string    `json:"type"`
@@ -229,30 +261,36 @@ type Challenge struct {
 }
 
 type ChallengeResponse struct {
-	Passphrase string `json:"passphrase,omitempty"`
-	Accept     bool   `json:"accept,omitempty"`
-	Abort      bool   `json:"abort,omitempty"`
-	Password   string `json:"password,omitempty"`
-	KeyID      string `json:"key_id,omitempty"`
-	Remember   bool   `json:"remember,omitempty"`
+	ChallengeID string `json:"challenge_id,omitempty"`
+	Passphrase  string `json:"passphrase,omitempty"`
+	Accept      bool   `json:"accept,omitempty"`
+	Abort       bool   `json:"abort,omitempty"`
+	Password    string `json:"password,omitempty"`
+	KeyID       string `json:"key_id,omitempty"`
+	Remember    bool   `json:"remember,omitempty"`
 }
 
 type Event struct {
-	Type        string           `json:"type"`
-	SessionID   string           `json:"session_id"`
-	State       string           `json:"state,omitempty"`
-	Path        string           `json:"path,omitempty"`
-	Error       string           `json:"error,omitempty"`
-	TransferID  string           `json:"transfer_id,omitempty"`
-	Direction   string           `json:"direction,omitempty"`
-	BytesTotal  int64            `json:"bytes_total,omitempty"`
-	BytesCopied int64            `json:"bytes_copied,omitempty"`
-	FilesTotal  int              `json:"files_total,omitempty"`
-	FilesDone   int              `json:"files_done,omitempty"`
-	CurrentPath string           `json:"current_path,omitempty"`
-	Challenge   *Challenge       `json:"challenge,omitempty"`
-	Warning     *session.Warning `json:"warning,omitempty"`
-	Time        time.Time        `json:"time"`
+	FollowSessionID    string           `json:"follow_session_id,omitempty"`
+	FollowConnectionID string           `json:"follow_connection_id,omitempty"`
+	FollowSourceDir    string           `json:"follow_source_dir,omitempty"`
+	FollowState        string           `json:"follow_state,omitempty"`
+	FollowError        string           `json:"follow_error,omitempty"`
+	Type               string           `json:"type"`
+	SessionID          string           `json:"session_id"`
+	State              string           `json:"state,omitempty"`
+	Path               string           `json:"path,omitempty"`
+	Error              string           `json:"error,omitempty"`
+	TransferID         string           `json:"transfer_id,omitempty"`
+	Direction          string           `json:"direction,omitempty"`
+	BytesTotal         int64            `json:"bytes_total,omitempty"`
+	BytesCopied        int64            `json:"bytes_copied,omitempty"`
+	FilesTotal         int              `json:"files_total,omitempty"`
+	FilesDone          int              `json:"files_done,omitempty"`
+	CurrentPath        string           `json:"current_path,omitempty"`
+	Challenge          *Challenge       `json:"challenge,omitempty"`
+	Warning            *session.Warning `json:"warning,omitempty"`
+	Time               time.Time        `json:"time"`
 }
 
 type Entry struct {
@@ -280,6 +318,7 @@ type TransferRequest struct {
 }
 
 type BatchTransferRequest struct {
+	SourceMode  string   `json:"source_mode,omitempty"`
 	Sources     []string `json:"sources"`
 	Target      string   `json:"target"`
 	Overwrite   bool     `json:"overwrite,omitempty"`
@@ -404,42 +443,37 @@ func (s *Service) Create(req CreateRequest) (Session, error) {
 	if strings.TrimSpace(req.ServerRef) == "" {
 		return Session{}, fmt.Errorf("%w: server_ref is required", ErrValidation)
 	}
-	cfgProvider, sessionService, pool, testMode := s.dependencies()
+	cfgProvider, _, pool, testMode := s.dependencies()
 	if !testMode && cfgProvider == nil {
 		return Session{}, fmt.Errorf("%w: config service is not available", ErrConflict)
 	}
 
 	currentDir := "/"
+	if req.FollowSessionID == "" && req.FollowConnectionID != "" {
+		return Session{}, fmt.Errorf("%w: follow_session_id is required", ErrValidation)
+	}
 	if req.FollowSessionID != "" {
-		if sessionService == nil {
-			return Session{}, fmt.Errorf("%w: session service is not available for follow_session_id", ErrConflict)
+		if _, err := s.validateFollowSource(req.ServerRef, req.FollowSessionID, req.FollowConnectionID); err != nil {
+			return Session{}, err
 		}
-		followed, err := sessionService.Get(req.FollowSessionID)
+	}
+	if req.ConnectionID != "" {
+		if pool == nil || cfgProvider == nil {
+			return Session{}, ErrConflict
+		}
+		cfg, err := cfgProvider.RuntimeConfig()
 		if err != nil {
 			return Session{}, err
 		}
-		if isSourceTerminal(followed.State) {
-			return Session{}, fmt.Errorf("%w: follow source is closed", ErrConflict)
+		target, err := resolveServer(cfg, req.ServerRef)
+		if err != nil {
+			return Session{}, err
 		}
-		if !testMode && cfgProvider != nil {
-			cfg, err := cfgProvider.RuntimeConfig()
-			if err != nil {
-				return Session{}, err
-			}
-			target, err := resolveServer(cfg, req.ServerRef)
-			if err != nil {
-				return Session{}, err
-			}
-			if followed.ServerID != "" && followed.ServerID != target.ID {
-				return Session{}, fmt.Errorf("%w: follow session does not match sftp server", ErrValidation)
-			}
-			if followed.ServerID == "" && followed.ServerRef != target.ID && followed.ServerRef != target.Alias {
-				return Session{}, fmt.Errorf("%w: follow session does not match sftp server", ErrValidation)
-			}
-		} else if followed.ServerRef != req.ServerRef && followed.Alias != req.ServerRef {
-			return Session{}, fmt.Errorf("%w: follow session does not match sftp server", ErrValidation)
+		lease, err := pool.AcquireConnection(req.ConnectionID, target.ID)
+		if err != nil {
+			return Session{}, fmt.Errorf("%w: %s", ErrConflict, err)
 		}
-
+		lease.Release()
 	}
 
 	now := s.policy.Now().UTC()
@@ -456,22 +490,27 @@ func (s *Service) Create(req CreateRequest) (Session, error) {
 		cancel()
 		return Session{}, fmt.Errorf("%w: sftp session limit reached", ErrConflict)
 	}
-	id := strconv.FormatInt(s.nextID, 10)
-	s.nextID++
+	id, err := resourceid.Allocate("sftp", s.idGenerator, func(id string) bool { return s.sessions[id] != nil })
+	if err != nil {
+		s.mu.Unlock()
+		cancel()
+		return Session{}, err
+	}
 	res := &resource{
 		Session: Session{
-			ID:                id,
-			ServerRef:         req.ServerRef,
-			Alias:             req.Alias,
-			State:             defaultSessionState,
-			Backend:           "ssh-sftp",
-			CurrentDir:        currentDir,
-			FollowSessionID:   req.FollowSessionID,
-			HostKeyPolicy:     req.HostKeyPolicy,
-			EventsURL:         "/v1/sftp/" + id + "/events",
-			TransferEventsURL: "/v1/sftp/" + id + "/transfers/events",
-			CreatedAt:         now,
-			UpdatedAt:         now,
+			ID:                 id,
+			ServerRef:          req.ServerRef,
+			Alias:              req.Alias,
+			State:              defaultSessionState,
+			Backend:            "ssh-sftp",
+			CurrentDir:         currentDir,
+			FollowSessionID:    req.FollowSessionID,
+			FollowConnectionID: req.FollowConnectionID,
+			HostKeyPolicy:      req.HostKeyPolicy,
+			EventsURL:          "/v1/sftp/" + id + "/events",
+			TransferEventsURL:  "/v1/sftp/" + id + "/transfers/events",
+			CreatedAt:          now,
+			UpdatedAt:          now,
 		},
 		cancel: cancel,
 	}
@@ -538,35 +577,19 @@ func (s *Service) cleanupCreateFailure(id string) {
 	}
 }
 
-func (s *Service) beginFollow(id string, followID string) error {
+func (s *Service) beginFollow(id, followID string) error {
 	if followID == "" {
 		return nil
 	}
 	s.mu.RLock()
-	sessionService := s.session
+	res := s.sessions[id]
+	connectionID := ""
+	if res != nil {
+		connectionID = res.FollowConnectionID
+	}
 	s.mu.RUnlock()
-	if sessionService == nil {
-		return fmt.Errorf("%w: session service is not available for follow_session_id", ErrConflict)
-	}
-	ch, cancel, followed, err := sessionService.SubscribeCWD(followID)
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	res, ok := s.sessions[id]
-	if !ok || isTerminalSessionState(res.State) {
-		s.mu.Unlock()
-		cancel()
-		return ErrNotFound
-	}
-	res.followPath = followed.CurrentDir
-	res.FollowState = "active"
-	res.followGeneration++
-	generation := res.followGeneration
-	res.followCancel = cancel
-	s.runLocked(res, func() { s.followSessionCWD(id, generation, ch) })
-	s.mu.Unlock()
-	return nil
+	_, err := s.setFollow(id, followID, connectionID, true)
+	return err
 }
 
 func (s *Service) connectSession(ctx context.Context, id string, req CreateRequest, cfgProvider configProvider, pool *sshpool.Pool) {
@@ -617,6 +640,7 @@ func (s *Service) connectSession(ctx context.Context, id string, req CreateReque
 	res.client = client
 	res.backendWork = work
 	res.lease = lease
+	res.ConnectionID = lease.ConnectionID
 	res.poolKeys = cloneStrings(lease.Keys)
 	res.cache = newRemoteDirCache(client, remoteDirCacheTTL)
 	res.State = "open"
@@ -650,10 +674,16 @@ func (s *Service) openRemoteClient(ctx context.Context, sessionID string, req Cr
 		confirm := func(attemptCtx context.Context, prompt sshpool.HostKeyPrompt) bool {
 			return s.waitHostKeyResponse(attemptCtx, sessionID, server, prompt)
 		}
-		lease, err := pool.AcquireClientContextWithPrompt(ctx, server, currentCfg, confirm, sshpool.DialOptions{
-			AgentSocket:   req.AgentSocket,
-			HostKeyPolicy: req.HostKeyPolicy,
-		})
+		var lease *sshpool.ClientLease
+		var err error
+		if req.ConnectionID != "" {
+			lease, err = pool.AcquireConnection(req.ConnectionID, server.ID)
+		} else {
+			lease, err = pool.AcquireClientContextWithPrompt(ctx, server, currentCfg, confirm, sshpool.DialOptions{
+				AgentSocket:   req.AgentSocket,
+				HostKeyPolicy: req.HostKeyPolicy,
+			})
+		}
 		if err != nil {
 			if errors.Is(err, sshpool.ErrHostKeyReject) {
 				return nil, nil, currentCfg, nil, err
@@ -669,6 +699,11 @@ func (s *Service) openRemoteClient(ctx context.Context, sessionID string, req Cr
 			}
 			return nil, nil, currentCfg, nil, err
 		}
+		s.mu.Lock()
+		if r := s.sessions[sessionID]; r != nil {
+			r.ConnectionID = lease.ConnectionID
+		}
+		s.mu.Unlock()
 		client := lease.Client
 		ownedCtx, work := resourcepolicy.Scope(ctx)
 		sftpClient, err := openSFTPSubsystem(ownedCtx, client)
@@ -861,6 +896,27 @@ func (s *Service) waitHostKeyResponse(ctx context.Context, sessionID string, ser
 		s.mu.Unlock()
 		return false
 	}
+	challengeID, idErr := resourceid.Allocate("challenge", s.idGenerator, func(id string) bool {
+		for _, r := range s.sessions {
+			for _, c := range []*Challenge{r.lastHostKeyChallenge, r.lastAuthChallenge} {
+				if c != nil && c.ID == id {
+					return true
+				}
+			}
+		}
+		return false
+	})
+	if idErr != nil {
+		s.mu.Unlock()
+		s.failSession(sessionID, idErr, config.RuntimeConfig{})
+		return false
+	}
+	challenge.Challenge.ID = challengeID
+	challenge.deadline = s.challengeNow().Add(s.challengeDuration)
+	challenge.Challenge.ExpiresAt = now.Add(s.challengeDuration)
+	challenge.Challenge.Outcome = "pending"
+	res.LastChallenge = cloneChallengePtr(&challenge.Challenge)
+	res.lastHostKeyChallenge = cloneChallengePtr(&challenge.Challenge)
 	res.hostKeyChallenge = challenge
 	res.HostKeyPending = true
 	// The state names the wait the client is in, matching the SSH contract: the
@@ -877,16 +933,37 @@ func (s *Service) waitHostKeyResponse(ctx context.Context, sessionID string, ser
 	})
 	s.mu.Unlock()
 
-	timer := time.NewTimer(challengeTimeout)
+	timer := time.NewTimer(challenge.deadline.Sub(s.challengeNow()))
 	defer timer.Stop()
 	select {
 	case resp := <-challenge.response:
 		return resp.Accept && !resp.Abort
 	case <-timer.C:
-		s.failPendingChallenge(sessionID, "host_key", "host key confirmation timed out")
+		if !s.failPendingChallenge(sessionID, "host_key", "host key confirmation timed out") {
+			select {
+			case resp := <-challenge.response:
+				return resp.Accept && !resp.Abort
+			default:
+			}
+		}
+		return false
+	case <-prompt.TransportDone:
+		if !s.failPendingChallenge(sessionID, "host_key", "connection closed during host key confirmation") {
+			select {
+			case resp := <-challenge.response:
+				return resp.Accept && !resp.Abort
+			default:
+			}
+		}
 		return false
 	case <-ctx.Done():
-		s.failPendingChallenge(sessionID, "host_key", "connecting cancelled")
+		if !s.failPendingChallenge(sessionID, "host_key", "connecting cancelled") {
+			select {
+			case resp := <-challenge.response:
+				return resp.Accept && !resp.Abort
+			default:
+			}
+		}
 		return false
 	}
 }
@@ -925,6 +1002,26 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 		s.mu.Unlock()
 		return cfg, fmt.Errorf("%w: session %s no longer accepts challenge responses", ErrConflict, sessionID)
 	}
+	challengeID, idErr := resourceid.Allocate("challenge", s.idGenerator, func(id string) bool {
+		for _, r := range s.sessions {
+			for _, c := range []*Challenge{r.lastHostKeyChallenge, r.lastAuthChallenge} {
+				if c != nil && c.ID == id {
+					return true
+				}
+			}
+		}
+		return false
+	})
+	if idErr != nil {
+		s.mu.Unlock()
+		return cfg, idErr
+	}
+	challenge.Challenge.ID = challengeID
+	challenge.deadline = s.challengeNow().Add(s.challengeDuration)
+	challenge.Challenge.ExpiresAt = now.Add(s.challengeDuration)
+	challenge.Challenge.Outcome = "pending"
+	res.LastChallenge = cloneChallengePtr(&challenge.Challenge)
+	res.lastAuthChallenge = cloneChallengePtr(&challenge.Challenge)
 	res.authRetryCount = retryCount
 	res.authChallenge = challenge
 	res.AuthPending = true
@@ -939,10 +1036,25 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 	})
 	s.mu.Unlock()
 
-	timer := time.NewTimer(challengeTimeout)
+	timer := time.NewTimer(challenge.deadline.Sub(s.challengeNow()))
 	defer timer.Stop()
+	var resp ChallengeResponse
 	select {
-	case resp := <-challenge.response:
+	case resp = <-challenge.response:
+	case <-timer.C:
+		if s.failPendingChallenge(sessionID, "auth", "authentication retry timed out") {
+			return cfg, ErrAuthChallengeExpired
+		}
+		select {
+		case resp = <-challenge.response:
+		default:
+			return cfg, ErrConflict
+		}
+	case <-ctx.Done():
+		s.failPendingChallenge(sessionID, "auth", "authentication retry cancelled")
+		return cfg, ctx.Err()
+	}
+	{
 		if resp.Abort {
 			return cfg, fmt.Errorf("%w: authentication retry aborted", ErrConflict)
 		}
@@ -964,12 +1076,6 @@ func (s *Service) waitAuthResponse(ctx context.Context, sessionID string, server
 		}
 		s.mu.Unlock()
 		return s.runtimeConfigForAuthResponse(cfg, server, resp)
-	case <-timer.C:
-		s.failPendingChallenge(sessionID, "auth", "authentication retry timed out")
-		return cfg, fmt.Errorf("%w: authentication retry timed out", ErrConflict)
-	case <-ctx.Done():
-		s.failPendingChallenge(sessionID, "auth", "authentication retry cancelled")
-		return cfg, ctx.Err()
 	}
 }
 
@@ -1039,6 +1145,13 @@ func (s *Service) challenge(id string, typ string) (Challenge, error) {
 		pending = res.authChallenge
 	}
 	if pending == nil {
+		last := res.lastAuthChallenge
+		if typ == "host_key" {
+			last = res.lastHostKeyChallenge
+		}
+		if last != nil {
+			return *cloneChallengePtr(last), nil
+		}
 		return Challenge{SessionID: id, Type: typ, Pending: false}, nil
 	}
 	out := pending.Challenge
@@ -1048,84 +1161,125 @@ func (s *Service) challenge(id string, typ string) (Challenge, error) {
 
 func (s *Service) respondChallenge(id string, typ string, resp ChallengeResponse) (Challenge, error) {
 	s.mu.Lock()
-	res, ok := s.sessions[id]
-	if !ok {
-		s.mu.Unlock()
+	defer s.mu.Unlock()
+	r := s.sessions[id]
+	if r == nil {
 		return Challenge{}, ErrNotFound
 	}
-	// Once terminal a challenge is no longer submittable: answering one would
-	// move the session back out of the outcome that was recorded for it.
-	if isTerminalSessionState(res.State) {
-		s.mu.Unlock()
-		return Challenge{}, fmt.Errorf("%w: session %s no longer accepts challenge responses", ErrConflict, id)
-	}
-	var pending *pendingChallenge
+	pending, last := r.authChallenge, r.lastAuthChallenge
 	if typ == "host_key" {
-		pending = res.hostKeyChallenge
-	} else {
-		pending = res.authChallenge
+		pending, last = r.hostKeyChallenge, r.lastHostKeyChallenge
+	}
+	if resp.ChallengeID != "" && (last == nil || last.ID != resp.ChallengeID) {
+		return Challenge{}, fmt.Errorf("%w: challenge identity mismatch", ErrConflict)
+	}
+	if pending == nil || isTerminalSessionState(r.State) {
+		if last != nil && last.Outcome == "expired" {
+			if typ == "host_key" {
+				return *cloneChallengePtr(last), ErrHostKeyChallengeExpired
+			}
+			return *cloneChallengePtr(last), ErrAuthChallengeExpired
+		}
+		return Challenge{}, fmt.Errorf("%w: challenge is no longer pending", ErrConflict)
+	}
+	if !pending.deadline.IsZero() && !s.challengeNow().Before(pending.deadline) {
+		s.finishChallengeLocked(r, typ, "expired")
+		s.failChallengeLocked(r, typ, "challenge expired")
+		if typ == "host_key" {
+			return *cloneChallengePtr(r.lastHostKeyChallenge), ErrHostKeyChallengeExpired
+		}
+		return *cloneChallengePtr(r.lastAuthChallenge), ErrAuthChallengeExpired
+	}
+	outcome := "accepted"
+	if resp.Abort || (typ == "host_key" && !resp.Accept) {
+		outcome = "aborted"
+	}
+	c := s.finishChallengeLocked(r, typ, outcome)
+	r.State = "connecting"
+	r.UpdatedAt = s.policy.Now().UTC()
+
+	// Delivery belongs to the same commit as resolution; the timer cannot expire
+	// an accepted answer after this point.
+	pending.response <- resp
+	s.publishSessionLocked(r, Event{Type: "sftp.challenge.resolved", SessionID: id, State: r.State, Challenge: &c, Time: r.UpdatedAt})
+	return c, nil
+}
+func (s *Service) finishChallengeLocked(r *resource, typ, outcome string) Challenge {
+	pending := r.authChallenge
+	if typ == "host_key" {
+		pending = r.hostKeyChallenge
 	}
 	if pending == nil {
-		s.mu.Unlock()
-		return Challenge{SessionID: id, Type: typ, Pending: false}, nil
+		return Challenge{}
 	}
-	challenge := pending.Challenge
+	c := pending.Challenge
+	c.Pending = false
+	c.Outcome = outcome
+	c.UpdatedAt = s.policy.Now().UTC()
+	if outcome == "expired" {
+		if typ == "host_key" {
+			c.FailureCode = "HOST_KEY_CHALLENGE_EXPIRED"
+		} else {
+			c.FailureCode = "AUTH_CHALLENGE_EXPIRED"
+		}
+	}
+	if outcome == "aborted" {
+		c.FailureCode = "CHALLENGE_ABORTED"
+		r.FailureCode = c.FailureCode
+	}
 	if typ == "host_key" {
-		res.hostKeyChallenge = nil
-		res.HostKeyPending = false
-		if res.State == "host_key_pending" {
-			res.State = "connecting"
-		}
+		r.hostKeyChallenge = nil
+		r.HostKeyPending = false
+		r.lastHostKeyChallenge = cloneChallengePtr(&c)
 	} else {
-		res.authChallenge = nil
-		res.AuthPending = false
-		if res.State == "auth_pending" {
-			res.State = "connecting"
-		}
+		r.authChallenge = nil
+		r.AuthPending = false
+		r.lastAuthChallenge = cloneChallengePtr(&c)
 	}
-	res.UpdatedAt = s.policy.Now().UTC()
-	s.publishSessionLocked(res, Event{Type: "sftp.challenge.resolved", SessionID: id, State: res.State, Challenge: &challenge, Time: res.UpdatedAt})
-	s.mu.Unlock()
-	select {
-	case pending.response <- resp:
-	default:
-	}
-	challenge.Pending = false
-	challenge.UpdatedAt = s.policy.Now().UTC()
-	return challenge, nil
+	r.LastChallenge = cloneChallengePtr(&c)
+	return c
 }
 
-func (s *Service) failPendingChallenge(sessionID string, typ string, message string) {
-	now := s.policy.Now().UTC()
+func (s *Service) failPendingChallenge(sessionID string, typ string, message string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	res, ok := s.sessions[sessionID]
-	if !ok {
-		return
+	r := s.sessions[sessionID]
+	if r == nil || isTerminalSessionState(r.State) {
+		return false
 	}
-	// A cancelled or already failed session keeps its terminal state, time and
-	// cause; this late failure report is only noise.
-	if isTerminalSessionState(res.State) {
-		return
-	}
+	pending := r.authChallenge
 	if typ == "host_key" {
-		res.hostKeyChallenge = nil
-		res.HostKeyPending = false
-	} else {
-		res.authChallenge = nil
-		res.AuthPending = false
+		pending = r.hostKeyChallenge
 	}
-	if res.cancel != nil {
-		res.cancel()
+	if pending == nil {
+		return false
 	}
-	res.State = "failed"
-	res.DisconnectCause = message
-	res.ClosedAt = &now
-	res.UpdatedAt = now
-	res.pendingCredentials = nil
-	s.publishSessionLocked(res, Event{Type: "sftp.error", SessionID: sessionID, State: res.State, Error: message, Time: now})
-	s.cancelFollowLocked(res)
-	s.closeSubscribersLocked(res.ID)
+	outcome := "aborted"
+	if strings.Contains(message, "timed out") {
+		outcome = "expired"
+	}
+	s.finishChallengeLocked(r, typ, outcome)
+	if strings.Contains(message, "connection closed") {
+		r.LastChallenge.FailureCode = "CONNECTION_FAILED"
+		r.lastHostKeyChallenge.FailureCode = "CONNECTION_FAILED"
+	}
+	s.failChallengeLocked(r, typ, message)
+	return true
+}
+func (s *Service) failChallengeLocked(r *resource, typ, message string) {
+	now := s.policy.Now().UTC()
+	if r.cancel != nil {
+		r.cancel()
+	}
+	r.State = "failed"
+	r.UpdatedAt = now
+	r.pendingCredentials = nil
+	r.FailureCode = r.LastChallenge.FailureCode
+	r.DisconnectCause = message
+	r.ClosedAt = &now
+	s.publishSessionLocked(r, Event{Type: "sftp.error", SessionID: r.ID, State: r.State, Error: message, Challenge: cloneChallengePtr(r.LastChallenge), Time: now})
+	s.cancelFollowLocked(r)
+	s.closeSubscribersLocked(r.ID)
 }
 
 func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig) {
@@ -1151,6 +1305,8 @@ func (s *Service) failSession(id string, err error, cfg config.RuntimeConfig) {
 	res.ClosedAt = &now
 	res.UpdatedAt = now
 	res.pendingCredentials = nil
+	s.finishChallengeLocked(res, "host_key", "aborted")
+	s.finishChallengeLocked(res, "auth", "aborted")
 	res.hostKeyChallenge = nil
 	res.authChallenge = nil
 	res.HostKeyPending = false
@@ -1324,6 +1480,8 @@ func (s *Service) closeSessionLocked(res *resource, state string, cause string, 
 	// Clear pending markers and the credential candidate so a late challenge,
 	// retry or connect failure cannot revive the session or leave a secret
 	// waiting to be persisted.
+	s.finishChallengeLocked(res, "host_key", "aborted")
+	s.finishChallengeLocked(res, "auth", "aborted")
 	res.hostKeyChallenge = nil
 	res.authChallenge = nil
 	res.HostKeyPending = false
@@ -1543,22 +1701,39 @@ func (s *Service) List(id string, remotePath string, opts ListOptions) ([]Entry,
 }
 
 func (s *Service) Stat(id string, remotePath string) (Entry, error) {
+	return s.StatWithOptions(id, remotePath, true)
+}
+func (s *Service) Lstat(id string, remotePath string) (Entry, error) {
+	return s.StatWithOptions(id, remotePath, false)
+}
+func (s *Service) StatWithOptions(id, remotePath string, followSymlinks bool) (Entry, error) {
 	res, clean, err := s.requireOpenSession(id, remotePath)
 	if err != nil {
 		return Entry{}, err
 	}
 	if res.client != nil {
-		info, err := res.client.Stat(clean)
+		var info os.FileInfo
+		var err error
+		if followSymlinks {
+			info, err = res.client.Stat(clean)
+		} else {
+			info, err = res.client.Lstat(clean)
+		}
 		if err != nil {
 			return Entry{}, err
 		}
 		return entryFromInfo(clean, info), nil
 	}
-	local, _, err := s.resolve(id, clean)
+	local, err := s.resolveObject(id, clean, followSymlinks)
 	if err != nil {
 		return Entry{}, err
 	}
-	info, err := os.Stat(local)
+	var info os.FileInfo
+	if followSymlinks {
+		info, err = os.Stat(local)
+	} else {
+		info, err = os.Lstat(local)
+	}
 	if err != nil {
 		return Entry{}, err
 	}
@@ -1598,7 +1773,7 @@ func (s *Service) RemoveFile(id string, remotePath string) error {
 		return err
 	}
 	if res.client != nil {
-		info, err := res.client.Stat(clean)
+		info, err := res.client.Lstat(clean)
 		if err != nil {
 			return err
 		}
@@ -1611,11 +1786,11 @@ func (s *Service) RemoveFile(id string, remotePath string) error {
 		res.cache.Invalidate(clean, path.Dir(clean))
 		return nil
 	}
-	local, _, err := s.resolve(id, clean)
+	local, err := s.resolveObject(id, clean, false)
 	if err != nil {
 		return err
 	}
-	info, err := os.Stat(local)
+	info, err := os.Lstat(local)
 	if err != nil {
 		return err
 	}
@@ -1631,7 +1806,7 @@ func (s *Service) RemoveDir(id string, remotePath string) error {
 		return err
 	}
 	if res.client != nil {
-		info, err := res.client.Stat(clean)
+		info, err := res.client.Lstat(clean)
 		if err != nil {
 			return err
 		}
@@ -1644,11 +1819,11 @@ func (s *Service) RemoveDir(id string, remotePath string) error {
 		res.cache.Invalidate(clean, path.Dir(clean))
 		return nil
 	}
-	local, _, err := s.resolve(id, clean)
+	local, err := s.resolveObject(id, clean, false)
 	if err != nil {
 		return err
 	}
-	info, err := os.Stat(local)
+	info, err := os.Lstat(local)
 	if err != nil {
 		return err
 	}
@@ -1658,31 +1833,60 @@ func (s *Service) RemoveDir(id string, remotePath string) error {
 	return os.Remove(local)
 }
 
-func (s *Service) Rename(id string, oldPath string, newPath string) (Entry, error) {
+func (s *Service) Rename(id, oldPath, newPath string) (Entry, error) {
+	return s.RenameWithOptions(id, oldPath, newPath, true)
+}
+func (s *Service) RenameWithOptions(id, oldPath, newPath string, overwrite bool) (Entry, error) {
 	res, oldClean, err := s.requireOpenSession(id, oldPath)
 	if err != nil {
 		return Entry{}, err
 	}
+	if oldPath == "" || newPath == "" {
+		return Entry{}, sftpFieldFailure("old_path", "old_path and new_path are required")
+	}
 	newClean := cleanRemote(newPath)
+	if !overwrite && oldClean != newClean {
+		_, err := s.Lstat(id, newClean)
+		if err == nil {
+			return Entry{}, fmt.Errorf("%w: destination exists", ErrConflict)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return Entry{}, err
+		}
+	}
 	if res.client != nil {
-		if err := res.client.Rename(oldClean, newClean); err != nil {
+		rename := res.client.Rename
+		posix := false
+		if overwrite {
+			if _, ok := res.client.HasExtension("posix-rename@openssh.com"); ok {
+				rename = res.client.PosixRename
+				posix = true
+			}
+		}
+		if err := rename(oldClean, newClean); err != nil {
+			var status *pkgsftp.StatusError
+			if overwrite && !posix && oldClean != newClean && (errors.Is(err, os.ErrExist) || (errors.As(err, &status) && status.Code == 4)) {
+				if _, statErr := res.client.Lstat(newClean); statErr == nil {
+					return Entry{}, fmt.Errorf("%w: server could not replace destination", ErrConflict)
+				}
+			}
 			return Entry{}, err
 		}
 		res.cache.Invalidate(oldClean, newClean, path.Dir(oldClean), path.Dir(newClean))
-		return s.Stat(id, newClean)
+		return s.Lstat(id, newClean)
 	}
-	oldLocal, _, err := s.resolve(id, oldClean)
+	oldLocal, err := s.resolveObject(id, oldClean, false)
 	if err != nil {
 		return Entry{}, err
 	}
-	newLocal, _, err := s.resolve(id, newClean)
+	newLocal, err := s.resolveObject(id, newClean, false)
 	if err != nil {
 		return Entry{}, err
 	}
 	if err := os.Rename(oldLocal, newLocal); err != nil {
 		return Entry{}, err
 	}
-	return s.Stat(id, newClean)
+	return s.Lstat(id, newClean)
 }
 
 func (s *Service) Upload(id string, req TransferRequest) (Transfer, error) {
@@ -1724,6 +1928,9 @@ func (s *Service) runDownload(ctx context.Context, res *backendView, work *trans
 }
 
 func (s *Service) BatchUpload(id string, req BatchTransferRequest) (Transfer, error) {
+	if req.SourceMode != "" && req.SourceMode != "literal" {
+		return Transfer{}, fmt.Errorf("%w: uploads support literal sources only", ErrValidation)
+	}
 	if len(req.Sources) == 0 || strings.TrimSpace(req.Target) == "" {
 		return Transfer{}, fmt.Errorf("%w: sources and target are required", ErrValidation)
 	}
@@ -1737,6 +1944,16 @@ func (s *Service) BatchUpload(id string, req BatchTransferRequest) (Transfer, er
 }
 
 func (s *Service) BatchDownload(id string, req BatchTransferRequest) (Transfer, error) {
+	if req.SourceMode != "" && req.SourceMode != "glob" && req.SourceMode != "literal" {
+		return Transfer{}, fmt.Errorf("%w: source_mode must be literal or glob", ErrValidation)
+	}
+	if req.SourceMode == "literal" {
+		for _, source := range req.Sources {
+			if !path.IsAbs(source) {
+				return Transfer{}, sftpFieldFailure("sources", "literal sources must be absolute")
+			}
+		}
+	}
 	if len(req.Sources) == 0 || strings.TrimSpace(req.Target) == "" {
 		return Transfer{}, fmt.Errorf("%w: sources and target are required", ErrValidation)
 	}
@@ -2107,7 +2324,20 @@ func (s *Service) runBatchDownload(ctx context.Context, res *backendView, work *
 			}
 			return "", err
 		}
-		matches, err := s.globMatches(res, pattern, req.IncludeDirs, true)
+		var matches []Entry
+		var err error
+		if req.SourceMode == "literal" {
+			var entry Entry
+			entry, err = s.Stat(res.ID, pattern)
+			if err == nil && entry.Type == "directory" && !req.IncludeDirs {
+				return "failed", fmt.Errorf("%w: directory source requires include_dirs", ErrValidation)
+			}
+			if err == nil && (entry.Type != "directory" || req.IncludeDirs) {
+				matches = []Entry{entry}
+			}
+		} else {
+			matches, err = s.globMatches(res, pattern, req.IncludeDirs, true)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				for j := range work.Items {
@@ -2832,6 +3062,13 @@ func (s *Service) dependencies() (configProvider, sessionProvider, *sshpool.Pool
 
 func (s *Service) publishSessionLocked(res *resource, event Event) {
 	event.Error = logger.Redact(event.Error)
+	if strings.HasPrefix(event.Type, "sftp.follow.") || strings.HasPrefix(event.Type, "sftp.cwd.") {
+		event.FollowSessionID = res.FollowSessionID
+		event.FollowConnectionID = res.FollowConnectionID
+		event.FollowSourceDir = res.FollowSourceDir
+		event.FollowState = res.FollowState
+		event.FollowError = res.FollowError
+	}
 
 	if event.Time.IsZero() {
 		event.Time = s.policy.Now().UTC()
@@ -2892,6 +3129,7 @@ func (s *Service) publishTransferLocked(transfer *transferState, typ string, now
 
 func (r *resource) snapshot() Session {
 	out := r.Session
+	out.LastChallenge = cloneChallengePtr(r.LastChallenge)
 	if out.CWDUpdatedAt != nil {
 		t := *out.CWDUpdatedAt
 		out.CWDUpdatedAt = &t
@@ -3144,7 +3382,9 @@ func evalExistingParent(dir string, root string) (string, error) {
 
 func entryFromInfo(remotePath string, info os.FileInfo) Entry {
 	typ := "file"
-	if info.IsDir() {
+	if info.Mode()&os.ModeSymlink != 0 {
+		typ = "symlink"
+	} else if info.IsDir() {
 		typ = "directory"
 	}
 	return Entry{
@@ -3160,33 +3400,45 @@ func entryFromInfo(remotePath string, info os.FileInfo) Entry {
 func sortEntries(entries []Entry, sortBy string) {
 	desc := strings.HasPrefix(sortBy, "-")
 	sortBy = strings.TrimPrefix(sortBy, "-")
-	if sortBy == "" {
-		sortBy = "name"
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		less := false
+	compare := func(a, b Entry) int {
 		switch sortBy {
 		case "size":
-			less = entries[i].Size < entries[j].Size
+			if a.Size < b.Size {
+				return -1
+			}
+			if a.Size > b.Size {
+				return 1
+			}
 		case "mod_time":
-			less = entries[i].ModTime.Before(entries[j].ModTime)
+			if a.ModTime.Before(b.ModTime) {
+				return -1
+			}
+			if a.ModTime.After(b.ModTime) {
+				return 1
+			}
 		case "type":
-			if entries[i].Type == entries[j].Type {
-				less = entries[i].Name < entries[j].Name
-			} else {
-				less = entries[i].Type < entries[j].Type
+			if n := strings.Compare(a.Type, b.Type); n != 0 {
+				return n
 			}
 		default:
-			if entries[i].Type == entries[j].Type {
-				less = entries[i].Name < entries[j].Name
-			} else {
-				less = entries[i].Type == "directory"
+			if (a.Type == "directory") != (b.Type == "directory") {
+				if a.Type == "directory" {
+					return -1
+				}
+				return 1
 			}
 		}
-		if desc {
-			return !less
+		if n := strings.Compare(a.Name, b.Name); n != 0 {
+			return n
 		}
-		return less
+		return strings.Compare(a.Path, b.Path)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		n := compare(entries[i], entries[j])
+		if desc {
+			return n > 0
+		}
+		return n < 0
 	})
 }
 
@@ -3334,4 +3586,22 @@ func containsString(values []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// Resolve the parent when operating on a link itself. Following the final link
+// would reject or mutate its target instead of deleting/renaming the link.
+func (s *Service) resolveObject(id, clean string, follow bool) (string, error) {
+	if follow || clean == "/" {
+		local, _, err := s.resolve(id, clean)
+		return local, err
+	}
+	parent, _, err := s.resolve(id, path.Dir(clean))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, path.Base(clean)), nil
+}
+
+func sftpFieldFailure(field, message string) error {
+	return fmt.Errorf("%w: %w", ErrValidation, &config.ValidationFailure{Errors: []config.ValidationError{{Resource: "sftp", Field: field, Message: message}}})
 }

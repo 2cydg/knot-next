@@ -11,5 +11,6 @@ Record stable resource IDs and machine codes; redact credentials and do not
 capture PTY/file contents in diagnostics.
 
 See the [public workflow example](../examples/baseline/README.md), [API contract](api/README.md)
-and [handoff checklist](cli-handoff.md). Do not infer unavailable forwarding,
+and [handoff checklist](cli-handoff.md). Use connection/follow/proxy-test/forward resource contracts and GET to recover
+actual results. Do not infer unavailable
 sync, archive or update capabilities from placeholder packages.

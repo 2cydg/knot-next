@@ -318,11 +318,11 @@
 
 query 说明：
 
-- `alias`: 精确 alias 过滤
-- `tag`: 可重复，按 tag 过滤
+- `alias`: 大小写无关子串过滤
+- `tag`: 可重复，每个按大小写无关的完整 tag 精确匹配（前端标签子串搜索自行过滤）
 - `auth_method`: 过滤认证方式
 - `proxy_id`: 过滤代理
-- `q`: 模糊搜索
+- `q`: 大小写无关的 alias/host/user 子串搜索，不包含 tags
 - `limit`: 分页大小
 - `offset`: 偏移
 - `sort`: 排序字段
@@ -497,3 +497,7 @@ query 说明：
 `default_sftp_local_path` 等客户端偏好保持旧字段兼容，core 不据此改变本地进程 cwd。独立客户端配置在 CLI 阶段承接。
 
 `log_level` 是启动配置，修改后需重启 core 才生效；关键生命周期和失败诊断仍保留。
+
+## 配置正确性与转发定义
+
+服务器转发使用独立 [forwards API](forwards.md)，普通 server PUT 保留原定义。普通 key metadata 的 source_path 仅用于既有记录读取；新增路径材料必须通过 [secrets 导入](secrets.md)，不能长期引用源文件。sync provider 类型切换在同一配置事务内清理原类型 password/S3 credentials，再验证最终字段；失败保留原配置。主要最终模型校验返回 VALIDATION_FAILED，details.fields 为 resource/field/message 数组；不能依赖英文 message 做分支，其他校验没有字段详情时仍展示整表错误。

@@ -130,6 +130,27 @@ func (s *Server) handleSettings(w stdhttp.ResponseWriter, r *stdhttp.Request, co
 }
 
 func (s *Server) handleServers(w stdhttp.ResponseWriter, r *stdhttp.Request, configService *config.Service, parts []string) {
+	if len(parts) == 2 && parts[1] == "forwards" {
+		resource := "config/servers/" + parts[0] + "/forwards"
+		switch r.Method {
+		case stdhttp.MethodGet:
+			data, err := configService.GetForwards(parts[0])
+			writeResult(w, response.RiskReadOnly, resource, data, err)
+		case stdhttp.MethodPut:
+			var body struct {
+				Forwards []config.ForwardDefinition `json:"forwards"`
+			}
+			if !decodeJSON(w, r, &body) {
+				return
+			}
+			data, err := configService.PutForwards(parts[0], body.Forwards)
+			writeResult(w, response.RiskLocalMutation, resource, data, err)
+		default:
+			requireMethod(w, r, stdhttp.MethodGet)
+		}
+		return
+	}
+
 	if len(parts) == 1 && parts[0] == "resolve" {
 		if !requireMethod(w, r, stdhttp.MethodGet) {
 			return
@@ -551,13 +572,22 @@ func writeDeletedResult(w stdhttp.ResponseWriter, risk response.Risk, resource s
 
 func writeMappedError(w stdhttp.ResponseWriter, risk response.Risk, resource string, err error) {
 	logger.Diagnostic(slog.LevelWarn, "configuration operation failed", "resource", resource, "error", logger.Redact(err.Error()))
+	var fields *config.ValidationFailure
+	if errors.As(err, &fields) {
+		response.JSONError(w, 400, response.Error{Code: "VALIDATION_FAILED", Message: fields.Error(), Risk: risk, Resource: resource, Details: map[string]any{"fields": fields.Errors}})
+		return
+	}
 	switch {
 	case errors.Is(err, config.ErrNotFound):
 		writeAPIError(w, stdhttp.StatusNotFound, risk, resource, "NOT_FOUND", "resource was not found")
 	case errors.Is(err, config.ErrConflict):
 		writeAPIError(w, stdhttp.StatusConflict, risk, resource, "CONFLICT", "resource conflicts with an existing configuration item")
+	case errors.Is(err, keyutil.ErrUnsupportedPrivateKey):
+		writeAPIError(w, 400, risk, resource, "UNSUPPORTED_PRIVATE_KEY", err.Error())
 	case errors.Is(err, keyutil.ErrPassphraseRequired):
 		writeAPIError(w, stdhttp.StatusBadRequest, risk, resource, "PASSPHRASE_REQUIRED", "private key passphrase required")
+	case errors.Is(err, keyutil.ErrInvalidPrivateKey):
+		writeAPIError(w, 400, risk, resource, "INVALID_PRIVATE_KEY", "invalid private key or passphrase")
 	case errors.Is(err, config.ErrValidation):
 		writeAPIError(w, stdhttp.StatusBadRequest, risk, resource, "VALIDATION_FAILED", err.Error())
 	default:

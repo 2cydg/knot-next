@@ -26,10 +26,12 @@ type client struct {
 }
 type resource struct {
 	ID            string `json:"id"`
+	ConnectionID  string `json:"connection_id"`
 	ServerID      string `json:"server_id"`
 	State         string `json:"state"`
 	Error         string `json:"error"`
 	FrameworkCode string `json:"framework_code"`
+	FailureCode   string `json:"failure_code"`
 }
 
 func (c *client) call(ctx context.Context, method, route string, body any, out any) error {
@@ -53,7 +55,13 @@ func (c *client) call(ctx context.Context, method, route string, body any, out a
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%s %s: HTTP %d", method, route, resp.StatusCode)
+		var failure struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&failure)
+		return fmt.Errorf("%s %s: HTTP %d (%s)", method, route, resp.StatusCode, failure.Error.Code)
 	}
 	if out == nil {
 		_, err = io.Copy(io.Discard, resp.Body)
@@ -98,10 +106,15 @@ func (c *client) wait(ctx context.Context, route, ready string, trust bool) erro
 			}
 			return nil
 		case "failed", "closed", "disconnected":
-			return fmt.Errorf("resource ended: %s (%s)", current.State, current.FrameworkCode)
+			code := current.FailureCode
+			if code == "" {
+				code = current.FrameworkCode
+			}
+			return fmt.Errorf("resource ended: %s (%s)", current.State, code)
 		case "host_key_pending":
 			var challenge struct {
 				Fingerprint string `json:"fingerprint"`
+				ID          string `json:"challenge_id"`
 			}
 			if err := c.call(ctx, "GET", route+"/challenges/host-key", nil, &challenge); err != nil {
 				return err
@@ -110,17 +123,18 @@ func (c *client) wait(ctx context.Context, route, ready string, trust bool) erro
 			if !trust {
 				return fmt.Errorf("host key requires explicit -trust-new: %s", challenge.Fingerprint)
 			}
-			if err := c.call(ctx, "POST", route+"/challenges/host-key", map[string]any{"accept": true, "remember": true}, nil); err != nil {
+			if err := c.call(ctx, "POST", route+"/challenges/host-key", map[string]any{"challenge_id": challenge.ID, "accept": true, "remember": true}, nil); err != nil {
 				return err
 			}
 		case "auth_pending":
 			var challenge struct {
-				PassphraseRequired bool `json:"passphrase_required"`
+				PassphraseRequired bool   `json:"passphrase_required"`
+				ID                 string `json:"challenge_id"`
 			}
 			if err := c.call(ctx, "GET", route+"/challenges/auth", nil, &challenge); err != nil {
 				return err
 			}
-			body := map[string]any{"remember": true}
+			body := map[string]any{"challenge_id": challenge.ID, "remember": true}
 			if challenge.PassphraseRequired {
 				body["passphrase"] = os.Getenv("KNOT_PASSPHRASE")
 			} else if key := os.Getenv("KNOT_KEY_ID"); key != "" {
@@ -197,8 +211,11 @@ func run(ctx context.Context, c *client, server, source, target string, trust bo
 	if exec.State != "completed" || exec.ExitCode != 0 {
 		return errors.New("exec did not complete successfully")
 	}
+	if err := c.call(ctx, "GET", shellRoute, nil, &shell); err != nil {
+		return err
+	}
 	var files resource
-	if err = c.call(ctx, "POST", "/v1/sftp", map[string]any{"server_ref": server, "allow_auth_retry": true, "host_key_policy": "strict"}, &files); err != nil {
+	if err = c.call(ctx, "POST", "/v1/sftp", map[string]any{"server_ref": server, "connection_id": shell.ConnectionID, "follow_session_id": shell.ID, "follow_connection_id": shell.ConnectionID, "allow_auth_retry": true, "host_key_policy": "strict"}, &files); err != nil {
 		return err
 	}
 	route := "/v1/sftp/" + files.ID

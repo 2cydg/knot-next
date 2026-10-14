@@ -14,6 +14,8 @@ import (
 
 	"knot-core/internal/logger"
 	"knot-core/pkg/config"
+	"knot-core/pkg/forward"
+	"knot-core/pkg/proxytest"
 	"knot-core/pkg/secret"
 	"knot-core/pkg/session"
 	"knot-core/pkg/sftp"
@@ -37,6 +39,8 @@ type Service struct {
 	statusCache  statusCache
 	capabilityMu sync.RWMutex
 	config       *config.Service
+	forward      *forward.Service
+	proxyTest    *proxytest.Service
 	secret       *secret.Service
 	session      *session.Service
 	sftp         *sftp.Service
@@ -65,6 +69,7 @@ func (s *Service) UseConfig(configService *config.Service) {
 	s.capabilityMu.Lock()
 	defer s.capabilityMu.Unlock()
 	s.config = configService
+	s.proxyTest = proxytest.NewService(configService)
 	s.invalidateCapabilityProbes()
 }
 
@@ -100,6 +105,50 @@ func (s *Service) UseSSHPool(pool *sshpool.Pool) {
 	if pool != nil {
 		pool.DisconnectCallback = s.handleSSHPoolDisconnect
 	}
+}
+
+func (s *Service) UseForward(service *forward.Service) {
+	s.capabilityMu.Lock()
+	defer s.capabilityMu.Unlock()
+	s.forward = service
+	if service != nil {
+		service.OnEvent(s.handleForwardEvent)
+	}
+}
+func (s *Service) Forward() *forward.Service {
+	s.capabilityMu.RLock()
+	defer s.capabilityMu.RUnlock()
+	return s.forward
+}
+func (s *Service) ProxyTest() *proxytest.Service {
+	s.capabilityMu.RLock()
+	defer s.capabilityMu.RUnlock()
+	return s.proxyTest
+}
+func (s *Service) handleForwardEvent(event forward.Event) {
+	if failed := event.AutoFailure; failed != nil {
+		s.PublishEvent(Event{
+			Type: event.Type, Resource: "connection", ResourceID: failed.ConnectionID,
+			Level: "warn", Time: event.Time,
+			Data: map[string]any{
+				"server_id": failed.ServerID, "connection_id": failed.ConnectionID,
+				"definition_id": failed.DefinitionID, "origin": "persistent",
+				"failure_code": event.FailureCode, "error": event.Error,
+				"warning": session.Warning{Kind: "auto_forward_failed", Message: event.Error},
+			},
+		})
+		return
+	}
+	v := event.Forward
+	data := map[string]any{"state": v.State, "error": v.Error, "failure_code": v.FailureCode, "connection_id": v.ConnectionID, "server_id": v.ServerID, "origin": v.Origin}
+	if event.FailureCode != "" {
+		data["failure_code"] = event.FailureCode
+		data["error"] = event.Error
+	}
+	if v.Origin == "persistent" && v.State == "failed" {
+		data["warning"] = session.Warning{Kind: "auto_forward_failed", Message: "automatic forwarding failed; authenticated SSH remains available"}
+	}
+	s.PublishEvent(Event{Type: event.Type, Resource: "forward", ResourceID: v.ID, Data: data})
 }
 
 func (s *Service) UseShutdown(fn func()) {
@@ -242,6 +291,8 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	sessionService := s.session
 	sftpService := s.sftp
 	pool := s.sshPool
+	forwards := s.forward
+	proxies := s.proxyTest
 	s.capabilityMu.RUnlock()
 
 	s.PublishEvent(Event{Type: "core.shutdown_started", Resource: "core", Level: "info"})
@@ -287,6 +338,12 @@ func (s *Service) Shutdown(ctx context.Context) error {
 	}
 	if sftpService != nil {
 		release("sftp", sftpService.Shutdown)
+	}
+	if forwards != nil {
+		release("forwards", forwards.Shutdown)
+	}
+	if proxies != nil {
+		release("proxy tests", proxies.Shutdown)
 	}
 	if pool != nil {
 		release("ssh pool", pool.Shutdown)
@@ -370,16 +427,21 @@ func (s *Service) handleSFTPEvent(event sftp.Event) {
 		resourceID = event.TransferID
 	}
 	data := map[string]any{
-		"session_id":   event.SessionID,
-		"state":        event.State,
-		"transfer_id":  event.TransferID,
-		"direction":    event.Direction,
-		"bytes_total":  event.BytesTotal,
-		"bytes_copied": event.BytesCopied,
-		"files_total":  event.FilesTotal,
-		"files_done":   event.FilesDone,
-		"current_path": event.CurrentPath,
-		"error":        event.Error,
+		"session_id":           event.SessionID,
+		"state":                event.State,
+		"transfer_id":          event.TransferID,
+		"direction":            event.Direction,
+		"bytes_total":          event.BytesTotal,
+		"bytes_copied":         event.BytesCopied,
+		"files_total":          event.FilesTotal,
+		"files_done":           event.FilesDone,
+		"current_path":         event.CurrentPath,
+		"follow_session_id":    event.FollowSessionID,
+		"follow_connection_id": event.FollowConnectionID,
+		"follow_source_dir":    event.FollowSourceDir,
+		"follow_state":         event.FollowState,
+		"follow_error":         event.FollowError,
+		"error":                event.Error,
 	}
 	if event.Path != "" {
 		data["path"] = event.Path
@@ -417,9 +479,9 @@ func (s *Service) handleSSHPoolDisconnect(poolKey string) {
 	s.PublishEvent(Event{
 		Type:       "ssh_pool.disconnected",
 		Resource:   "ssh_pool",
-		ResourceID: poolKey,
+		ResourceID: "",
 		Level:      "warning",
-		Data:       map[string]any{"pool_key": poolKey},
+		Data:       map[string]any{"connections_changed": true},
 	})
 }
 
@@ -574,6 +636,8 @@ func (s *Service) CapabilitiesContext(ctx context.Context) []Capability {
 	secretAvailable := s.secret != nil
 	sessionAvailable := s.session != nil
 	sftpAvailable := s.sftp != nil
+	forwardAvailable := s.forward != nil
+	proxyTestAvailable := s.proxyTest != nil
 	secretService := s.secret
 	configService := s.config
 	logFile := s.logFile
@@ -589,7 +653,7 @@ func (s *Service) CapabilitiesContext(ctx context.Context) []Capability {
 		logAvailable = false
 		logReason = "redaction_saturated"
 	}
-	return []Capability{
+	capabilities := []Capability{
 		{Name: "cwd_observe", Status: capabilityStatus(sessionAvailable), Risk: "READ_ONLY", Supported: &supported, Available: &sessionAvailable, Limitations: []string{"requires remote OSC7; no automatic shell hook"}},
 		{Name: "sftp_follow", Status: capabilityStatus(sftpAvailable && sessionAvailable), Risk: "REMOTE_READ", Limitations: []string{"explicit source session; manual cd pauses follow"}},
 		{Name: "ssh_agent", Status: "implemented", Risk: "READ_ONLY", Supported: &supported, Available: &agentAvailable, Reason: agentReason},
@@ -604,13 +668,27 @@ func (s *Service) CapabilitiesContext(ctx context.Context) []Capability {
 		{Name: "secret", Status: capabilityStatus(secretAvailable), Risk: "LOCAL_MUTATION"},
 		{Name: "session", Status: capabilityStatus(sessionAvailable), Risk: "LONG_RUNNING"},
 		{Name: "sftp", Status: capabilityStatus(sftpAvailable), Risk: "REMOTE_MUTATION"},
-		{Name: "forward", Status: "planned", Risk: "LONG_RUNNING"},
+		{Name: "forward", Status: "implemented", Available: &forwardAvailable, Risk: "LONG_RUNNING"},
+		{Name: "proxy_test", Status: "implemented", Available: &proxyTestAvailable, Risk: "REMOTE_READ"},
 		{Name: "broadcast", Status: "planned", Risk: "LONG_RUNNING"},
 		{Name: "sync", Status: "planned", Risk: "LONG_RUNNING"},
 		{Name: "archive", Status: "planned", Risk: "LOCAL_MUTATION"},
 		{Name: "update", Status: "planned", Risk: "DESTRUCTIVE"},
 		{Name: "task", Status: "planned", Risk: "LONG_RUNNING"},
 	}
+	for i := range capabilities {
+		c := &capabilities[i]
+		if c.Available == nil {
+			available := c.Status == "available"
+			c.Available = &available
+		}
+		if c.Supported == nil {
+			supported := c.Name != "broadcast" && c.Name != "sync" && c.Name != "archive" && c.Name != "update" && c.Name != "task"
+			c.Supported = &supported
+		}
+	}
+	return capabilities
+
 }
 
 func capabilityStatus(available bool) string {
@@ -642,6 +720,7 @@ func (s *Service) Status() Status {
 	sessionService := s.session
 	sftpService := s.sftp
 	pool := s.sshPool
+	forwards := s.forward
 	s.capabilityMu.RUnlock()
 	activeSessions := 0
 	if sessionService != nil {
@@ -653,6 +732,10 @@ func (s *Service) Status() Status {
 		activeSFTPSessions = sftpService.SessionCount()
 		runningTransfers = sftpService.RunningTransferCount()
 	}
+	activeForwards := 0
+	if forwards != nil {
+		activeForwards = forwards.ActiveCount()
+	}
 	poolStatus := PoolStatus{}
 	if pool != nil {
 		poolStatus.Count, poolStatus.Entries = pool.Snapshot()
@@ -662,7 +745,7 @@ func (s *Service) Status() Status {
 		ActiveSessions:      activeSessions,
 		ActiveSFTPSessions:  activeSFTPSessions,
 		RunningTransfers:    runningTransfers,
-		ActiveForwards:      0,
+		ActiveForwards:      activeForwards,
 		RunningTasks:        0,
 		SSHPool:             poolStatus,
 		AllocatedMemoryByte: alloc,

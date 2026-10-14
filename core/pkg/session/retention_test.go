@@ -359,6 +359,12 @@ func TestSessionFailureClosesSubscribersAndContext(t *testing.T) {
 			if failure == "connect" {
 				s.failSession(res.ID, errors.New("connection failed"), config.RuntimeConfig{}, "failed")
 			} else {
+				pending := &pendingChallenge{Challenge: Challenge{SessionID: res.ID, Type: failure, Pending: true}, response: make(chan ChallengeResponse, 1)}
+				if failure == "host_key" {
+					res.hostKeyChallenge = pending
+				} else {
+					res.authChallenge = pending
+				}
 				s.failPendingChallenge(res.ID, failure, "challenge failed")
 			}
 			select {

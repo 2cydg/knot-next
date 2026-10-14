@@ -23,6 +23,7 @@ import (
 	"knot-core/pkg/config"
 	"knot-core/pkg/core"
 	"knot-core/pkg/crypto"
+	"knot-core/pkg/forward"
 	"knot-core/pkg/secret"
 	"knot-core/pkg/session"
 	"knot-core/pkg/sftp"
@@ -195,6 +196,9 @@ func prepareServices(
 	coreService.UseSession(sessionService)
 	coreService.UseSFTP(sftpService)
 	coreService.UseSSHPool(sharedPool)
+	forwardService := forward.NewService(sharedPool)
+	sharedPool.UseTargetHook(forwardService.EnsureAutoForwards)
+	coreService.UseForward(forwardService)
 	// The shutdown API only asks for shutdown; the runner owns the teardown and
 	// releases resources through the cleanups below.
 	coreService.UseShutdown(env.RequestShutdown)

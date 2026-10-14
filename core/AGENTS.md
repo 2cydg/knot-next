@@ -99,3 +99,16 @@ Windows uses context-aware go-winio named pipes. File diagnostics have bounded
 rotation, redaction and explicit lifecycle ownership. For the B09–B11 batch the
 user explicitly deferred native non-Linux tests to CLI work; cross-build results
 must never be presented as native platform runtime validation.
+
+Connection/SSH/SFTP IDs are opaque random short strings; public APIs never expose
+pool keys or credential digests. Follow source connection and SFTP transport are
+separate. Set/clear follow must preserve transport, roll back failed subscription
+changes, cancel old directory validation and keep generation protection. Challenge
+answers bind challenge_id and preserve accepted/expired/aborted outcomes.
+
+Secrets source_path is a one-time original-byte private-key import; reject new
+persistent file references in ordinary key metadata writes while reading legacy
+SourcePath-only records. Forward instances hold complete route leases and actual
+listener/stream/late-worker ownership. Automatic definitions register once per
+target transport snapshot, independently of advisory callbacks and session close.
+See docs/api/{connections,proxy-tests,forwards}.md and the gap acceptance record.

@@ -139,11 +139,13 @@
 说明：
 
 - 选择 `private_key` 或 `source_path`，不能同时传非空值。SourcePath 由 core 在本机读取。
-- 私钥实际解析为 Ed25519 / RSA / ECDSA 并计算类型、位数、指纹；损坏 PEM 或公钥不能当作私钥保存。
-- 内联有口令私钥必须传正确 passphrase 以验证整个私钥。缺失返回 `400 PASSPHRASE_REQUIRED`，错误返回 `400 VALIDATION_FAILED`；passphrase 不落盘。原始有口令 key 仍加密保存，连接时需要本次尝试的 passphrase。
-- SourcePath 可无口令登记有口令 OpenSSH 或传统加密 PEM key。OpenSSH 从 public envelope 派生元数据；PEM 无 public envelope，未解锁时 type/length/fingerprint 留空，传正确的验证口令可补齐。未解锁的 PEM 仅验证格式和加密头，私钥内容在提供口令时验证。路径丢失、不可读、内容变化不能复用旧 signer/cache 假成功。
+- 支持 OpenSSH、未加密 PKCS#8 以及传统 RSA/EC PEM 容器，私钥实际解析为 Ed25519 / RSA / ECDSA 并计算类型、位数、指纹；损坏 PEM 或公钥不能当作私钥保存。
+- 当前不支持 ENCRYPTED PRIVATE KEY（加密 PKCS#8）；路径/粘贴均返回 400 UNSUPPORTED_PRIVATE_KEY，与损坏私钥和缺口令区分。导入前请使用支持的容器格式。
+- 支持的内联有口令私钥必须传正确 passphrase 以验证整个私钥。缺失返回 `400 PASSPHRASE_REQUIRED`，错误返回 `400 INVALID_PRIVATE_KEY`；passphrase 不落盘。原始有口令 key 仍加密保存，连接时需要本次尝试的 passphrase。
+- source_path 是本次导入输入，必须为 core 所在系统的绝对路径（Windows 支持盘符/UNC），是可读普通文件。core 一次读取、完整验证后把**原始 bytes**加密保存为 PrivateKey，清空 SourcePath；不去口令重编码，不写源文件，不存口令。路径与粘贴等价，缺口令同样 PASSPHRASE_REQUIRED，错误为 INVALID_PRIVATE_KEY。材料上限 1 MiB（内联还受 JSON 整体 1 MiB 限制）。源文件后续删除/替换不影响已存材料。
+- 普通 CreateKey/UpdateKey 不允许建立新的 SourcePath/材料引用。已有磁盘 SourcePath-only 记录兼容读取，GET 不自动迁移；显式重新导入成功后才取消引用。导入失败保持旧材料，并发普通别名编辑保留；并发材料更新为 409。
 - 无口令私钥忽略多余的 passphrase；有口令私钥仍严格验证口令。
-- `encrypted` 表示 SSH key 自身需要口令，所有写入的内联 key 在 TOML 中还使用兼容旧版的 `ENC:`。
+- `encrypted` 表示 SSH key 自身需要口令，所有本次导入的 key 在 TOML 中还使用兼容旧版的 `ENC:`。
 - 删除清空 key 材料及派生元数据。
 
 #### DELETE `/v1/secrets/keys/{id}/private`
@@ -224,3 +226,5 @@
 
 - 修改 secret 前可以先读取 `/v1/secrets/crypto`，确认 provider 可用状态
 - 读取配置展示时使用 `/v1/config` 或 `/v1/secrets` 的“是否已设置”信息，不要假设服务端支持 secret 回读
+
+显式 TOML 导入也按绝对路径、普通文件、1 MiB 上限读取 source_path，将原始 bytes 转为内联密文并清空路径；普通磁盘加载保留旧路径兼容语义。

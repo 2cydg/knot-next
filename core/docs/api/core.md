@@ -150,6 +150,9 @@
 
 - `available`
 - `planned`
+- `implemented`
+
+所有条目统一包含 supported/available：supported 表示本版本具有实现，available 表示当前服务/provider 可用。旧条目保留 available/planned 的 status 兼容值，新能力用 implemented；客户端一律根据 available 判断，不只读 status。Agent/crypto 依赖实时环境探测；forward/proxy_test 为已实现能力，是否装配服务决定 available。
 
 ### GET `/v1/runtime`
 
@@ -313,3 +316,9 @@ Agent 支持 Unix socket 和 Windows named pipe；`ssh_agent.available` 来自�
 runtime `log_path` 是实际文件日志，默认 `<StateDir>/log/core.log`，JSON lines；单文件 10 MiB，最多 `.1`–`.3` 三份历史。启动/就绪/关闭、资源状态和错误、配置/导入错误留有 instance ID/资源上下文；普通成功资源事件和成功 `exec.finished` 按启动配置 `log_level` 过滤；关键进程生命周期、资源/exec 失败和 API/config 错误诊断始终保留。因此 `log_level=error` 仍可能有最低生命周期 Info/失败 Warn 记录。修改 `log_level` 在下次 core 启动生效。
 
 日志不记录命令正文、PTY payload、文件内容或完整请求。token、password、passphrase、私钥、Authorization 和代理认证 URL统一脱敏。Unix 目录 0700/文件 0600；Windows 设置仅当前用户完整访问的 protected DACL。关闭先收尾业务资源，再 Sync/Close 日志；初始化日志失败会中止启动并释放单实例锁。日志 tail/follow API 后置。
+
+## 本轮连接、代理与转发
+
+连接查询及最新建立序号见 [connections](connections.md)，代理实际 scope 见 [proxy-tests](proxy-tests.md)，L/R/D 运行规则见 [forwards](forwards.md)。status 的 active_forwards 仅统计真实 active listener。ssh_pool.entries 只公开 connection_id/server/alias/host/idle/ref_count，不返回内部 key/chain_keys；ssh_pool.disconnected 通知连接集合变动，不返回 pool_key，客户端用 GET 重新查询。
+
+统一 shutdown 同时停止转发/代理探测，关闭 pooled transport 并等待新领域实际 worker。自动转发失败不影响 SSH 就绪，通过全局 forward.failed 和 auto_forward_failed warning 查明结果。临时流停止和迟到 SSH 请求的收尾预算不等于实际释放完成。

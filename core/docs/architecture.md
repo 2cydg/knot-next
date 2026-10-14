@@ -14,4 +14,8 @@ Core 是单用户、loopback-only 的能力服务。`cmd/core` 组织单实例�
 
 `internal/logger` 管理有界文件轮转、脱敏与 Close。Agent Unix socket/Windows named pipe 共用拨号抽象，认证连接临时持有，转发 handler 随共享 client 释放。
 
-CLI/TUI、转发资源管理、广播、归档、同步、更新、任务、自动 shell hook 和日志 tail API 在后续阶段。API 合同见 [API 入口](api/README.md)，平台验证边界见 [验收记录](baseline-acceptance.md)。
+连接 registry 公开独立短 ID 和原子 route lease 取得，SFTP follow 以单独来源订阅/取消 context/generation 维护。同服务器跨连接换源不会转移传输。私钥导入在配置锁外读取/完整验证/加密原文，窄事务提交材料且保留并发普通字段修改。
+
+pkg/forward 管理临时/自动 L/R/D 实例，listener、流、迟到请求及完整路由 lease 随实例持有；目标连接取得的必做 hook 原子登记首次规则快照，不依赖可能丢失的回调。pkg/proxytest 与 SSH 共用 internal/proxyproto，测试不写配置，有独立容量、context 和 shutdown。
+
+CLI/TUI、广播、归档、同步、更新、任务、自动 shell hook 和日志 tail API 在后续阶段。API 合同见 [API 入口](api/README.md)，平台验证边界见 [验收记录](baseline-acceptance.md)。

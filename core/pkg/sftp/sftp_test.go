@@ -57,7 +57,7 @@ func TestCreateFollowSessionUpdatesCurrentDir(t *testing.T) {
 	}
 	followEvents := make(chan session.CWDNotify, 2)
 	sessionSvc := &fakeSessionProvider{
-		resource: session.Resource{ID: "1", ServerRef: "srv", Alias: "web"},
+		resource: session.Resource{ID: "1", ServerRef: "srv", Alias: "web", State: "connected"},
 		events:   followEvents,
 	}
 	sftpSvc := NewService(filepath.Join(root, "sftp"))

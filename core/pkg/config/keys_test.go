@@ -2,7 +2,9 @@ package config
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/pem"
@@ -23,11 +25,15 @@ func TestPrivateKeyValidationAndMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ec, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, entry := range []struct {
 		name string
 		key  any
 		bits int
-	}{{"ed25519", ed, 256}, {"rsa", rsaKey, 2048}} {
+	}{{"ed25519", ed, 256}, {"rsa", rsaKey, 2048}, {"ecdsa", ec, 256}} {
 		t.Run(entry.name, func(t *testing.T) {
 			svc := newTestService(t)
 			view, err := svc.CreateKey(KeyMetadata{ID: "key", Alias: "deploy", Type: "invented", Length: 123})
@@ -115,15 +121,18 @@ func TestPassphraseAndSourcePathRemainTransient(t *testing.T) {
 	if err := os.WriteFile(path, raw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.SetKeyPrivate("key", "", path); err != nil {
+	if _, err := svc.SetKeyPrivateWithPassphrase("key", "", path, "attempt-only-passphrase"); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err = svc.RuntimeConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Keys["key"].PrivateKey != "" || cfg.Keys["key"].SourcePath != path {
-		t.Fatal("SourcePath precedence incorrect")
+	if !bytes.Equal([]byte(cfg.Keys["key"].PrivateKey), raw) || cfg.Keys["key"].SourcePath != "" {
+		t.Fatal("source import did not preserve original bytes")
+	}
+	if _, err := svc.SetKeyPrivate("key", "", path); !errors.Is(err, keyutil.ErrPassphraseRequired) {
+		t.Fatal("path import accepted missing passphrase")
 	}
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
@@ -133,7 +142,7 @@ func TestPassphraseAndSourcePathRemainTransient(t *testing.T) {
 	}
 }
 
-func TestKeyMetadataUpdatePreservesSourcePath(t *testing.T) {
+func TestKeyMetadataUpdatePreservesImportedMaterial(t *testing.T) {
 	svc := newTestService(t)
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -157,7 +166,7 @@ func TestKeyMetadataUpdatePreservesSourcePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.SourcePath != path || !view.PrivateKeySet || view.Type != "ed25519" || view.Length != 256 {
+	if view.SourcePath != "" || !view.PrivateKeySet || view.Type != "ed25519" || view.Length != 256 {
 		t.Fatal("metadata update lost material or trusted client type")
 	}
 }

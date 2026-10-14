@@ -80,7 +80,8 @@ Current capabilities:
 - ✅ SFTP file operations
 - ✅ Key and proxy management
 - ✅ Secrets encryption (platform-specific)
-- 🚧 Port forwarding (planned)
+- ✅ Connection identities, dynamic SFTP follow, proxy probes and private-key original-byte import
+- ✅ Local/remote/dynamic forwarding with temporary and server automatic rules
 - 🚧 Broadcast mode (planned)
 - 🚧 Configuration sync (planned)
 - 🚧 TUI interface (planned)
@@ -100,3 +101,5 @@ and race validation is complete for this batch. Native macOS/Windows Agent,
 credential-store and terminal validation is deferred to CLI integration under
 user authorization. See [API docs](core/docs/api/README.md) and
 [acceptance evidence](core/docs/baseline-acceptance.md).
+
+Core gap completion contracts and executed validation: [acceptance](core/docs/gap-acceptance.md), [public API scenarios](core/examples/gaps/README.md). CLI/TUI remains the next phase; cross-builds are compile evidence, with native platform verification recorded separately.

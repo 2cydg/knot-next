@@ -33,7 +33,7 @@ func (s *Service) MigrationPlan() MigrationPlan {
 	if samePath(m.LegacyPath, s.path) {
 		var warnings []ValidationError
 		items := []MigrationItem{{Resource: "config", Action: "reuse", Reason: "legacy TOML is the active configuration; apply is unnecessary"},
-			{Resource: "forwards", Action: "preserve", Reason: "stored forwarding definitions are preserved; engine remains planned"},
+			{Resource: "forwards", Action: "preserve", Reason: "stored forwarding definitions are preserved and enabled on future target connections"},
 			{Resource: "known_hosts/state.json", Action: "reuse", Reason: "trust and recent history remain at their original paths"}}
 		if m.JSONExists {
 			items = append(items, MigrationItem{Resource: "config.json", Action: "unsupported", Reason: "JSON import is not supported; TOML remains authoritative and JSON is preserved"})
@@ -230,15 +230,20 @@ func (s *Service) readImportSource(path string) (Config, string, bool, error) {
 		if key.PrivateKey != "" {
 			material = []byte(key.PrivateKey)
 		} else if key.SourcePath != "" {
-			material, err = os.ReadFile(key.SourcePath)
+			material, err = readPrivateKeySource(key.SourcePath)
 			if err != nil {
-				return Config{}, "", false, fmt.Errorf("%w: source private key path cannot be read", ErrValidation)
+				return Config{}, "", false, fmt.Errorf("%w: source private key path cannot be read", err)
 			}
 		}
-		if len(material) > 0 {
+		if len(material) > maxKeyBytes {
+			return Config{}, "", false, fieldFailure("keys", "private_key", "private key exceeds 1 MiB")
+		}
+		if len(material) > 0 || key.SourcePath != "" {
 			if err := inspectStoredKey(&key, material, ""); err != nil {
 				return Config{}, "", false, fmt.Errorf("%w: source contains an invalid private key", ErrValidation)
 			}
+			key.PrivateKey = string(material)
+			key.SourcePath = ""
 			cfg.Keys[id] = key
 		}
 	}

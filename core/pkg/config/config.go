@@ -96,6 +96,10 @@ type Settings struct {
 }
 
 type ForwardConfig struct {
+	ID         string `toml:"id,omitempty"`
+	Bind       string `toml:"bind,omitempty"`
+	Target     string `toml:"target,omitempty"`
+	Enabled    *bool  `toml:"enabled,omitempty"`
 	Type       string `toml:"type"`
 	LocalPort  int    `toml:"local_port"`
 	RemoteAddr string `toml:"remote_addr,omitempty"`
@@ -500,7 +504,7 @@ func (s *Service) UpdateServer(id string, server ServerProfile) (ServerProfileVi
 			server.ID = id
 		}
 		if server.ID != id {
-			return fmt.Errorf("%w: id cannot be changed", ErrValidation)
+			return fieldFailure("servers", "id", "id cannot be changed")
 		}
 		if aliasExistsServer(*cfg, server.Alias, id) {
 			return ErrConflict
@@ -636,7 +640,7 @@ func (s *Service) UpdateProxy(id string, proxy ProxyProfile) (ProxyProfileView, 
 			proxy.ID = id
 		}
 		if proxy.ID != id {
-			return fmt.Errorf("%w: id cannot be changed", ErrValidation)
+			return fieldFailure("proxies", "id", "id cannot be changed")
 		}
 		if aliasExistsProxy(*cfg, proxy.Alias, id) {
 			return ErrConflict
@@ -689,8 +693,8 @@ func (s *Service) GetKey(id string) (KeyMetadataView, error) {
 func (s *Service) CreateKey(key KeyMetadata) (KeyMetadataView, error) {
 	var out KeyMetadataView
 	err := s.withConfig(func(cfg *Config) error {
-		if key.PrivateKey != "" {
-			return secretFieldError("private key")
+		if key.PrivateKey != "" || key.SourcePath != "" || key.Passphrase != "" {
+			return secretFieldError("private key material")
 		}
 		if key.ID == "" {
 			key.ID = newID("key")
@@ -702,11 +706,6 @@ func (s *Service) CreateKey(key KeyMetadata) (KeyMetadataView, error) {
 		key.Length = 0
 		key.Fingerprint = ""
 		key.Encrypted = false
-		if key.SourcePath != "" {
-			if err := s.inspectKey(&key); err != nil {
-				return err
-			}
-		}
 		cfg.Keys[key.ID] = key
 		out = keyView(key)
 		return nil
@@ -717,7 +716,7 @@ func (s *Service) CreateKey(key KeyMetadata) (KeyMetadataView, error) {
 func (s *Service) UpdateKey(id string, key KeyMetadata) (KeyMetadataView, error) {
 	var out KeyMetadataView
 	err := s.withConfig(func(cfg *Config) error {
-		if key.PrivateKey != "" {
+		if key.PrivateKey != "" || key.Passphrase != "" {
 			return secretFieldError("private key")
 		}
 		current, ok := cfg.Keys[id]
@@ -728,13 +727,16 @@ func (s *Service) UpdateKey(id string, key KeyMetadata) (KeyMetadataView, error)
 			key.ID = id
 		}
 		if key.ID != id {
-			return fmt.Errorf("%w: id cannot be changed", ErrValidation)
+			return fieldFailure("keys", "id", "id cannot be changed")
 		}
 		if aliasExistsKey(*cfg, key.Alias, id) {
 			return ErrConflict
 		}
 		if key.PrivateKey == "" {
 			key.PrivateKey = current.PrivateKey
+		}
+		if key.SourcePath != "" && key.SourcePath != current.SourcePath {
+			return secretFieldError("private key source")
 		}
 		if key.SourcePath == "" {
 			key.SourcePath = current.SourcePath
@@ -743,12 +745,6 @@ func (s *Service) UpdateKey(id string, key KeyMetadata) (KeyMetadataView, error)
 		key.Length = current.Length
 		key.Fingerprint = current.Fingerprint
 		key.Encrypted = current.Encrypted
-		if key.SourcePath != "" {
-			key.PrivateKey = ""
-			if err := s.inspectKey(&key); err != nil {
-				return err
-			}
-		}
 		cfg.Keys[id] = key
 		out = keyView(key)
 		return nil
@@ -824,7 +820,7 @@ func (s *Service) UpdateSyncProvider(id string, provider SyncProviderConfig) (Sy
 			provider.ID = id
 		}
 		if provider.ID != id {
-			return fmt.Errorf("%w: id cannot be changed", ErrValidation)
+			return fieldFailure("sync_providers", "id", "id cannot be changed")
 		}
 		if aliasExistsSync(*cfg, provider.Alias, id) {
 			return ErrConflict
@@ -912,42 +908,55 @@ func (s *Service) SetKeyPrivate(id string, privateKey string, sourcePath string)
 	return s.SetKeyPrivateWithPassphrase(id, privateKey, sourcePath, "")
 }
 
-func (s *Service) SetKeyPrivateWithPassphrase(id string, privateKey string, sourcePath string, passphrase string) (KeyMetadataView, error) {
+// SetKeyPrivateWithPassphrase imports original bytes, never a persistent file reference.
+func (s *Service) SetKeyPrivateWithPassphrase(id, privateKey, sourcePath, passphrase string) (KeyMetadataView, error) {
+	before, err := s.snapshot()
+	if err != nil {
+		return KeyMetadataView{}, err
+	}
+	original, ok := before.Keys[id]
+	if !ok {
+		return KeyMetadataView{}, ErrNotFound
+	}
+	if (privateKey == "") == (sourcePath == "") {
+		return KeyMetadataView{}, fieldFailure("keys", "private_key", "choose exactly one of private_key or source_path")
+	}
+	raw := []byte(privateKey)
+	if sourcePath != "" {
+		raw, err = readPrivateKeySource(sourcePath)
+		if err != nil {
+			return KeyMetadataView{}, err
+		}
+	}
+	if len(raw) > maxKeyBytes {
+		return KeyMetadataView{}, fieldFailure("keys", "private_key", "private key exceeds 1 MiB")
+	}
+	if _, err := keyutil.Signer(raw, passphrase); err != nil {
+		return KeyMetadataView{}, fmt.Errorf("%w: %w", ErrValidation, err)
+	}
+	meta, err := keyutil.Inspect(raw, passphrase)
+	if err != nil {
+		return KeyMetadataView{}, fmt.Errorf("%w: %w", ErrValidation, err)
+	}
+	encrypted, err := s.encryptSecret(string(raw))
+	if err != nil {
+		return KeyMetadataView{}, err
+	}
 	var out KeyMetadataView
-	err := s.withConfig(func(cfg *Config) error {
+	err = s.withConfig(func(cfg *Config) error {
 		key, ok := cfg.Keys[id]
 		if !ok {
 			return ErrNotFound
 		}
-		if privateKey != "" && sourcePath != "" {
-			return fmt.Errorf("%w: choose private_key or source_path", ErrValidation)
+		if key.PrivateKey != original.PrivateKey || key.SourcePath != original.SourcePath {
+			return fmt.Errorf("%w: private key material changed during import", ErrConflict)
 		}
-		raw := []byte(privateKey)
-		if sourcePath != "" {
-			var err error
-			raw, err = os.ReadFile(sourcePath)
-			if err != nil {
-				return fmt.Errorf("%w: private key source cannot be read", ErrValidation)
-			}
-		}
-		if privateKey != "" {
-			if _, err := keyutil.Signer(raw, passphrase); err != nil {
-				return fmt.Errorf("%w: %w", ErrValidation, err)
-			}
-		}
-		key.Type, key.Length, key.Fingerprint = "", 0, ""
-		if err := inspectStoredKey(&key, raw, passphrase); err != nil {
-			return err
-		}
-		key.PrivateKey = ""
-		if privateKey != "" {
-			encrypted, err := s.encryptSecret(privateKey)
-			if err != nil {
-				return err
-			}
-			key.PrivateKey = encrypted
-		}
-		key.SourcePath = sourcePath
+		key.PrivateKey = encrypted
+		key.SourcePath = ""
+		key.Type = meta.Type
+		key.Length = meta.Bits
+		key.Fingerprint = meta.Fingerprint
+		key.Encrypted = meta.Encrypted
 		cfg.Keys[id] = key
 		out = keyView(key)
 		return nil
@@ -1166,7 +1175,7 @@ func (s *Service) withConfig(fn func(*Config) error) error {
 		}
 		result := validate(next)
 		if !result.Valid {
-			return fmt.Errorf("%w: %s", ErrValidation, result.Errors[0].Message)
+			return &ValidationFailure{Errors: result.Errors}
 		}
 		next.UpdatedAt = time.Now().UTC()
 		if err := s.saveLocked(next); err != nil {
@@ -1762,8 +1771,14 @@ func validate(cfg Config) ValidationResult {
 		if hasControl(server.ID) || hasControl(server.KnownHostsPath) {
 			add(resource, "id/path", "server ID and path must not contain control characters")
 		}
-		for _, f := range server.Forwards {
-			if f.LocalPort <= 0 || f.LocalPort > 65535 || (f.Type != "L" && f.Type != "R" && f.Type != "D") || hasControl(f.RemoteAddr) {
+		seenForwardIDs := map[string]bool{}
+		for i, f := range server.Forwards {
+			id := f.Definition(server.ID, i).ID
+			if seenForwardIDs[id] {
+				add(resource, "forwards", "duplicate forwarding definition ID")
+			}
+			seenForwardIDs[id] = true
+			if ValidateForward(f.Definition(server.ID, i)) != nil {
 				add(resource, "forwards", "invalid stored forwarding definition")
 			}
 		}
@@ -1929,6 +1944,13 @@ func normalizeServer(server *ServerProfile) {
 }
 
 func keepProviderSecrets(next *SyncProviderConfig, current SyncProviderConfig) {
+	if next.Type != current.Type {
+		next.Password = ""
+		next.AccessKeyID = ""
+		next.SecretAccessKey = ""
+		next.SessionToken = ""
+		return
+	}
 	if next.Password == "" {
 		next.Password = current.Password
 	}

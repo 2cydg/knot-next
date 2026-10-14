@@ -9,8 +9,11 @@
 - [secrets.md](./secrets.md)：secret 摘要、加密能力、secret 写入与删除
 - [sessions.md](./sessions.md)：SSH session 资源、exec、challenge、attach、session 事件
 - [sftp.md](./sftp.md)：SFTP session、文件操作、传输、challenge、SFTP 事件
+- [connections.md](./connections.md)：独立连接身份、完整路由取得与候选
+- [proxy-tests.md](./proxy-tests.md)：草稿/已存代理的只读探测
+- [forwards.md](./forwards.md)：持久定义、临时/自动 L/R/D 转发、运行状态与事件
 
-未在本目录列出的能力，如 `forward`、`broadcast`、`sync`、`archive`、`update`、`task`，当前仍处于规划阶段；已实现且可用的端点均已列入上述分册。
+未在本目录列出的能力，如 `broadcast`、`sync`、`archive`、`update`、`task`，当前仍处于规划阶段；已实现且可用的端点均已列入上述分册。
 
 ## 覆盖矩阵
 
@@ -24,6 +27,8 @@
 - `GET /v1/runtime`
 - `GET /v1/status`
 - `GET /v1/events` WebSocket
+- `GET /v1/connections`
+- `GET /v1/connections/{id}`
 - `POST /v1/connections/clear`
 - `POST /v1/shutdown`
 
@@ -44,6 +49,8 @@
 - `GET /v1/config/servers/{id}`
 - `PUT /v1/config/servers/{id}`
 - `DELETE /v1/config/servers/{id}`
+- `GET /v1/config/servers/{id}/forwards`
+- `PUT /v1/config/servers/{id}/forwards`
 - `GET /v1/config/servers/resolve?ref=...`
 - `GET /v1/config/proxies`
 - `POST /v1/config/proxies`
@@ -100,6 +107,7 @@
 - `POST /v1/sftp`
 - `GET /v1/sftp/{id}`
 - `DELETE /v1/sftp/{id}`
+- `POST /v1/sftp/{id}/control`
 - `GET /v1/sftp/{id}/events` WebSocket
 - `GET /v1/sftp/{id}/files`
 - `POST /v1/sftp/{id}/files`
@@ -121,6 +129,16 @@
 - `GET /v1/sftp/{id}/transfers/{transfer_id}`
 - `DELETE /v1/sftp/{id}/transfers/{transfer_id}`
 - `GET /v1/sftp/{id}/transfers/events` WebSocket
+
+### proxy-tests.md / forwards.md
+
+- `POST /v1/proxy-tests`
+- `GET /v1/forwards`
+- `POST /v1/forwards`
+- `GET /v1/forwards/{id}`
+- `DELETE /v1/forwards/{id}`
+- `POST /v1/forwards/{id}/control`
+- `GET /v1/forwards/{id}/events` WebSocket
 
 ## 约定
 

@@ -105,3 +105,9 @@ session 终态关闭订阅并清空映射，保留的 session events 可再次�
 ## WebSocket 消息和资源期限
 
 支持合法 binary/text continuation 与片间 ping/pong。每个完整消息累计最多 1 MiB，控制帧必须 FIN 且最多 125 字节；text/close reason 必须有效 UTF-8。握手只接受版本 13 和 16 字节 nonce。协议错误发送 1002，消息或单帧过大发送 1009 后关闭。所有发送均在连接级串行并设置 5 秒期限，失败关闭连接；客户端自身也应设置期限。warning 的脱敏 kind/message 同时保留在全局事件。
+
+转发事件见 [forwards](api/forwards.md)：局部 WS 首帧完整 forward.snapshot，后续为有限通知，满队列断开；全局 events 含必要状态及自动失败 warning。GET 是恢复和实际收尾结果。challenge 事件带 challenge_id/expires_at/outcome/failure_code，过期终态快照保留 last_challenge，无 secret。SFTP 换源/clear 事件不代表 transport 重建，目录应用仍由 GET/follow_source_dir/follow_error 判断。
+
+SFTP follow 通知包含 sftp.follow.changed/cleared；换源及 cwd 事件带当前来源连接、来源 session、来源目录与 follow 状态/错误，详见 [SFTP](api/sftp.md)。forward.flow_failed 在事件顶层携带失败码，active 实例 View 不保留单流故障。
+
+`forward.auto_failed` 表示自动规则无法分配运行 ID，只有连接/定义告警，没有可查询的 forward 资源。全局事件使用 resource=connection 和真实连接 resource_id，data 带 definition_id、failure_code、error、auto_forward_failed warning；不提供 forward events_url。详见 [转发](api/forwards.md)。

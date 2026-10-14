@@ -36,6 +36,7 @@ func TestBaselineWorkflowThroughPublicAPI(t *testing.T) {
 	sftp := files.NewService(t.TempDir())
 	sftp.UseConfig(cfg)
 	sftp.UsePool(pool)
+	sftp.UseSession(sessions)
 	service := core.New("example", time.Now())
 	service.UseConfig(cfg)
 	service.UseSecret(secret.NewService(cfg, provider))
@@ -79,8 +80,15 @@ func TestBaselineWorkflowThroughPublicAPI(t *testing.T) {
 			t.Errorf("resource was not closed: %+v", r)
 		}
 	}
-	ftp, err := service.SFTP().Get("1")
-	if err != nil || ftp.State != "closed" {
-		t.Fatalf("SFTP cleanup: %+v %v", ftp, err)
+	var resources []resource
+	for _, r := range service.SFTP().ListSessions() {
+		var observed resource
+		if err := c.call(ctx, "GET", "/v1/sftp/"+r.ID, nil, &observed); err != nil {
+			t.Fatal(err)
+		}
+		resources = append(resources, observed)
+	}
+	if len(resources) != 1 || resources[0].State != "closed" {
+		t.Fatalf("SFTP cleanup: %+v", resources)
 	}
 }

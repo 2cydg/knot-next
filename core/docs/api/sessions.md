@@ -19,7 +19,7 @@
 
 ```json
 {
-  "id": "session_1",
+  "id": "ssh_0123456789abcdef",
   "server_ref": "prod",
   "alias": "prod",
   "state": "attached",
@@ -39,8 +39,8 @@
   "exited_at": null,
   "exit_code": null,
   "framework_error": "",
-  "attach_url": "/v1/sessions/session_1/attach",
-  "events_url": "/v1/sessions/session_1/events",
+  "attach_url": "/v1/sessions/ssh_0123456789abcdef/attach",
+  "events_url": "/v1/sessions/ssh_0123456789abcdef/events",
   "host_key_pending": false,
   "auth_pending": false,
   "disconnect_cause": ""
@@ -50,6 +50,7 @@
 当前常见 `state`：
 
 - `connecting`
+- `connected`
 - `attached`
 - `detached`
 - `host_key_pending`
@@ -100,7 +101,7 @@ exec 的 `id` 用于诊断和关联本次同步调用。目前没有按 exec ID 
 
 ```json
 {
-  "session_id": "session_1",
+  "session_id": "ssh_0123456789abcdef",
   "type": "host_key",
   "pending": true,
   "prompt": "Do you trust this host key?",
@@ -122,7 +123,7 @@ exec 的 `id` 用于诊断和关联本次同步调用。目前没有按 exec ID 
 ```json
 {
   "type": "session.resized",
-  "session_id": "session_1",
+  "session_id": "ssh_0123456789abcdef",
   "state": "attached",
   "rows": 40,
   "cols": 120,
@@ -295,7 +296,7 @@ exec 的 `id` 用于诊断和关联本次同步调用。目前没有按 exec ID 
 
 ```json
 {
-  "session_id": "session_1",
+  "session_id": "ssh_0123456789abcdef",
   "type": "host_key",
   "pending": false
 }
@@ -360,7 +361,7 @@ exec 的 `id` 用于诊断和关联本次同步调用。目前没有按 exec ID 
 ```json
 {
   "type": "session.attached",
-  "session_id": "session_1",
+  "session_id": "ssh_0123456789abcdef",
   "state": "attached"
 }
 ```
@@ -414,7 +415,7 @@ session 结束时，服务端会额外发送：
 ```json
 {
   "type": "session.exit",
-  "session_id": "session_1",
+  "session_id": "ssh_0123456789abcdef",
   "exit_code": 0,
   "error": "",
   "disconnect_cause": ""
@@ -488,7 +489,7 @@ attach WebSocket 帧方向总结：
 - 服务端在正常结束时会**先发完已收到的输出字节，再发送唯一的 `session.exit`，随后关闭连接**；客户端可以据此认为 `session.exit` 之后不会再有输出
 - 未附着期间产生的输出保存在**有界**缓冲（上限 64 KiB）中，在下一个客户端 attach 时先补发。已发送给前一个 attach 的字节不会重放，因此重新 attach 不会看到重复输出；超过上限时丢弃最旧的字节，并通过 `session.attached` 之后的一个 text frame 告知：
   ```json
-  {"type": "session.attach.truncated", "session_id": "session_1", "detail": "pre-attach output exceeded the retained backlog"}
+  {"type": "session.attach.truncated", "session_id": "ssh_0123456789abcdef", "detail": "pre-attach output exceeded the retained backlog"}
   ```
 - 慢客户端不会被无限缓冲：服务端有界队列写满或写入超时后，attach 会被明确结束并关闭连接（客户端此时可能收不到错误帧，因为它已停止读取）。session 本身保持存活并可重新 attach
 - 输入写入按 session 串行处理。detach 丢弃旧 attachment 尚未发送的队列；已经进入 SSH 传输层的输入无法撤回，可能在 detach 后送达。远端停止读取时，新 attachment 可建立，但其输入等待同一 backend 写入完成，队列保持有界，不会为每次重新附着新增阻塞写入者。
@@ -512,7 +513,7 @@ attach WebSocket 帧方向总结：
 
 ## 候选、CWD 与 Agent（2026-10-08）
 
-session GET/列表新增 `server_id`，在解析真实配置目标后填入，与客户端传入的 `server_ref` 和显示 `alias` 区分。多个会话始终保留独立 `id`、state、`started_at`、`attached`、`current_dir` 和 `cwd_updated_at`；列表保持 ID 次序，core 不自动选一个会话。客户端按自身需求展示候选并显式选择 ID。
+session GET/列表新增 `server_id`，在解析真实配置目标后填入，与客户端传入的 `server_ref` 和显示 `alias` 区分。多个会话始终保留独立 `id`、state、`started_at`、`attached`、`current_dir` 和 `cwd_updated_at`；列表按开启时间排序，core 不自动选一个会话。客户端按自身需求展示候选并显式选择 ID。
 
 CWD 仅旁路观察远端 OSC7：`ESC ] 7 ; file://host/absolute/path BEL` 或 `ESC \\` 终结，支持任意分片、URL 编码空格/中文。PTY 字节原样输出；观察不去除控制序列，也不改写换行。非法 URI、含控制字符的目录和超长/未结束序列被忽略；观察缓存上限 4096 字节。远端不发送 OSC7 时，目录保持未知或上次值。core 不自动安装 Bash/Zsh hook、不修改登录文件，客户端不能承诺任意 shell 默认持续跟随。
 
@@ -521,3 +522,19 @@ CWD 仅旁路观察远端 OSC7：`ESC ] 7 ; file://host/absolute/path BEL` 或 `
 Unix 使用请求/dial options 或 `SSH_AUTH_SOCK`；Windows 优先 `SSH_AUTH_SOCK`，默认 `\\.\pipe\openssh-ssh-agent`，named pipe 使用 go-winio context 拨号。认证 Agent 连接在握手结束时关闭；每个远端 Agent 通道拥有独立本地连接，handler 由共享 SSH client 持有，同 client 多会话复用，单会话关闭不破坏其他会话，client/pool 关闭回收连接和 worker。Windows/macOS 原生运行验证留到 CLI 联测。
 
 交互 channel-open、PTY、整个 env 阶段、Agent forwarding、shell 阶段各有 15 秒期限；env 最多 64 项。服务端拒绝可选 env 时发布 `environment_rejected` warning 并继续创建；传输错误、取消或期限耗尽仍导致创建失败。resize/signal/close_stdin 在 backend 未就绪时返回 409，避免虚假确认。Remember 密码切换到 password 并清 key 引用，key 切换清旧密码；只修改认证字段，空凭据和 passphrase-only 不写盘。空 auth response 仅为本次尝试选择 Agent，`remember=true` 不改变已存认证。
+
+## 连接身份与挑战过期
+
+会话 ID 为独立随机短 ID，`connection_id` 在实际取得 lease 后填入；终态仍保留该关联。来源查询及精确连接语义见 [连接资源](connections.md)。
+
+SSH 和 SFTP 的 challenge 增加 `challenge_id`、`expires_at`、`outcome`（pending/accepted/expired/aborted）、`failure_code`。新客户端 POST 必须携带展示的那轮 `challenge_id`。为旧调用保留省略 ID 的当前 pending 应答语义，其跨轮保护有限；ID 不匹配、重复回答或已取消的回答为 409 CONFLICT，不能隐式成功。
+
+后台主机/认证等待默认各 60 秒，与网络阶段期限分开，前端确认框寿命由前端决定。期限到达后为 failed，资源新增 `failure_code` 和 `last_challenge`（无凭据），GET/challenge GET 和事件可查询一致的结果。迟到 POST 分别返回 `409 HOST_KEY_CHALLENGE_EXPIRED` / `409 AUTH_CHALLENGE_EXPIRED`；接受和过期在同一锁内竞争，accepted 不会再被定时器改成 expired。过期/拒绝不写 known_hosts；网络失败、用户取消不会冒充过期。历史裁剪后 404 只表示不可查询。
+
+挑战期限使用服务端内部单调时钟；expires_at 是给前端展示的墙钟时间，NTP 跳变不能延长受理窗口。默认 60 秒；仅服务装配的 Options 可给受控测试设置较短期限，运行中不改全局计时器。
+
+主机确认期间，支持读 deadline 的 TCP/代理 transport 做有界 64 KiB 原文观察，发现 EOF/读错误立即将 pending 挑战标为 aborted + CONNECTION_FAILED，并保留字节供握手续读。观察累计达到 **64 KiB（含恰好满额）** 即退出，不再读取下一字节；它不关闭 disconnected 信号、不伪报连接失败。满额之后发生的 EOF/断开不能在确认等待期间被观察，只能在应答后握手续读时发现，或按挑战等待期限结算。继续观察会要求无界缓存或丢弃握手原文，故保留此有界退化。SSH 跳板 channel 不支持读 deadline 时也保留等待期限边界。未观察到断开不等于证明连接存活，EXPIRED 只证明挑战期限未收到有效回答。auth_pending 属于失败连接后的重新尝试等待，不代表旧 socket 仍存活。
+
+旧磁盘 SourcePath-only key 的认证和连接身份摘要与新导入共用有界读取：仅普通文件、最多 1 MiB，设备/目录/超限文件拒绝。旧相对路径仍按 core 工作目录解析；新 secrets/TOML 导入仍要求绝对路径，不自动改写旧记录。
+
+一旦 accepted 赢得同锁受理，随后 context 取消不会反向丢弃已投递的信任回答；known_hosts 写入仍需成功才能完成连接，磁盘错误会导致连接失败。用户拒绝/取消在资源级和 last_challenge 中保留 CHALLENGE_ABORTED。

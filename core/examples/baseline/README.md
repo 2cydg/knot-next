@@ -19,7 +19,8 @@ select an explicitly configured daemon. The demo uses an allowed
 
 The workflow creates an SSH session, waits through auth/host-key challenges,
 remembers a verified password/key selection, attaches and receives the snapshot,
-runs bounded `true` exec, opens SFTP, lists `/`, uploads without overwrite,
+runs bounded `true` exec, reads the actual connection ID and opens SFTP on that
+connection with an explicit source session/connection pair, lists `/`, uploads without overwrite,
 receives the transfer snapshot and uses GET until terminal state, then closes
 both sessions. It never edits config files. The upload is an intentional remote
 write; choose a new destination. Key retries are persisted only as key IDs;
@@ -36,3 +37,10 @@ snapshot and does not enter raw terminal mode.
 `TestBaselineWorkflowThroughPublicAPI` runs this same client against real local
 SSH/SFTP and HTTP/WS with static test crypto and artificial credentials. The
 fixture alone composes internal services; operations go through public APIs.
+
+Challenge answers now bind challenge_id. IDs are opaque strings and cleanup
+queries returned resources instead of assuming numeric counters. The full gap
+API workflows (literal download, import/passphrase retry, proxy probes and
+local/remote/dynamic temporary/persistent rules) are documented in
+[API handoff](../../docs/cli-handoff.md) and exercised by public HTTP/WS integration
+scenarios in core/tests/integration/*_gap_test.go.

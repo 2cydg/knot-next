@@ -40,6 +40,8 @@ func (s *Server) handleSessions(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 		case stdhttp.MethodGet:
 			response.JSON(w, stdhttp.StatusOK, sessionService.ListWithOptions(session.ListOptions{
 				ServerRef: r.URL.Query().Get("server_ref"),
+				ServerID:  r.URL.Query().Get("server_id"),
+				Active:    r.URL.Query().Get("active") == "true",
 				Alias:     r.URL.Query().Get("alias"),
 				State:     r.URL.Query().Get("state"),
 			}))
@@ -188,6 +190,10 @@ func writeSessionResult(w stdhttp.ResponseWriter, risk response.Risk, resource s
 
 func writeSessionError(w stdhttp.ResponseWriter, risk response.Risk, resource string, err error) {
 	switch {
+	case errors.Is(err, session.ErrHostKeyChallengeExpired):
+		writeAPIError(w, 409, risk, resource, "HOST_KEY_CHALLENGE_EXPIRED", err.Error())
+	case errors.Is(err, session.ErrAuthChallengeExpired):
+		writeAPIError(w, 409, risk, resource, "AUTH_CHALLENGE_EXPIRED", err.Error())
 	case errors.Is(err, session.ErrNotFound):
 		writeAPIError(w, stdhttp.StatusNotFound, risk, resource, "NOT_FOUND", "session resource was not found")
 	case errors.Is(err, session.ErrConflict):
