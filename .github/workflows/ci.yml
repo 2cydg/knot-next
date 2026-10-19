@@ -22,7 +22,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.1'
-          cache-dependency-path: core/go.sum
+          cache-dependency-path: |
+            core/go.sum
+            cli/go.sum
       - name: Full tests and native build
         shell: bash
         run: |
@@ -36,7 +38,7 @@ jobs:
           name: native-${{ matrix.os }}
           path: |
             evidence/
-            bin/knot-core*
+            bin/knot*
 
   race:
     name: Linux race
@@ -47,7 +49,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.1'
-          cache-dependency-path: core/go.sum
+          cache-dependency-path: |
+            core/go.sum
+            cli/go.sum
       - name: Resource and public protocol race tests
         shell: bash
         run: |
@@ -55,6 +59,8 @@ jobs:
           mkdir -p evidence
           cd core
           GOWORK=off go test -race -count=1 -timeout=240s ./internal/resourcepolicy ./internal/api/http ./pkg/config ./pkg/session ./pkg/sftp ./pkg/sshpool ./pkg/core ./tests/integration ./examples/baseline 2>&1 | tee ../evidence/race.log
+          cd ../cli
+          GOWORK=off go test -race -count=1 -timeout=240s ./... 2>&1 | tee ../evidence/cli-race.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -70,7 +76,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.1'
-          cache-dependency-path: core/go.sum
+          cache-dependency-path: |
+            core/go.sum
+            cli/go.sum
       - name: Build Linux, macOS and Windows for amd64 and arm64
         shell: bash
         run: |
@@ -83,7 +91,7 @@ jobs:
           name: cross-build
           path: |
             evidence/
-            bin/knot-core-*
+            bin/knot-*
 
   lint:
     name: Go formatting and vet
@@ -96,7 +104,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27.1'
-          cache-dependency-path: core/go.sum
+          cache-dependency-path: |
+            core/go.sum
+            cli/go.sum
       - name: Lint with the pinned Go toolchain
         shell: bash
         run: |

@@ -7,7 +7,7 @@
 本仓库包含 **knot-core**：一个本地能力服务，通过标准化的 HTTP/WebSocket API 提供 SSH/SFTP 功能。
 
 knot-core 可被以下客户端使用：
-- 终端客户端（TUI 界面 - 计划中）
+- 终端客户端（CLI 入口和双语基础已实现，TUI 页面开发中）
 - 命令行脚本
 - AI 代理和自动化工具
 - 第三方应用程序
@@ -83,7 +83,11 @@ go build -o ../bin/knot-core ./cmd/core
 - 🚧 端口转发（计划中）
 - 🚧 广播模式（计划中）
 - 🚧 配置同步（计划中）
-- 🚧 TUI 界面（计划中）
+- 🚧 TUI 界面（入口和双语基础已实现，页面及真实连接开发中）
+
+独立 [CLI module](cli/README.md) 当前支持本地 `knot --help` 和
+`knot --version`，业务入口明确提示仍在开发。根构建、测试、lint 脚本依次处理
+core 和 cli。交付范围与验证见工作区根目录的 [阶段记录](../docs/cli-tui-progress.md)。
 
 ## 许可证
 
