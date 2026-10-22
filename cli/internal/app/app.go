@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -49,8 +50,12 @@ func Run(ctx context.Context, args []string, options Options) int {
 	translator := i18n.New(i18n.Detect(ctx, options.LanguageProvider).Language)
 	launch, err := entry.Parse(args)
 	if err != nil {
-		usageErr := err.(*entry.UsageError)
-		fmt.Fprintln(options.Stderr, translator.Text(i18n.InvalidArguments, map[string]any{"Argument": usageErr.Argument}))
+		var usageErr *entry.UsageError
+		argument := fmt.Sprint(args)
+		if errors.As(err, &usageErr) {
+			argument = usageErr.Argument
+		}
+		fmt.Fprintln(options.Stderr, translator.Text(i18n.InvalidArguments, map[string]any{"Argument": argument}))
 		return entry.ExitUsage
 	}
 	var output string

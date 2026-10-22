@@ -1,0 +1,600 @@
+// Package tui implements the prototype's menu, operations and modal ownership.
+package tui
+
+import (
+	"context"
+	"encoding/json"
+	"sort"
+	"strings"
+	"time"
+
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+
+	"knot-cli/internal/coreclient"
+	"knot-cli/internal/entry"
+	"knot-cli/internal/i18n"
+)
+
+type Focus int
+
+const (
+	MenuFocus Focus = iota
+	OperationsFocus
+	SearchFocus
+)
+
+type ListState string
+
+const (
+	Loading    ListState = "loading"
+	Ready      ListState = "ready"
+	Offline    ListState = "offline"
+	AuthFailed ListState = "auth-failed"
+	ReadError  ListState = "error"
+)
+
+type loadResult struct {
+	generation uint64
+	page       entry.Page
+	snapshot   coreclient.Snapshot
+	err        error
+}
+type streamResult struct {
+	epoch  uint64
+	stream *coreclient.Stream
+	err    error
+}
+type eventMsg struct {
+	epoch  uint64
+	item   coreclient.StreamItem
+	closed bool
+}
+type pollMsg struct{}
+type dismissMsg struct {
+	id       string
+	revision uint64
+}
+type Notice struct {
+	ID         string
+	Text       string
+	Error      bool
+	Persistent bool
+	revision   uint64
+}
+type NoticeMsg struct {
+	ID         string
+	Text       string
+	Error      bool
+	Persistent bool
+}
+
+// FormResult binds asynchronous completion to its original modal and instance.
+// Field errors use localized strings supplied by the typed operation handler.
+type FormResult struct {
+	ModalID    uint64
+	InstanceID string
+	Fields     map[string]string
+	Err        error
+	Saved      bool
+}
+
+// Model is the only owner of UI state. Cmds return values; workers never mutate
+// the model, drafts, selection or focus.
+type Model struct {
+	ctx            context.Context
+	launch         entry.LaunchContext
+	tr             i18n.Translator
+	runtimeFile    string
+	load           func(context.Context, string) (coreclient.Snapshot, error)
+	page           entry.Page
+	focus          Focus
+	state          ListState
+	width, height  int
+	search         textinput.Model
+	selectedID     string
+	snapshot       coreclient.Snapshot
+	lastError      error
+	modal          *Modal
+	modalSequence  uint64
+	notices        []Notice
+	noticeRevision uint64
+	generation     uint64
+	loading        bool
+	cancelLoad     context.CancelFunc
+	stream         *coreclient.Stream
+	streamEpoch    uint64
+	cancelStream   context.CancelFunc
+	streamOpening  bool
+	hasSnapshot    bool
+	healthStatus   string
+	exitCode       int
+}
+
+func New(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, runtimeFile string) *Model {
+	input := textinput.New()
+	input.CharLimit = 1024
+	page := launch.InitialPage()
+	if page == "" {
+		page = entry.Servers
+	}
+	focus := MenuFocus
+	if launch.Mode() == entry.PageDirect {
+		focus = OperationsFocus
+	}
+	return &Model{ctx: ctx, launch: launch, tr: tr, runtimeFile: runtimeFile, load: coreclient.Load, page: page, focus: focus, state: Loading, width: 80, height: 24, search: input}
+}
+
+func (m *Model) Init() tea.Cmd { return tea.Batch(m.beginLoad(false), poll()) }
+func poll() tea.Cmd            { return tea.Tick(4*time.Second, func(time.Time) tea.Msg { return pollMsg{} }) }
+func (m *Model) Close() {
+	if m.cancelLoad != nil {
+		m.cancelLoad()
+	}
+	m.stopStream()
+	if m.snapshot.Client != nil {
+		m.snapshot.Client.Close()
+	}
+}
+func (m *Model) stopStream() {
+	m.streamEpoch++
+	if m.cancelStream != nil {
+		m.cancelStream()
+		m.cancelStream = nil
+	}
+	if m.stream != nil {
+		m.stream.Close()
+		m.stream = nil
+	}
+	m.streamOpening = false
+}
+func (m *Model) beginLoad(showLoading bool) tea.Cmd {
+	if m.cancelLoad != nil {
+		m.cancelLoad()
+	}
+	m.generation++
+	generation, page := m.generation, m.page
+	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	m.cancelLoad = cancel
+	m.loading = true
+	if showLoading {
+		m.state = Loading
+	}
+	loader, path := m.load, m.runtimeFile
+	return func() tea.Msg {
+		defer cancel()
+		s, err := loader(ctx, path)
+		return loadResult{generation: generation, page: page, snapshot: s, err: err}
+	}
+}
+func (m *Model) openStream() tea.Cmd {
+	if m.stream != nil || m.streamOpening || m.snapshot.Client == nil {
+		return nil
+	}
+	m.streamOpening = true
+	epoch := m.streamEpoch
+	if m.cancelStream != nil {
+		m.cancelStream()
+	}
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.cancelStream = cancel
+	client := m.snapshot.Client
+	return func() tea.Msg { s, err := client.Events(ctx); return streamResult{epoch: epoch, stream: s, err: err} }
+}
+func readStream(epoch uint64, stream *coreclient.Stream) tea.Cmd {
+	return func() tea.Msg { item, ok := <-stream.Items; return eventMsg{epoch: epoch, item: item, closed: !ok} }
+}
+
+func (m *Model) notify(notice NoticeMsg) tea.Cmd {
+	m.noticeRevision++
+	n := Notice{ID: notice.ID, Text: notice.Text, Error: notice.Error, Persistent: notice.Persistent, revision: m.noticeRevision}
+	for i, old := range m.notices {
+		if old.ID == notice.ID {
+			m.notices[i] = n
+			m.pruneNotices()
+			return m.noticeTimer(n)
+		}
+	}
+	m.notices = append(m.notices, n)
+	m.pruneNotices()
+	return m.noticeTimer(n)
+}
+
+func (m *Model) pruneNotices() {
+	// Bound final notices separately, including active-to-final updates.
+	// Active operations cannot be evicted or suppress new warning messages.
+	oldest, finals := -1, 0
+	for i, n := range m.notices {
+		if !n.Persistent {
+			finals++
+			if oldest == -1 || n.revision < m.notices[oldest].revision {
+				oldest = i
+			}
+		}
+	}
+	if finals > 16 {
+		m.notices = append(m.notices[:oldest], m.notices[oldest+1:]...)
+	}
+}
+func (m *Model) noticeTimer(n Notice) tea.Cmd {
+	if n.Persistent {
+		return nil
+	}
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return dismissMsg{id: n.ID, revision: n.revision} })
+}
+func (m *Model) removeNotice(id string) {
+	for i, n := range m.notices {
+		if n.ID == id {
+			m.notices = append(m.notices[:i], m.notices[i+1:]...)
+			return
+		}
+	}
+}
+
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = max(1, msg.Width), max(1, msg.Height)
+		m.search.SetWidth(max(1, m.mainWidth()-4))
+		if m.modal != nil && m.modal.Form != nil {
+			m.modal.Form.Resize(max(1, min(m.width-8, 76)-4))
+		}
+		m.clampModalScroll()
+	case FormResult:
+		if m.modal == nil || m.modal.ID != msg.ModalID || m.modal.Form == nil || msg.InstanceID != m.snapshot.Runtime.InstanceID {
+			return m, nil
+		}
+		form := m.modal.Form
+		form.Busy = false
+		first := -1
+		for i := range form.Fields {
+			form.Fields[i].Error = msg.Fields[form.Fields[i].Name]
+			if first == -1 && form.Fields[i].Error != "" {
+				first = i
+			}
+		}
+		if first != -1 {
+			return m, form.Focus(first)
+		}
+		if msg.Err != nil {
+			return m, m.notify(NoticeMsg{ID: "form-error", Text: m.tr.ProtocolError(coreclient.Code(msg.Err)), Error: true})
+		}
+		if msg.Saved {
+			return m, m.dismissModal(false)
+		}
+	case loadResult:
+		if msg.generation != m.generation || msg.page != m.page {
+			if msg.snapshot.Client != nil {
+				msg.snapshot.Client.Close()
+			}
+			return m, nil
+		}
+		m.loading = false
+		if msg.err != nil {
+			m.lastError = msg.err
+			code := coreclient.Code(msg.err)
+			m.state = ReadError
+			if code == "RUNTIME_UNAVAILABLE" || code == "OFFLINE" {
+				m.state = Offline
+			}
+			if code == "UNAUTHORIZED" || code == "AUTH_FILE_INVALID" {
+				m.state = AuthFailed
+			}
+			m.hasSnapshot = false
+			m.selectedID = ""
+			m.stopStream()
+			if m.snapshot.Client != nil {
+				m.snapshot.Client.Close()
+			}
+			m.snapshot = coreclient.Snapshot{}
+			m.healthStatus = ""
+			m.removeNotice("health")
+			return m, nil
+		}
+		changed := m.snapshot.Runtime.InstanceID != "" && (m.snapshot.Runtime.InstanceID != msg.snapshot.Runtime.InstanceID || !m.snapshot.Client.SameEndpoint(msg.snapshot.Client))
+		if changed {
+			m.stopStream()
+			m.selectedID = ""
+		}
+		if m.snapshot.Client != nil {
+			m.snapshot.Client.Close()
+		}
+		m.snapshot = msg.snapshot
+		m.hasSnapshot = true
+		m.state = Ready
+		m.lastError = nil
+		m.ensureSelection()
+		var cmds []tea.Cmd
+		if changed {
+			cmds = append(cmds, m.notify(NoticeMsg{ID: "instance", Text: m.tr.Message("ui.instance_changed"), Error: true}))
+		}
+		if msg.snapshot.Health.Status != "ok" && (changed || m.healthStatus != msg.snapshot.Health.Status) {
+			cmds = append(cmds, m.notify(NoticeMsg{ID: "health", Text: m.tr.Message("ui.degraded"), Error: true}))
+		}
+		m.healthStatus = msg.snapshot.Health.Status
+		if m.healthStatus == "ok" {
+			m.removeNotice("health")
+		}
+		cmds = append(cmds, m.openStream())
+		return m, tea.Batch(cmds...)
+	case streamResult:
+		if msg.epoch != m.streamEpoch {
+			if msg.stream != nil {
+				msg.stream.Close()
+			}
+			return m, nil
+		}
+		m.streamOpening = false
+		if msg.err != nil {
+			if msg.stream != nil {
+				msg.stream.Close()
+			}
+			m.stopStream()
+			return m, m.notify(NoticeMsg{ID: "events", Text: m.tr.ProtocolError(coreclient.Code(msg.err)), Error: true})
+		}
+		m.stream = msg.stream
+		m.removeNotice("events")
+		return m, readStream(msg.epoch, msg.stream)
+	case eventMsg:
+		if msg.epoch != m.streamEpoch || m.stream == nil {
+			return m, nil
+		}
+		if msg.closed || msg.item.Err != nil {
+			m.stopStream()
+			return m, tea.Batch(m.notify(NoticeMsg{ID: "events", Text: m.tr.ProtocolError("EVENTS_UNAVAILABLE"), Error: true}), m.beginLoad(false))
+		}
+		var cmds []tea.Cmd
+		event := msg.item.Event
+		// core.snapshot is only a handshake. Config changes currently converge
+		// through polling; future local mutations must explicitly refresh.
+		if event.Type == "core.shutdown_started" || event.Type == "session.connected" {
+			if !m.loading {
+				cmds = append(cmds, m.beginLoad(false))
+			}
+		}
+		if event.Level == "warn" || event.Level == "warning" || event.Level == "error" {
+			var warning struct {
+				Warning struct {
+					Kind string `json:"kind"`
+				} `json:"warning"`
+			}
+			_ = json.Unmarshal(event.Data, &warning)
+			code := warning.Warning.Kind
+			if code == "" {
+				code = event.Type
+			}
+			cmds = append(cmds, m.notify(NoticeMsg{ID: "warning:" + event.ResourceID, Text: m.tr.Text("ui.warning", map[string]any{"Code": code}), Error: true}))
+		}
+		cmds = append(cmds, readStream(msg.epoch, m.stream))
+		return m, tea.Batch(cmds...)
+	case pollMsg:
+		if m.loading {
+			return m, poll()
+		}
+		return m, tea.Batch(m.beginLoad(false), poll())
+	case NoticeMsg:
+		return m, m.notify(msg)
+	case dismissMsg:
+		for i, n := range m.notices {
+			if n.ID == msg.id && n.revision == msg.revision && !n.Persistent {
+				m.notices = append(m.notices[:i], m.notices[i+1:]...)
+				break
+			}
+		}
+	case tea.KeyPressMsg:
+		if msg.String() == "ctrl+c" && (m.modal == nil || !m.modal.exclusive()) {
+			m.exitCode = entry.ExitCanceled
+			return m, tea.Quit
+		}
+		if m.modal != nil {
+			return m, m.modalKey(msg)
+		}
+		if m.focus == SearchFocus {
+			switch msg.String() {
+			case "enter", "esc":
+				m.search.Blur()
+				m.focus = OperationsFocus
+				return m, nil
+			case "/":
+				if m.page == entry.Servers && !strings.HasPrefix(m.search.Value(), "/") {
+					m.search.SetValue("/" + m.search.Value())
+					m.search.CursorEnd()
+					m.ensureSelection()
+					return m, nil
+				}
+			}
+			var cmd tea.Cmd
+			m.search, cmd = m.search.Update(msg)
+			m.ensureSelection()
+			return m, cmd
+		}
+		return m, m.key(msg)
+	case tea.PasteMsg:
+		if m.modal != nil {
+			if m.modal.Form != nil && !m.modal.Form.Busy {
+				return m, m.modal.Form.update(msg)
+			}
+			return m, nil
+		}
+		if m.focus == SearchFocus {
+			var cmd tea.Cmd
+			m.search, cmd = m.search.Update(msg)
+			m.ensureSelection()
+			return m, cmd
+		}
+	default:
+		if m.modal != nil && m.modal.Form != nil && !m.modal.Form.Busy {
+			return m, m.modal.Form.update(msg)
+		}
+		if m.focus == SearchFocus {
+			var cmd tea.Cmd
+			m.search, cmd = m.search.Update(msg)
+			return m, cmd
+		}
+	}
+	return m, nil
+}
+
+var pages = []entry.Page{entry.Servers, entry.Keys, entry.Proxies, entry.Sync}
+
+func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
+	binding := msg.String()
+	if binding == "?" {
+		return m.OpenModal(&Modal{Kind: Information, Title: m.tr.Message("ui.help"), Body: m.tr.Message("ui.help_body")})
+	}
+	if m.focus == MenuFocus {
+		index := 0
+		for i, p := range pages {
+			if p == m.page {
+				index = i
+			}
+		}
+		switch binding {
+		case "down":
+			index = (index + 1) % len(pages)
+		case "up":
+			index = (index + len(pages) - 1) % len(pages)
+		case "home":
+			index = 0
+		case "end":
+			index = len(pages) - 1
+		case "right", "enter", "tab":
+			m.focus = OperationsFocus
+			return nil
+		default:
+			return nil
+		}
+		m.page = pages[index]
+		m.search.SetValue("")
+		m.selectedID = ""
+		return m.beginLoad(true)
+	}
+	switch binding {
+	case "left", "esc", "tab", "shift+tab":
+		m.focus = MenuFocus
+	case "r":
+		return m.beginLoad(true)
+	case "/":
+		if m.page != entry.Sync || m.snapshot.Config.Settings.SyncPasswordSet {
+			m.focus = SearchFocus
+			return m.search.Focus()
+		}
+	case "up", "down", "home", "end":
+		rows := m.rows()
+		if len(rows) == 0 {
+			return nil
+		}
+		index := 0
+		for i, row := range rows {
+			if row.ID == m.selectedID {
+				index = i
+			}
+		}
+		switch binding {
+		case "up":
+			index--
+		case "down":
+			index++
+		case "home":
+			index = 0
+		case "end":
+			index = len(rows) - 1
+		}
+		m.selectedID = rows[max(0, min(len(rows)-1, index))].ID
+	case "i":
+		if m.state == Ready && m.selectedID != "" {
+			return m.openDetail()
+		}
+	case "enter":
+		if m.state == Ready && m.selectedID != "" {
+			if m.page == entry.Servers {
+				return m.pending()
+			}
+			return m.openDetail()
+		}
+	case "n", "e", "d", "delete", "c", "f", "p", "t", "s", "x":
+		if m.state == Ready && m.businessKeyAllowed(binding) {
+			return m.pending()
+		}
+	}
+	return nil
+}
+func (m *Model) businessKeyAllowed(binding string) bool {
+	if m.page == entry.Sync && !m.snapshot.Config.Settings.SyncPasswordSet {
+		return binding == "s"
+	}
+	keys := map[entry.Page]string{entry.Servers: "n e d delete c f p t", entry.Keys: "n d delete x", entry.Proxies: "n e d delete t", entry.Sync: "n e d p s"}
+	for _, key := range strings.Fields(keys[m.page]) {
+		if key == binding {
+			return binding == "n" || m.selectedID != ""
+		}
+	}
+	return false
+}
+func (m *Model) pending() tea.Cmd {
+	return m.notify(NoticeMsg{ID: "pending", Text: m.tr.Message("ui.pending")})
+}
+
+type row struct {
+	ID       string
+	Alias    string
+	Cells    []string
+	Details  [][2]string
+	LastUsed time.Time
+}
+
+func (m *Model) ensureSelection() {
+	rows := m.rows()
+	for _, r := range rows {
+		if r.ID == m.selectedID {
+			return
+		}
+	}
+	m.selectedID = ""
+	if len(rows) > 0 {
+		m.selectedID = rows[0].ID
+	}
+}
+func (m *Model) rows() []row {
+	rows := m.allRows()
+	query := strings.ToLower(strings.TrimSpace(m.search.Value()))
+	filtered := rows[:0]
+	for _, r := range rows {
+		match := strings.Contains(strings.ToLower(r.Alias), query)
+		if m.page == entry.Servers && strings.HasPrefix(query, "/") {
+			match = false
+			for _, s := range m.snapshot.Config.Servers {
+				if s.ID == r.ID {
+					for _, tag := range s.Tags {
+						if strings.Contains(strings.ToLower(tag), strings.TrimSpace(query[1:])) {
+							match = true
+						}
+					}
+					break
+				}
+			}
+		}
+		if match {
+			filtered = append(filtered, r)
+		}
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		if m.page == entry.Servers && !filtered[i].LastUsed.Equal(filtered[j].LastUsed) {
+			return filtered[i].LastUsed.After(filtered[j].LastUsed)
+		}
+		return strings.ToLower(filtered[i].Alias) < strings.ToLower(filtered[j].Alias)
+	})
+	return filtered
+}
+func (m *Model) openDetail() tea.Cmd {
+	for _, r := range m.rows() {
+		if r.ID == m.selectedID {
+			var lines []string
+			for _, d := range r.Details {
+				lines = append(lines, m.tr.Message("ui."+d[0])+": "+d[1])
+			}
+			return m.OpenModal(&Modal{Kind: Information, Title: m.tr.Message("ui.detail") + " · " + r.Alias, Body: strings.Join(lines, "\n")})
+		}
+	}
+	return nil
+}

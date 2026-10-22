@@ -83,10 +83,11 @@ go build -o ../bin/knot-core ./cmd/core
 - 🚧 端口转发（计划中）
 - 🚧 广播模式（计划中）
 - 🚧 配置同步（计划中）
-- 🚧 TUI 界面（入口和双语基础已实现，页面及真实连接开发中）
+- 🚧 TUI 界面（双语资源列表、搜索和详情已实现，CRUD 及真实连接开发中）
 
-独立 [CLI module](cli/README.md) 当前支持本地 `knot --help` 和
-`knot --version`，业务入口明确提示仍在开发。根构建、测试、lint 脚本依次处理
+独立 [CLI module](cli/README.md) 支持本地帮助/版本，以及真实 core 发现、
+双语资源列表、搜索、详情和离线恢复。请手动启动 knot-core；CRUD 和 SSH/SFTP
+仍在开发中。根构建、测试、lint 脚本依次处理
 core 和 cli。交付范围与验证见工作区根目录的 [阶段记录](../docs/cli-tui-progress.md)。
 
 ## 许可证

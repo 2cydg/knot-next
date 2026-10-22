@@ -2,11 +2,11 @@
 
 ## Repository Structure
 
-This repository contains two independent Go modules: **knot-core** and the new **knot-cli** frontend foundation. CLI management pages and SSH/SFTP flows are still under development; stage status is recorded in the workspace [docs/cli-tui-progress.md](../docs/cli-tui-progress.md).
+This repository contains two independent Go modules: **knot-core** and **knot-cli**. The CLI reads real resource lists through a bilingual root TUI; CRUD and SSH/SFTP flows are still under development. Stage status is recorded in the workspace [docs/cli-tui-progress.md](../docs/cli-tui-progress.md).
 
 Current structure:
 - `core/` - knot-core service (module: knot-core)
-- `cli/` - Frontend module: entry routing, bilingual messages, user-language detection and local help/version
+- `cli/` - Frontend module: entry/i18n, typed public core client, discovery and root TUI
 
 ## Architecture
 
@@ -43,7 +43,7 @@ suggestions are designed in the client phase. Core retains generic resource
 queries, directory listing, glob matching, and directory caching through its API;
 it should not implement legacy command syntax or completion display formatting.
 
-Entry and i18n foundations are implemented. Business flows use the public core HTTP/WS protocol and must not import core packages. The fixed UI stack is Bubble Tea v2, Bubbles v2 and Lip Gloss v2; introduce and pin these when implementing the root TUI. Do not restore Cobra, legacy completion or an SFTP REPL.
+Business flows use the public core HTTP/WS protocol and must not import core packages. The UI stack is pinned to Bubble Tea v2.1.0, Bubbles v2.2.1 and Lip Gloss v2.0.6, with coder/websocket v1.8.15. Root TUI state is only mutated in Update; requests carry page/generation and modal completions carry modal/instance identity. Keep exclusive confirmations ahead of all other keys. Do not restore Cobra, legacy completion or an SFTP REPL.
 
 ## Building
 
@@ -129,7 +129,7 @@ core/
 
 ### CLI (`cli/`)
 
-See [cli/README.md](cli/README.md) for launch, language and exit contracts. The current foundation supports local help/version, with business entries reporting that implementation is pending. `scripts/build.sh`, `scripts/test.sh` and `scripts/lint.sh` process both modules with GOWORK=off; `build.sh --all` builds both for six CGO=0 targets.
+See [cli/README.md](cli/README.md) for discovery, prototype interactions and launch/exit contracts. Resource lists, search, details, offline/auth/error states and bounded event recovery use real core responses; mutations and actual SSH/SFTP are pending. `scripts/build.sh`, `scripts/test.sh` and `scripts/lint.sh` process both modules with GOWORK=off; `build.sh --all` builds both for six CGO=0 targets.
 
 ## Contributing
 

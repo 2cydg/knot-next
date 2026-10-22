@@ -84,11 +84,12 @@ Current capabilities:
 - ✅ Local/remote/dynamic forwarding with temporary and server automatic rules
 - 🚧 Broadcast mode (planned)
 - 🚧 Configuration sync (planned)
-- 🚧 TUI interface (entry/i18n foundation implemented; pages and connections under development)
+- 🚧 TUI interface (bilingual resource lists/search/details implemented; CRUD and connections under development)
 
-The independent [CLI module](cli/README.md) supports local `knot --help` and
-`knot --version`. Business entries currently report that implementation is
-pending. Root build/test/lint scripts process both modules. See the
+The independent [CLI module](cli/README.md) supports local help/version and a
+bilingual TUI with real core discovery, resource lists, search, details and
+offline recovery. Start knot-core manually; CRUD and SSH/SFTP remain in development.
+Root build/test/lint scripts process both modules. See the
 [workspace stage record](../docs/cli-tui-progress.md) for delivered scope and validation.
 
 ## License
