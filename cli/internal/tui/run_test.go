@@ -49,6 +49,21 @@ func TestRunCanceledBeforeDiscovery(t *testing.T) {
 	}
 }
 
+func TestRunSetsAndRestoresTitleWhenDiscoveryFails(t *testing.T) {
+	t.Setenv("KNOT_RUNTIME_FILE", "invalid-relative-path")
+	for _, args := range [][]string{nil, {"ssh", "alias"}} {
+		launch, _ := entry.Parse(args)
+		var output, diagnostics bytes.Buffer
+		code := Run(context.Background(), launch, i18n.New(i18n.English), nil, &output, &diagnostics)
+		if code != entry.ExitFailure || diagnostics.Len() == 0 {
+			t.Fatal("expected discovery failure")
+		}
+		if got, want := output.String(), "\x1b]0;Knot\x07\x1b]0;Knot\x07"; got != want {
+			t.Fatalf("management/alias entry did not set and restore the title: %q", got)
+		}
+	}
+}
+
 func TestAliasRunCancellationReleasesHTTPRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -198,6 +199,36 @@ func isChanClosed(ch <-chan struct{}) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func TestSSHAgentFailureDoesNotAllocatePTYBeforeRetry(t *testing.T) {
+	started := make(chan struct{})
+	srv := startSSHServer(t, sshserver.ShellBehavior{Started: started, Scripted: true, ReadStdin: true, SendExitStatus: true})
+	service, serverID, _ := newSSHService(t, srv)
+	// Use a missing endpoint so this test never depends on the host's Agent.
+	service.UseDialOptions(DialOptions{AgentSocket: filepath.Join(t.TempDir(), "missing-agent"), Timeout: time.Second})
+	created := createSession(t, service, serverID, CreateRequest{ForwardAgent: true})
+	failed := waitForState(t, service, created.ID, 5*time.Second, "failed")
+	if failed.FrameworkCode != "agent_forwarding_unavailable" {
+		t.Fatalf("failure code = %q, want Agent forwarding failure", failed.FrameworkCode)
+	}
+	// OpenSSH records last login when allocating a PTY. Abandoning that PTY
+	// before starting a shell can accumulate login messages on a pooled client.
+	if requests := srv.PTYRequests(); len(requests) != 0 {
+		t.Fatalf("failed Agent setup allocated %d PTYs before retry", len(requests))
+	}
+	if isChanClosed(started) {
+		t.Fatal("failed Agent setup started a shell")
+	}
+
+	retry := createSession(t, service, serverID, CreateRequest{ForwardAgent: false})
+	connected := waitForState(t, service, retry.ID, 5*time.Second, "connected")
+	if connected.ConnectionID == "" || connected.ConnectionID != failed.ConnectionID {
+		t.Fatal("retry did not exercise the same pooled SSH connection")
+	}
+	if requests := srv.PTYRequests(); len(requests) != 1 {
+		t.Fatalf("successful retry allocated %d PTYs, want exactly one", len(requests))
 	}
 }
 

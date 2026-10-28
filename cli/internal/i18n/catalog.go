@@ -49,7 +49,7 @@ SFTP file management and transfers are still under development.
 		FrontendPending:        "Management pages and SSH connections are still under development; this build supports knot --help and knot --version.",
 		StartupDirectoryFailed: "Cannot read the startup directory: {{.Reason}}.",
 		OutputFailed:           "Cannot write terminal output: {{.Reason}}.",
-		MenuServers:            "Servers", MenuKeys: "Keys", MenuProxies: "Proxies", MenuSync: "Sync services",
+		MenuServers:            "Servers", MenuKeys: "Keys", MenuProxies: "Proxies", MenuSync: "Sync",
 		UnknownError: "Operation failed ({{.Code}}).",
 	},
 	Chinese: {
@@ -77,7 +77,7 @@ SFTP 文件管理及传输仍在开发中。
 		FrontendPending:        "管理页面和 SSH 连接仍在开发中；当前构建支持 knot --help 和 knot --version。",
 		StartupDirectoryFailed: "无法读取启动目录：{{.Reason}}。",
 		OutputFailed:           "无法写入终端输出：{{.Reason}}。",
-		MenuServers:            "服务器", MenuKeys: "密钥", MenuProxies: "代理", MenuSync: "同步服务",
+		MenuServers:            "服务器", MenuKeys: "密钥", MenuProxies: "代理", MenuSync: "同步",
 		UnknownError: "操作失败（{{.Code}}）。",
 	},
 }

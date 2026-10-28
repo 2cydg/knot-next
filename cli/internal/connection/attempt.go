@@ -46,6 +46,7 @@ func (a *Attempt) Start(request coreclient.SessionRequest) Result {
 	}
 	// Observe warnings before creating the session; remembering credentials can
 	// fail immediately after authentication, before the renderer hands off.
+	created := make(chan struct{})
 	if stream, err := a.Client.Events(a.ctx); err == nil {
 		a.mu.Lock()
 		a.watchDone = make(chan struct{})
@@ -54,17 +55,36 @@ func (a *Attempt) Start(request coreclient.SessionRequest) Result {
 		go func() {
 			defer close(done)
 			defer stream.Close()
+			// Events buffers early warnings until the response identifies this
+			// attempt. Never collect failures or warnings from other sessions.
+			select {
+			case <-created:
+			case <-a.ctx.Done():
+				return
+			}
+			id := a.ID()
+			if id == "" {
+				return
+			}
 			for item := range stream.Items {
 				e := item.Event
-				if e.Level != "warn" && e.Level != "warning" && e.Level != "error" {
+				if e.Type != "session.warning" || (e.Level != "warn" && e.Level != "warning" && e.Level != "error") {
 					continue
 				}
 				var data struct {
-					Warning struct {
+					SessionID string `json:"session_id"`
+					Warning   struct {
 						Kind string `json:"kind"`
 					} `json:"warning"`
 				}
 				_ = json.Unmarshal(e.Data, &data)
+				sessionID := e.ResourceID
+				if sessionID == "" {
+					sessionID = data.SessionID
+				}
+				if sessionID != id {
+					continue
+				}
 				code := data.Warning.Kind
 				if code == "" {
 					code = e.Type
@@ -82,6 +102,7 @@ func (a *Attempt) Start(request coreclient.SessionRequest) Result {
 	a.mu.Lock()
 	a.id = s.ID
 	a.mu.Unlock()
+	close(created)
 	// Cancellation can race the 201 response. Close the accepted resource even
 	// if the UI has already moved on; never leave a known ID connecting.
 	if a.ctx.Err() != nil {

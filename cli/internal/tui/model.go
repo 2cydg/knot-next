@@ -120,6 +120,7 @@ type Model struct {
 
 func New(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, runtimeFile string) *Model {
 	input := textinput.New()
+	input.Prompt = ""
 	input.CharLimit = 1024
 	page := launch.InitialPage()
 	if page == "" {
@@ -138,7 +139,13 @@ func (m *Model) Init() tea.Cmd {
 	}
 	resume := m.resumeCmd
 	m.resumeCmd = nil
-	return tea.Batch(m.beginLoad(false), poll(), resume)
+	cmds := []tea.Cmd{m.beginLoad(false), poll(), resume}
+	// A new Bubble Tea program follows every native SSH attachment. Timers
+	// from the previous program cannot dismiss notices retained in this model.
+	for _, notice := range m.notices {
+		cmds = append(cmds, m.noticeTimer(notice))
+	}
+	return tea.Batch(cmds...)
 }
 func poll() tea.Cmd { return tea.Tick(4*time.Second, func(time.Time) tea.Msg { return pollMsg{} }) }
 func (m *Model) Close() {
@@ -306,9 +313,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.handleForwardAction(msg)
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(1, msg.Width), max(1, msg.Height)
-		m.search.SetWidth(max(1, m.mainWidth()-4))
+		m.search.SetWidth(max(1, m.mainWidth()-7))
 		if m.modal != nil && m.modal.Form != nil {
-			m.modal.Form.Resize(max(1, min(m.width-8, 76)-4))
+			m.modal.Form.Resize(m.formInputWidth())
 		}
 		m.clampModalScroll()
 	case FormResult:
@@ -436,7 +443,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if strings.HasPrefix(event.Type, "forward.") && m.modal != nil && m.modal.Forwards != nil {
 			cmds = append(cmds, m.refreshForwards(m.modal))
 		}
-		if event.Level == "warn" || event.Level == "warning" || event.Level == "error" {
+		// Session failures are handled by the connection/terminal result path,
+		// including the optional Agent fallback. They are not non-fatal warnings.
+		if event.Type != "session.error" && (event.Level == "warn" || event.Level == "warning" || event.Level == "error") {
 			var warning struct {
 				Warning struct {
 					Kind string `json:"kind"`
@@ -540,8 +549,13 @@ var pages = []entry.Page{entry.Servers, entry.Keys, entry.Proxies, entry.Sync}
 
 func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 	binding := msg.String()
-	if binding == "?" {
-		return m.OpenModal(&Modal{Kind: Information, Title: m.tr.Message("ui.help"), Body: m.tr.Message("ui.help_body")})
+	if m.focus == MenuFocus {
+		// Only the page's entry shortcuts may cross from the menu. Once
+		// editing starts, Update routes all typing to the focused widget.
+		gated := m.page == entry.Sync && !m.snapshot.Config.Settings.SyncPasswordSet
+		if (!gated && (binding == "/" || binding == "n")) || (gated && binding == "s") {
+			m.focus = OperationsFocus
+		}
 	}
 	if m.focus == MenuFocus {
 		index := 0
@@ -573,8 +587,6 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 	switch binding {
 	case "left", "esc", "tab", "shift+tab":
 		m.focus = MenuFocus
-	case "r":
-		return m.beginLoad(true)
 	case "/":
 		if m.page != entry.Sync || m.snapshot.Config.Settings.SyncPasswordSet {
 			m.focus = SearchFocus
@@ -602,10 +614,6 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 			index = len(rows) - 1
 		}
 		m.selectedID = rows[max(0, min(len(rows)-1, index))].ID
-	case "i":
-		if m.state == Ready && m.selectedID != "" {
-			return m.openDetail()
-		}
 	case "enter":
 		if m.state == Ready && m.selectedID != "" {
 			if m.page == entry.Servers {
@@ -627,7 +635,7 @@ func (m *Model) businessKeyAllowed(binding string) bool {
 	if m.page == entry.Sync && binding == "s" {
 		return true
 	}
-	keys := map[entry.Page]string{entry.Servers: "n e d delete c f p t", entry.Keys: "n d delete x", entry.Proxies: "n e d delete t", entry.Sync: "n e d delete p s a"}
+	keys := map[entry.Page]string{entry.Servers: "n e d delete c f p", entry.Keys: "n d delete x", entry.Proxies: "n e d delete t", entry.Sync: "n e d delete p s a"}
 	for _, key := range strings.Fields(keys[m.page]) {
 		if key == binding {
 			return binding == "n" || m.selectedID != ""

@@ -65,9 +65,6 @@ func (m *Model) businessAction(key string) tea.Cmd {
 	if m.page == entry.Sync && key == "s" {
 		return m.openSyncPassword()
 	}
-	if m.page == entry.Servers && key == "t" {
-		return m.openForwards(m.selectedID)
-	}
 	if m.page == entry.Proxies && key == "t" {
 		return m.testSavedProxy()
 	}
@@ -105,7 +102,7 @@ func (m *Model) openEditor(kind coreclient.Resource, create, credentials bool, s
 		d.Provider = coreclient.ProviderWrite{ID: d.ID, Type: "webdav", Key: "config.toml.enc"}
 		return m.showEditor(d)
 	}
-	modal := &Modal{Kind: Information, Title: m.tr.Message("manage.edit"), Body: m.tr.Message("ui.loading")}
+	modal := &Modal{Kind: Information, Title: m.editorTitle(kind, false), Body: m.tr.Message("ui.loading")}
 	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
 	modal.OnCancel = func() tea.Msg { cancel(); return nil }
 	cmd := m.OpenModal(modal)
@@ -258,10 +255,7 @@ func (m *Model) showEditor(d resourceDraft) tea.Cmd {
 	if d.Kind == coreclient.Servers && !d.CredentialsOnly {
 		form.Sections = []Choice{{ID: "basic", Label: m.tr.Message("manage.basic")}, {ID: "proxy", Label: m.tr.Message("ui.proxy")}, {ID: "jumps", Label: m.tr.Message("ui.jumps")}, {ID: "forwards", Label: m.tr.Message("manage.forwards")}}
 	}
-	title := m.tr.Message("manage.edit")
-	if d.Create {
-		title = m.tr.Message("manage.new")
-	}
+	title := m.editorTitle(d.Kind, d.Create)
 	modal := &Modal{Kind: EditForm, Title: title, Form: form, Edit: &d}
 	if d.Kind == coreclient.Proxies {
 		modal.Body = m.tr.Message("manage.proxy_form_hint")
@@ -295,6 +289,14 @@ func (m *Model) showEditor(d resourceDraft) tea.Cmd {
 		}
 	}
 	return cmd
+}
+
+func (m *Model) editorTitle(kind coreclient.Resource, create bool) string {
+	action := "edit"
+	if create {
+		action = "new"
+	}
+	return m.tr.Message("manage." + action + "." + string(kind))
 }
 
 func setField(form *Form, name, value string) {

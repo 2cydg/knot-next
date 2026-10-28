@@ -146,6 +146,7 @@ func TestAttemptBoundsWarningQueueAndJoinsObserver(t *testing.T) {
 			return
 		}
 		if r.URL.Path == "/v1/sessions" {
+			<-warningsSent
 			io.WriteString(w, `{"data":{"id":"opaque","state":"connected"}}`)
 			return
 		}
@@ -155,9 +156,24 @@ func TestAttemptBoundsWarningQueueAndJoinsObserver(t *testing.T) {
 		}
 		defer ws.CloseNow()
 		_ = ws.Write(r.Context(), websocket.MessageText, []byte(`{"type":"core.snapshot","api_version":"v1"}`))
-		for range 40 {
-			_ = ws.Write(r.Context(), websocket.MessageText, []byte(`{"type":"session.warning","level":"warn","data":{"warning":{"kind":"remember_failed","message":"must-not-be-displayed"}}}`))
+		// These arrive before the POST response identifies the attempt. Failed
+		// Agent attempts and other sessions must not become its exit warnings.
+		for _, event := range []string{
+			`{"type":"session.error","resource_id":"opaque","level":"warn","data":{"error":"agent forwarding unavailable: agent_unavailable"}}`,
+			`{"type":"session.warning","resource_id":"other","level":"warn","data":{"warning":{"kind":"unrelated"}}}`,
+			`{"type":"session.warning","level":"warn","data":{"warning":{"kind":"unscoped"}}}`,
+			`{"type":"forward.failed","resource_id":"forward","level":"error"}`,
+		} {
+			_ = ws.Write(r.Context(), websocket.MessageText, []byte(event))
 		}
+		for range 40 {
+			_ = ws.Write(r.Context(), websocket.MessageText, []byte(`{"type":"session.warning","resource_id":"opaque","level":"warn","data":{"warning":{"kind":"remember_failed","message":"must-not-be-displayed"}}}`))
+		}
+		// Also send them after the retained warnings so queue eviction cannot
+		// hide a failure to filter them.
+		_ = ws.Write(r.Context(), websocket.MessageText, []byte(`{"type":"session.error","resource_id":"opaque","level":"warn"}`))
+		_ = ws.Write(r.Context(), websocket.MessageText, []byte(`{"type":"session.warning","resource_id":"other","level":"warn","data":{"warning":{"kind":"unrelated"}}}`))
+		_ = ws.Write(r.Context(), websocket.MessageText, []byte(`{"type":"session.warning","level":"warn","data":{"session_id":"opaque","warning":{"kind":"last_warning"}}}`))
 		close(warningsSent)
 		_, _, _ = ws.Read(r.Context())
 	}))
@@ -172,9 +188,9 @@ func TestAttemptBoundsWarningQueueAndJoinsObserver(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		a.mu.Lock()
-		n := len(a.warnings)
+		drained := len(a.warnings) > 0 && a.warnings[len(a.warnings)-1] == "last_warning"
 		a.mu.Unlock()
-		if n == 16 {
+		if drained {
 			break
 		}
 		time.Sleep(time.Millisecond)
@@ -183,8 +199,12 @@ func TestAttemptBoundsWarningQueueAndJoinsObserver(t *testing.T) {
 	if len(warnings) != 16 {
 		t.Fatal("unbounded/lost warnings", len(warnings))
 	}
-	for _, code := range warnings {
-		if code != "remember_failed" {
+	for i, code := range warnings {
+		want := "remember_failed"
+		if i == len(warnings)-1 {
+			want = "last_warning"
+		}
+		if code != want {
 			t.Fatal("backend text escaped into application queue")
 		}
 	}

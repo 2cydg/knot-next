@@ -50,7 +50,7 @@ func (m *Model) startSSH(ref string, resolve bool, agent ...bool) tea.Cmd {
 	}
 	client, instance := m.snapshot.Client, m.snapshot.Runtime.InstanceID
 	a := connection.New(m.ctx, client, instance)
-	forwardAgent := len(agent) == 0 || agent[0]
+	forwardAgent := (len(agent) == 0 || agent[0]) && m.snapshot.Available("agent_forwarding")
 	m.ssh = &sshAttempt{Attempt: a, Ref: ref, Resolve: resolve, ForwardAgent: forwardAgent}
 	m.directMessage = m.tr.Message("ssh.connecting")
 	rows, cols := min(max(1, m.height), 1000), min(max(1, m.width), 1000)
@@ -109,7 +109,7 @@ func (m *Model) handleSSH(msg sshResult) tea.Cmd {
 			return nil
 		}
 		if current.ForwardAgent && coreclient.Code(current.Failure) == "agent_forwarding_unavailable" {
-			return m.openAgentRetry()
+			return m.retryWithoutAgent()
 		}
 		return m.finishSSH(current.Failure)
 	}
@@ -148,22 +148,21 @@ func sessionFailure(s coreclient.Session) error {
 	return coreclient.Failure(code)
 }
 
-func (m *Model) openAgentRetry() tea.Cmd {
+func (m *Model) retryWithoutAgent() tea.Cmd {
 	current := m.ssh
-	modal := &Modal{Kind: ActionConfirm, Title: m.tr.Message("ssh.agent_retry"), Body: m.tr.Message("ssh.agent_retry_body")}
-	modal.OnCancel = func() tea.Msg { return sshCancelMsg{Attempt: current.Attempt} }
-	modal.OnConfirm = func(string) tea.Cmd {
-		modal.Busy = true
-		ref, resolve := current.Ref, current.Resolve
-		if current.Session.ServerID != "" {
-			ref, resolve = current.Session.ServerID, false
-		}
-		return func() tea.Msg {
-			current.Attempt.Close()
-			return sshRetryMsg{Ref: ref, Resolve: resolve, Attempt: current.Attempt}
-		}
+	// The capability snapshot can become stale, or the remote can refuse
+	// forwarding. Retry once without it and invalidate already scheduled polls.
+	current.Submitting = true
+	current.Revision++
+	ref, resolve := current.Ref, current.Resolve
+	if current.Session.ServerID != "" {
+		ref, resolve = current.Session.ServerID, false
 	}
-	return m.OpenModal(modal)
+	attempt := current.Attempt
+	return func() tea.Msg {
+		attempt.Close()
+		return sshRetryMsg{Ref: ref, Resolve: resolve, Attempt: attempt}
+	}
 }
 
 func (m *Model) openSSHChallenge(c coreclient.Challenge) tea.Cmd {

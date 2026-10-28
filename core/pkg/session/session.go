@@ -1204,6 +1204,18 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 			release()
 			return nil, nil, currentCfg, err
 		}
+		// Finish Agent setup before allocating a PTY. OpenSSH records login
+		// information during PTY allocation; abandoning it before Shell and
+		// retrying on the pooled client can accumulate Last login messages.
+		if req.ForwardAgent {
+			if err := sessionSetup(ownedCtx, sshSession, func() error {
+				return pool.ForwardAgent(ownedCtx, client, sshSession, dialOpts.AgentSocket, dialOpts.Timeout)
+			}); err != nil {
+				closeSSHSession(ownedCtx, sshSession)
+				release()
+				return nil, nil, currentCfg, err
+			}
+		}
 		if err := sessionSetup(ownedCtx, sshSession, func() error {
 			return sshSession.RequestPty(req.Term, req.Rows, req.Cols, sshTerminalModes())
 		}); err != nil {
@@ -1221,15 +1233,6 @@ func (s *Service) openInteractive(ctx context.Context, sessionID string, req Cre
 			closeSSHSession(ownedCtx, sshSession)
 			release()
 			return nil, nil, currentCfg, err
-		}
-		if req.ForwardAgent {
-			if err := sessionSetup(ownedCtx, sshSession, func() error {
-				return pool.ForwardAgent(ownedCtx, client, sshSession, dialOpts.AgentSocket, dialOpts.Timeout)
-			}); err != nil {
-				closeSSHSession(ownedCtx, sshSession)
-				release()
-				return nil, nil, currentCfg, err
-			}
 		}
 		stdin, err := sshSession.StdinPipe()
 		if err != nil {

@@ -94,18 +94,32 @@ func TestSSHAnswerInvalidatesPollFromPreviousChallenge(t *testing.T) {
 	}
 }
 
-func TestSSHAgentFailureRequiresExplicitRetry(t *testing.T) {
-	m, a := sshModel(t)
-	m.ssh.ForwardAgent = true
-	m.handleSSH(sshResult{Attempt: a, Result: connection.Result{Session: coreclient.Session{ID: "opaque", State: "failed", FrameworkCode: "agent_forwarding_unavailable"}}})
-	if m.modal == nil || m.modal.Kind != ActionConfirm || m.handoff != nil || m.ssh.Attempt != a {
-		t.Fatal("agent forwarding silently downgraded")
-	}
-	for _, key := range []string{"?", "c", "ctrl+s", "ctrl+c"} {
-		m.Update(press(key))
-		if m.ssh.Attempt != a || m.modal == nil {
-			t.Fatal("retry confirmation leaked key")
+func TestSSHAgentForwardingFollowsCoreAvailability(t *testing.T) {
+	for _, available := range []bool{false, true} {
+		m := testModel(t, "servers")
+		m.snapshot.Capabilities = []coreclient.Capability{{Name: "agent_forwarding", Available: available}}
+		m.startSSH("opaque", false)
+		if m.ssh.ForwardAgent != available || m.modal != nil {
+			t.Fatal("Agent availability did not control forwarding without a prompt")
 		}
+	}
+}
+
+func TestSSHAgentFailureRetriesOnceWithoutConfirmation(t *testing.T) {
+	m, a := sshModel(t)
+	m.snapshot.Capabilities = []coreclient.Capability{{Name: "agent_forwarding", Available: true}}
+	m.ssh.ForwardAgent = true
+	m.ssh.Ref, m.ssh.Resolve = "alias", true
+	failure := sshResult{Attempt: a, Result: connection.Result{Session: coreclient.Session{ID: "opaque", ServerID: "server-id", State: "failed", FrameworkCode: "agent_forwarding_unavailable"}}}
+	cmd := m.handleSSH(failure)
+	if cmd == nil || m.modal != nil || m.handoff != nil || !m.ssh.Submitting || len(m.notices) != 0 {
+		t.Fatal("Agent failure did not schedule a silent retry")
+	}
+	if m.ssh.Revision == 0 {
+		t.Fatal("fallback did not invalidate outstanding polls")
+	}
+	if m.handleSSH(failure) != nil {
+		t.Fatal("late failure scheduled a duplicate retry")
 	}
 	// A late completion from another attempt cannot replace the current one.
 	other := connection.New(context.Background(), m.snapshot.Client, "other")
@@ -113,6 +127,21 @@ func TestSSHAgentFailureRequiresExplicitRetry(t *testing.T) {
 	m.Update(sshRetryMsg{Ref: "other", Attempt: other})
 	if m.ssh.Attempt != a {
 		t.Fatal("stale retry replaced current attempt")
+	}
+	retry, ok := cmd().(sshRetryMsg)
+	if !ok || retry.Ref != "server-id" || retry.Resolve {
+		t.Fatal("retry lost the resolved server identity")
+	}
+	m.Update(retry)
+	if m.ssh == nil || m.ssh.Attempt == a || m.ssh.ForwardAgent || m.modal != nil {
+		t.Fatal("retry did not disable forwarding")
+	}
+	// A failure even with forwarding disabled must terminate, not loop.
+	next := m.ssh.Attempt
+	t.Cleanup(func() { next.Finish() })
+	m.handleSSH(sshResult{Attempt: next, Result: connection.Result{Session: failure.Result.Session}})
+	if m.ssh != nil {
+		t.Fatal("fallback retried indefinitely")
 	}
 }
 

@@ -1,12 +1,14 @@
 Knot                                                                                     cli 0.1.0-dev    core 0.1.0-dev
 ┌─────────────────┐ ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
-│  S Servers      │ │ Sync services                                                                                    │
-│                 │ │ [←/Esc] Menu  [↑↓] Select  [/] Search  [r] Refresh  [?] Help  [i] Details  [n] New  [e] Edit     │
-│  K Keys         │ │ [d] Delete  [p] Credentials  [a] Default  [s] Sync password                                      │
+│  🖥️ Servers     │ │ Sync                                                                                             │
+│                 │ │ [↑↓] Select  [/] Search  [n] New  [e] Edit  [d] Delete  [p] Credentials  [a] Default  [s] Sync   │
+│  🔑 Keys        │ │ password                                                                                         │
 │                 │ │ ──────────────────────────────────────────────────────────────────────────────────────────────── │
-│  P Proxies      │ │ Search aliases                                                                                   │
+│  🔀 Proxies     │ │ ┌──────────────────────────────────────────────────────────────────────────────────────────────┐ │
+│                 │ │ │Search aliases                                                                                │ │
+│> 🔄 Sync        │ │ └──────────────────────────────────────────────────────────────────────────────────────────────┘ │
 │                 │ │ ┌──────────────────────────────────────────────────────────────────┐ ┌─────────────────────────┐ │
-│> Y Sync services│ │ │  Alias        Type         Location     Credentials  Default     │ │Details                  │ │
+│                 │ │ │  Alias        Type         Location     Credentials  Default     │ │Details                  │ │
 │                 │ │ │──────────────────────────────────────────────────────────────────│ │s3-main                  │ │
 │                 │ │ │> s3-main      S3           backup/conf… Set          Yes         │ │Type                     │ │
 │                 │ │ │· 备份é        WebDAV       https://bac… Set          No          │ │S3                       │ │
@@ -24,8 +26,6 @@ Knot                                                                            
 │                 │ │ │                                                                  │ │Set                      │ │
 │                 │ │ │                                                                  │ │Default                  │ │
 │                 │ │ │                                                                  │ │Yes                      │ │
-│                 │ │ │                                                                  │ │                         │ │
-│                 │ │ │                                                                  │ │                         │ │
 │                 │ │ │                                                                  │ │                         │ │
 │                 │ │ │                                                                  │ │                         │ │
 │                 │ │ └──────────────────────────────────────────────────────────────────┘ └─────────────────────────┘ │

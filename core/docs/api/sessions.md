@@ -517,7 +517,7 @@ session GET/列表新增 `server_id`，在解析真实配置目标后填入，�
 
 CWD 仅旁路观察远端 OSC7：`ESC ] 7 ; file://host/absolute/path BEL` 或 `ESC \\` 终结，支持任意分片、URL 编码空格/中文。PTY 字节原样输出；观察不去除控制序列，也不改写换行。非法 URI、含控制字符的目录和超长/未结束序列被忽略；观察缓存上限 4096 字节。远端不发送 OSC7 时，目录保持未知或上次值。core 不自动安装 Bash/Zsh hook、不修改登录文件，客户端不能承诺任意 shell 默认持续跟随。
 
-`forward_agent=true` 明确要求转发成功。没有可用本地 Agent/key、endpoint 冲突或远端拒绝，session 进入 `failed`，`framework_code=agent_forwarding_unavailable`，`forward_agent=false`，错误可经 GET/事件观察。认证 Agent 错误继续进入现有 `AuthError`/可重试 challenge 流程，用户可改用密码或私钥。
+`forward_agent=true` 明确要求转发成功。没有可用本地 Agent/key、endpoint 冲突或远端拒绝，session 进入 `failed`，`framework_code=agent_forwarding_unavailable`，`forward_agent=false`，错误可经 GET/事件观察。Agent forwarding 在 PTY 申请前完成，失败时不申请远端 PTY，避免客户端关闭转发后重试时，在复用连接上累积 OpenSSH 的登录提示和登录记录。认证 Agent 错误继续进入现有 `AuthError`/可重试 challenge 流程，用户可改用密码或私钥。
 
 Unix 使用请求/dial options 或 `SSH_AUTH_SOCK`；Windows 优先 `SSH_AUTH_SOCK`，默认 `\\.\pipe\openssh-ssh-agent`，named pipe 使用 go-winio context 拨号。认证 Agent 连接在握手结束时关闭；每个远端 Agent 通道拥有独立本地连接，handler 由共享 SSH client 持有，同 client 多会话复用，单会话关闭不破坏其他会话，client/pool 关闭回收连接和 worker。Windows/macOS 原生运行验证留到 CLI 联测。
 

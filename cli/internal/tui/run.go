@@ -23,6 +23,8 @@ func Run(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, in
 	if ctx.Err() != nil {
 		return entry.ExitCanceled
 	}
+	_ = terminal.SetTitle(output, "Knot")
+	defer func() { _ = terminal.SetTitle(output, "Knot") }()
 	path, err := coreclient.RuntimeFile()
 	if err != nil {
 		return runError(ctx, err, tr, diagnostics)
@@ -50,7 +52,13 @@ func Run(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, in
 		ssh := m.handoff
 		in, _ := input.(*os.File)
 		out, _ := output.(*os.File)
+		title := ssh.Session.Alias
+		if title == "" {
+			title = "Knot"
+		}
+		_ = terminal.SetTitle(output, title)
 		result := terminal.Run(ctx, ssh.Attempt.Client, ssh.Attempt.Instance, ssh.Session.ID, in, out)
+		_ = terminal.SetTitle(output, "Knot")
 		if ctx.Err() != nil {
 			ssh.Attempt.Close()
 		}

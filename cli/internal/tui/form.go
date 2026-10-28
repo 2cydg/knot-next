@@ -40,6 +40,7 @@ func (f Field) choiceLabel() string {
 
 func TextField(name, label, value string, required, secret bool) Field {
 	f := Field{Name: name, Label: label, Required: required, Input: textinput.New()}
+	f.Input.Prompt = ""
 	f.Input.SetValue(value)
 	f.Input.CharLimit = 4096
 	if secret {
@@ -244,7 +245,8 @@ func (f *Form) Resize(width int) {
 		if f.Fields[i].Multiline {
 			f.Fields[i].Area.SetWidth(max(1, width))
 		} else {
-			f.Fields[i].Input.SetWidth(max(1, width))
+			// textinput reserves one extra cell for its virtual cursor.
+			f.Fields[i].Input.SetWidth(max(1, width-1))
 		}
 	}
 }

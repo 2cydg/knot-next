@@ -2,8 +2,6 @@ package i18n
 
 func addSSHCatalogs() {
 	entries := map[Key][2]string{
-		"ssh.agent_retry":                    {"Reconnect without Agent forwarding", "关闭 Agent 转发后重连"},
-		"ssh.agent_retry_body":               {"SSH Agent forwarding is unavailable locally or was refused by the server. Reconnect with Agent forwarding disabled for this connection?", "本机 Agent 转发不可用或服务端拒绝了请求。是否仅为此次连接关闭 Agent 转发并重新连接？"},
 		"ssh.connecting":                     {"Connecting to SSH… [Esc] Cancel", "正在连接 SSH… [Esc] 取消"},
 		"ssh.cancel_hint":                    {"[Esc] Cancel", "[Esc] 取消"},
 		"ssh.trust":                          {"Trust host key", "信任主机密钥"},

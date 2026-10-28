@@ -42,6 +42,12 @@ func TestWarningsAndHandshakeFollowCoreContract(t *testing.T) {
 		t.Fatal("handshake caused redundant config reload")
 	}
 	for _, level := range []string{"warn", "warning", "error"} {
+		send(coreclient.Event{Type: "session.error", ResourceID: "failed-agent-attempt", Level: level, Data: json.RawMessage(`{"state":"failed","error":"agent forwarding unavailable: agent_unavailable"}`)})
+		if len(m.notices) != 0 {
+			t.Fatal("session failure duplicated as a generic core warning", level)
+		}
+	}
+	for _, level := range []string{"warn", "warning", "error"} {
 		send(coreclient.Event{Type: "session.warning", ResourceID: level, Level: level, Data: json.RawMessage(`{"warning":{"kind":"credential_save_failed"}}`)})
 		if got := m.notices[len(m.notices)-1]; !got.Error || !strings.Contains(got.Text, "credential_save_failed") {
 			t.Fatal("warning lost", level, got)
@@ -53,6 +59,27 @@ func TestWarningsAndHandshakeFollowCoreContract(t *testing.T) {
 	send(coreclient.Event{Type: "session.connected"})
 	if !m.loading || m.generation != generation+1 {
 		t.Fatal("real recent-use change did not refresh config")
+	}
+}
+
+func TestReenteringTUIRearmsRetainedNotificationTimers(t *testing.T) {
+	m := testModel(t)
+	// Simulate handing off to native SSH before the first program's timer
+	// could dismiss a warning. The same model is then used by a new program.
+	m.notify(NoticeMsg{ID: "warning:previous", Text: "old warning", Error: true})
+	m.notify(NoticeMsg{ID: "active", Text: "still running", Persistent: true})
+	cmds, ok := m.Init()().(tea.BatchMsg)
+	if !ok || len(cmds) != 3 {
+		t.Fatal("expected discovery, polling and one retained notice timer")
+	}
+	// Leave discovery and polling unexecuted; only the resumed timer matters.
+	message, ok := cmds[2]().(dismissMsg)
+	if !ok || message.id != "warning:previous" {
+		t.Fatal("retained notification has no dismissal command")
+	}
+	m.Update(message)
+	if len(m.notices) != 1 || m.notices[0].ID != "active" {
+		t.Fatal("warning stuck after returning from SSH, or active notice expired")
 	}
 }
 
@@ -86,8 +113,8 @@ func TestBackgroundRetryPreservesFailureState(t *testing.T) {
 			t.Fatal("background retry obscured failure", code)
 		}
 		m.Update(press("r"))
-		if m.state != Loading {
-			t.Fatal("explicit refresh should show loading")
+		if m.state != state {
+			t.Fatal("removed refresh shortcut changed failure state")
 		}
 	}
 }

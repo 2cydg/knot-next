@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"strings"
 	"unicode"
 
@@ -20,6 +21,7 @@ var (
 	muted      = lipgloss.Color("#8b9390")
 	line       = lipgloss.Color("#46504b")
 	green      = lipgloss.Color("#a7ccb2")
+	tagSearch  = lipgloss.Color("#8fb8d8")
 	red        = lipgloss.Color("#d6a19b")
 	selected   = lipgloss.Color("#283a31")
 )
@@ -43,6 +45,11 @@ func Display(value string) string {
 func displayWidget(value string) string {
 	var b strings.Builder
 	for _, r := range value {
+		// textinput pads wide placeholder characters with NULs. They have
+		// zero display width but can disturb Lip Gloss border placement.
+		if r == 0 {
+			continue
+		}
 		if unicode.Is(unicode.Cf, r) {
 			fmt.Fprintf(&b, "\\u%04x", r)
 		} else {
@@ -69,7 +76,10 @@ func box(content string, width, height int, focus bool) string {
 	if focus {
 		color = green
 	}
-	return lipgloss.NewStyle().Foreground(text).Background(background).Border(lipgloss.NormalBorder()).BorderForeground(color).Width(max(1, width)).Height(max(1, height)).MaxWidth(width).MaxHeight(height).Render(content)
+	return coloredBox(content, width, height, color)
+}
+func coloredBox(content string, width, height int, borderColor color.Color) string {
+	return lipgloss.NewStyle().Foreground(text).Background(background).Border(lipgloss.NormalBorder()).BorderForeground(borderColor).Width(max(1, width)).Height(max(1, height)).MaxWidth(width).MaxHeight(height).Render(content)
 }
 func (m *Model) sidebarWidth() int {
 	if m.width < 100 {
@@ -77,8 +87,9 @@ func (m *Model) sidebarWidth() int {
 	}
 	return 19
 }
-func (m *Model) mainWidth() int   { return max(1, m.width-m.sidebarWidth()-1) }
-func (m *Model) pageName() string { return m.tr.Message("menu." + string(m.page)) }
+func (m *Model) mainWidth() int      { return max(1, m.width-m.sidebarWidth()-1) }
+func (m *Model) pageName() string    { return m.tr.Message("menu." + string(m.page)) }
+func (m *Model) formInputWidth() int { return max(1, min(78, m.width-4)-6) }
 
 func (m *Model) View() tea.View {
 	if m.width < 24 || m.height < 10 {
@@ -94,7 +105,7 @@ func (m *Model) View() tea.View {
 	versions = ansi.Truncate(versions, max(1, w-7), "…")
 	top := lipgloss.NewStyle().Foreground(green).Render("Knot") + strings.Repeat(" ", max(1, w-4-ansi.StringWidth(versions))) + lipgloss.NewStyle().Foreground(muted).Render(versions)
 	var menu []string
-	icons := []string{"S", "K", "P", "Y"}
+	icons := []string{"🖥️", "🔑", "🔀", "🔄"}
 	for i, p := range pages {
 		value := "  " + icons[i]
 		if p == m.page {
@@ -167,7 +178,7 @@ func (m *Model) View() tea.View {
 }
 
 var primaryActions = map[entry.Page][]string{
-	entry.Servers: {"n", "e", "Delete", "c/Enter", "f", "t"},
+	entry.Servers: {"n", "e", "Delete", "c/Enter", "f"},
 	entry.Keys:    {"n", "Delete", "x"},
 	entry.Proxies: {"n", "e", "Delete", "t"},
 	entry.Sync:    {"n", "e", "d", "p", "a", "s"},
@@ -175,32 +186,17 @@ var primaryActions = map[entry.Page][]string{
 
 func (m *Model) mainContent(width, height int) string {
 	hints := m.tr.Message("ui.region_hints")
-	if m.focus == MenuFocus {
-		hints = m.tr.Message("ui.menu_hints")
-	}
-	if m.focus == SearchFocus {
-		hints = m.tr.Message("ui.search_hints")
-	}
-	if m.focus == OperationsFocus && m.selectedID != "" {
-		hints += "  " + m.tr.Message("ui.detail_hint")
-	}
-	if m.focus != SearchFocus && m.state == Ready {
-		for _, key := range primaryActions[m.page] {
-			label := m.tr.Message("ui.action." + key)
-			if key == "t" && m.page == entry.Servers {
-				label = m.tr.Message("manage.forwards")
-			}
-			if key == "s" && m.page == entry.Sync {
-				label = m.tr.Message("manage.sync_password")
-			}
-			hints += "  [" + key + "] " + label
+	for _, key := range primaryActions[m.page] {
+		label := m.tr.Message("ui.action." + key)
+		if key == "s" && m.page == entry.Sync {
+			label = m.tr.Message("manage.sync_password")
 		}
+		hints += "  [" + key + "] " + label
 	}
 	if m.page == entry.Sync && m.hasSnapshot && !m.snapshot.Config.Settings.SyncPasswordSet {
-		hints = m.tr.Message("ui.sync_hint") + "  " + m.tr.Message("ui.menu_hints")
+		hints = m.tr.Message("ui.sync_hint")
 	}
 	head := lipgloss.NewStyle().Foreground(green).Render(m.pageName()) + "\n" + lipgloss.NewStyle().Foreground(green).Render(wrap(hints, width)) + "\n" + strings.Repeat("─", width)
-	remaining := max(1, height-lipgloss.Height(head)-1)
 	if m.state != Ready {
 		key, hint := "ui.loading", "ui.loading_hint"
 		switch m.state {
@@ -231,32 +227,23 @@ func (m *Model) mainContent(width, height int) string {
 	if m.page == entry.Servers {
 		placeholder = m.tr.Message("ui.search_server")
 	}
+	searchColor := line
+	if m.focus == SearchFocus {
+		searchColor = green
+	}
 	if strings.HasPrefix(m.search.Value(), "/") && m.page == entry.Servers {
 		placeholder = m.tr.Message("ui.search_tags")
+		searchColor = tagSearch
 	}
 	input := m.search
 	input.Placeholder = placeholder
 	search := displayWidget(input.View())
-	if m.focus != SearchFocus {
-		value := Display(m.search.Value())
-		if value == "" {
-			value = placeholder
-		}
-		search = lipgloss.NewStyle().Foreground(muted).Render(fit(value, width))
-	}
-	head += "\n" + fit(search, width) + "\n"
-	remaining -= 2
+	head += "\n" + coloredBox(fit(search, max(1, width-2)), width, 3, searchColor) + "\n"
+	remaining := max(3, height-lipgloss.Height(head)-1)
 	rows := m.rows()
-	if len(rows) == 0 {
-		key, hint := "ui.empty", "ui.empty_hint"
-		if m.search.Value() != "" {
-			key, hint = "ui.no_results", "ui.no_results_hint"
-		}
-		return head + wrap(m.tr.Message("ui.list")+"\n\n"+m.tr.Message(key)+"\n\n"+m.tr.Message(hint), width)
-	}
 	tableWidth := width
 	detailWidth := 0
-	if m.width >= 110 {
+	if m.width >= 110 && len(rows) > 0 {
 		detailWidth = 27
 		tableWidth -= detailWidth + 1
 	}
@@ -395,47 +382,25 @@ func (m *Model) modalView() string {
 	}
 	if modal.Form != nil {
 		form := modal.Form
+		if form.Busy {
+			body = append(body, m.tr.Message("ui.busy"))
+		}
 		if len(form.Sections) > 0 {
 			var tabs []string
 			for _, s := range form.Sections {
-				label := s.Label
+				style := lipgloss.NewStyle().Foreground(muted).Padding(0, 1)
 				if s.ID == form.Section {
-					label = "[" + label + "]"
+					style = style.Foreground(green).Background(selected)
 				}
-				tabs = append(tabs, label)
+				tabs = append(tabs, style.Render(Display(s.Label)))
 			}
-			body = append(body, wrap(strings.Join(tabs, " · "), inner))
+			body = append(body, wrap(strings.Join(tabs, " "), inner), "")
 		}
-		start := max(0, form.Index)
-		for i := start; i < len(form.Fields); i++ {
-			f := form.Fields[i]
-			if !form.visible(i) || (f.Section != "" && f.Section != form.Section) {
-				continue
-			}
-			label := f.Label
-			if f.Required {
-				label += " *"
-			}
-			body = append(body, wrap(Display(label), inner))
-			if f.Static {
-				if f.Error != "" {
-					body = append(body, wrap(Display(f.Error), inner))
-				}
-				continue
-			} else if len(f.Choices) > 0 {
-				body = append(body, fit("‹ "+Display(f.choiceLabel())+" ›", inner))
-			} else if f.Multiline {
-				body = append(body, wrap(displayWidget(f.Area.View()), inner))
-			} else {
-				body = append(body, fit(displayWidget(f.Input.View()), inner))
-			}
-			if f.Error != "" {
-				body = append(body, lipgloss.NewStyle().Foreground(red).Render(wrap(Display(f.Error), inner)))
-			}
+		available := max(1, m.height-6-lipgloss.Height(header))
+		if len(body) > 0 {
+			available -= lipgloss.Height(strings.Join(body, "\n")) + 1
 		}
-		if form.Busy {
-			body = append([]string{m.tr.Message("ui.busy")}, body...)
-		}
+		body = append(body, formView(form, inner, max(1, available)))
 	}
 	if modal.Kind == Picker {
 		size := modal.PageSize
@@ -464,4 +429,62 @@ func (m *Model) modalView() string {
 		lines = lines[:available]
 	}
 	return lipgloss.NewStyle().Foreground(text).Background(background).Border(lipgloss.NormalBorder()).BorderForeground(green).Padding(0, 1).Width(width).MaxHeight(m.height - 4).Render(header + "\n" + strings.Join(lines, "\n"))
+}
+
+// Render all visible fields, scrolling only when the focused field no longer
+// fits. Advancing focus must not hide values that still fit in the viewport.
+func formView(form *Form, width, height int) string {
+	var blocks []string
+	var starts []int
+	focusStart, focusEnd, offset := 0, 0, 0
+	for i, f := range form.Fields {
+		if !form.visible(i) || (f.Section != "" && f.Section != form.Section) {
+			continue
+		}
+		label := f.Label
+		if f.Required {
+			label += " *"
+		}
+		parts := []string{wrap(Display(label), width)}
+		if !f.Static {
+			inputWidth := max(1, width-2)
+			value := ""
+			switch {
+			case len(f.Choices) > 0:
+				value = fit("‹ "+Display(f.choiceLabel())+" ›", inputWidth)
+			case f.Multiline:
+				value = displayWidget(f.Area.View())
+			default:
+				value = fit(displayWidget(f.Input.View()), inputWidth)
+			}
+			color := line
+			if i == form.Index {
+				color = green
+			}
+			parts = append(parts, lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(color).Width(width).Render(value))
+		}
+		if f.Error != "" {
+			parts = append(parts, lipgloss.NewStyle().Foreground(red).Render(wrap(Display(f.Error), width)))
+		}
+		block := strings.Join(parts, "\n")
+		starts = append(starts, offset)
+		if i == form.Index {
+			focusStart, focusEnd = offset, offset+lipgloss.Height(block)
+		}
+		offset += lipgloss.Height(block) + 1
+		blocks = append(blocks, block)
+	}
+	start := 0
+	if focusEnd > height {
+		start = focusStart
+		for _, at := range starts {
+			if at >= focusEnd-height {
+				start = min(at, focusStart)
+				break
+			}
+		}
+	}
+	lines := strings.Split(strings.Join(blocks, "\n\n"), "\n")
+	start = min(start, len(lines)-1)
+	return strings.Join(lines[start:min(len(lines), start+height)], "\n")
 }

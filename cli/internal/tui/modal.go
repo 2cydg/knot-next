@@ -63,7 +63,7 @@ func (m *Model) OpenModal(modal *Modal) tea.Cmd {
 	modal.instanceID = m.snapshot.Runtime.InstanceID
 	m.modal = modal
 	if modal.Form != nil {
-		modal.Form.Resize(max(1, min(m.width-8, 76)-4))
+		modal.Form.Resize(m.formInputWidth())
 		cmds = append(cmds, modal.Form.Focus(0))
 	}
 	m.clampModalScroll()

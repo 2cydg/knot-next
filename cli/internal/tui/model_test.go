@@ -83,13 +83,12 @@ func TestPrototypeInitialFocusMenuAndTypingPriority(t *testing.T) {
 	if m.focus != MenuFocus {
 		t.Fatal("default focus")
 	}
-	for _, key := range []string{"n", "e", "d", "c", "f", "r", "/"} {
+	for _, key := range []string{"e", "d", "c", "f", "r", "?", "t"} {
 		_, cmd := m.Update(press(key))
 		if cmd != nil || len(m.notices) != 0 || m.focus != MenuFocus {
 			t.Fatal("menu business key escaped", key)
 		}
 	}
-	m.Update(press("right"))
 	m.Update(press("/"))
 	m.Update(press("n"))
 	m.Update(press("?"))
@@ -107,12 +106,41 @@ func TestPrototypeInitialFocusMenuAndTypingPriority(t *testing.T) {
 }
 func TestTagSearchIsSubstringAndEscPreservesMode(t *testing.T) {
 	m := testModel(t, "servers")
+	border := func() string {
+		t.Helper()
+		for _, line := range strings.Split(m.mainContent(69, 20), "\n") {
+			if strings.HasPrefix(ansi.Strip(line), "┌") {
+				return line
+			}
+		}
+		t.Fatal("search border missing")
+		return ""
+	}
 	m.Update(press("/"))
+	aliasBorder := border()
+	m.Update(press("/"))
+	tagBorder := border()
+	if aliasBorder == tagBorder {
+		t.Fatal("tag mode did not change the search border color")
+	}
+	m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyBackspace}))
+	if m.search.Value() != "" || border() != aliasBorder {
+		t.Fatal("removing the tag prefix did not restore the alias border")
+	}
 	m.Update(press("/"))
 	m.Update(tea.PasteMsg{Content: "duct"})
 	m.Update(press("esc"))
 	if m.search.Value() != "/duct" || len(m.rows()) != 1 || m.rows()[0].ID != "opaque-b" {
 		t.Fatal(m.search.Value(), m.rows())
+	}
+	if border() != tagBorder {
+		t.Fatal("leaving search lost the tag mode indicator")
+	}
+	m.Update(press("/"))
+	m.Update(press("home"))
+	m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyDelete}))
+	if m.search.Value() != "duct" || border() != aliasBorder {
+		t.Fatal("deleting the prefix from a query did not restore the alias border")
 	}
 	m.search.SetValue("db")
 	if len(m.rows()) != 0 {
