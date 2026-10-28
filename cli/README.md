@@ -1,6 +1,6 @@
 # Knot CLI / TUI
 
-独立 module `knot-cli`，工具链为 Go 1.27.1。前端通过 core 的公开 HTTP/WS API 工作，已实现中英文根 TUI、真实资源列表、搜索、详情、离线/认证错误及事件恢复。已接入服务器、密钥、代理、同步服务配置及转发管理的真实写入；SSH/SFTP 终端连接仍由后续阶段实现。
+独立 module `knot-cli`，工具链为 Go 1.27.1。前端通过 core 的公开 HTTP/WS API 工作，已实现中英文根 TUI、真实资源列表、搜索、详情、离线/认证错误及事件恢复。资源管理、转发管理和真实 SSH 原生终端已接入；SFTP 文件页和文件传输仍在后续阶段。
 
 ```bash
 cd cli
@@ -24,7 +24,7 @@ GOWORK=off go build -o ../bin/knot .
 
 ## 原型交互
 
-默认入口聚焦左菜单；页面直达聚焦右操作区。左菜单 ↑↓ 循环切页，→/Enter/Tab 进入操作区；业务字母键在菜单无效。操作区 ←/Esc/Tab 返回菜单，↑↓/Home/End 选行，/ 搜索，r 刷新，i 查看独立详情。密钥/代理/同步列表 Enter 打开详情，服务器 c/Enter 的 SSH 尚在开发中。
+默认入口聚焦左菜单；页面直达聚焦右操作区。左菜单 ↑↓ 循环切页，→/Enter/Tab 进入操作区；业务字母键在菜单无效。操作区 ←/Esc/Tab 返回菜单，↑↓/Home/End 选行，/ 搜索，r 刷新，i 查看独立详情。密钥/代理/同步列表 Enter 打开详情，服务器 c/Enter 连接 SSH。
 
 服务器默认按 core 的 last_used 排序，仅别名子串搜索；输入框内 / 在开头切换标签子串搜索，Esc/Enter 保留查询并回列表。刷新按资源 ID 保留选择。同步密码未设置时显示原型门槛，仅保留 s 的业务入口及通用导航。
 
@@ -66,9 +66,23 @@ GOWORK=off go build -o ../bin/knot .
 
 `LaunchContext` 的 mode、initial_page、server_ref、return_policy 通过只读方法访问，controller 必须传递其退出策略。server_ref 此时仅是未解析别名；真实连接必须采用 core resolve 返回的持久服务器 ID。
 
-help/version 不检测终端、不读取启动目录、不发现 core。其余入口要求 stdin/stdout 同时为 TTY。alias 入口实际发现并 resolve，成功后仍提示 SSH 开发中并退出 1，不创建管理菜单；不存在 alias 返回本地化错误 1。前端不会自动启动 core，也不会读写业务配置或偏好文件。
+help/version 不检测终端、不读取启动目录、不发现 core。其余入口要求 stdin/stdout 同时为 TTY。alias 入口实际发现并 resolve 为持久服务器 ID，显示连接/挑战视图并进入原生 SSH，不创建管理菜单；不存在 alias 返回本地化错误 1。前端不会自动启动 core，也不会读写业务配置或偏好文件。
 
-退出契约：远端 exit-status 0–255 原样保留，缺失/越界状态返回 1；本地连接/协议失败 1，参数错误 2，主动取消 130。管理 TUI 保留单次 SSH 结果继续运行。当前提供解析与状态转换边界，实际远端状态和交接验证属于 SSH 阶段。
+退出契约：远端 exit-status 0–255 原样保留，缺失/越界状态返回 1；本地连接/协议失败 1，参数错误 2，主动取消 130。管理 TUI 保留单次 SSH 结果继续运行。
+
+## SSH 连接和终端
+
+管理页 c/Enter 与 alias 直连共用连接控制器。201 只代表受理，使用 GET 复核真实 connected 后才进入终端；回答挑战成功后继续等待。等待期间 Esc 取消并 DELETE 已受理的会话；失败在 TUI 留在服务器页，alias 展示错误后退出。
+
+主机信任框显示服务器、主机、密钥类型和指纹，只接受 Enter 信任并保存或 Esc 取消。后台失败/超时保留原框；迟到确认按实际机器码报告超时、连接失败或实例变更，不重新连接来接受旧指纹。认证表单支持密码、已导入私钥/临时口令和 Agent；可选择记住成功凭据，实际保存由 core 完成，不持久化私钥口令。Tab/Enter 前进、Ctrl+s 提交，Esc 直接取消连接，不进入保存草稿流程。应答后旧轮询不能重新打开上一轮挑战。
+
+默认请求 Agent 转发。Agent 不可用或服务端拒绝时，明确询问是否关闭转发后重新连接；只有 Enter 确认才为此次连接关闭，Esc 取消。不静默降级、不修改远端 sshd，也不改变后续连接的默认值；新尝试可能再次要求认证。
+
+Bubble Tea 完全结束并释放 stdin 后才启动 raw bridge；退出桥接时先取消并等待输入/resize worker，恢复终端后才重新启动 TUI。binary 原样收发，Ctrl+c/Ctrl+d 送远端，支持 vim/top、ANSI/OSC7 与实际窗口尺寸更新。每次接入按固定默认清屏，前端不注入 shell hook 或改写远端输出。Linux 使用可取消的终端 reader；Windows 使用可取消 overlapped Console 句柄并保存/恢复输出模式；macOS/Windows 当前仅交叉编译，尚未做原生终端验收。
+
+等待完整输出后的 session.exit 再处理退出码；session.error 不会提前截断尾部。缺少 exit frame 时通过 GET 查询结果，有实际退出码则保留并提示可能漏输出；无真实退出状态返回失败。WS 中断保留活跃会话为 detached，显示实际会话 ID，当前没有自动重连或终端重新附着入口，可通过 core API 管理。明确的进程取消会断开本次会话。warning 在有界队列中收集，回 TUI 或退出前显示，不插进远端字节流。
+
+手动验证：先启动 core、保存服务器，执行 `knot servers` 后按 c；远端运行 `stty size`、`top`、`vim` 并缩放窗口，执行 `exit 7` 应返回服务器页。再用 `knot <alias>` 登录并 `exit 7`，本地 `echo $?` 应为 7；Ctrl+d 应正常退出 shell，重复连接后终端输入与回显应正常。SFTP 双栏及上传下载尚未实现。
 
 ## 语言与默认值
 

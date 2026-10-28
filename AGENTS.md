@@ -2,7 +2,7 @@
 
 ## Repository Structure
 
-This repository contains two independent Go modules: **knot-core** and **knot-cli**. The CLI reads real resource lists through a bilingual root TUI; resource CRUD, proxy testing and forwarding management use the public API; SSH/SFTP terminal flows are still under development. Stage status is recorded in the workspace [docs/cli-tui-progress.md](../docs/cli-tui-progress.md).
+This repository contains two independent Go modules: **knot-core** and **knot-cli**. The bilingual CLI provides resource CRUD, proxy tests, forwarding management and native SSH through the public API. SFTP UI and file transfers are still under development. Stage status is recorded in the workspace [docs/cli-tui-progress.md](../docs/cli-tui-progress.md).
 
 Current structure:
 - `core/` - knot-core service (module: knot-core)
@@ -129,7 +129,7 @@ core/
 
 ### CLI (`cli/`)
 
-See [cli/README.md](cli/README.md) for discovery, prototype interactions and launch/exit contracts. Resource lists, search, details, CRUD, proxy tests, sync credentials and persistent/temporary forward management use real core responses; actual SSH/SFTP terminal flows are pending. Resource writes are deliberately sequential under the user’s current scope: keep form errors/drafts and created IDs, but do not add partial-save recovery machinery, rollback or unknown-outcome reconciliation. `scripts/build.sh`, `scripts/test.sh` and `scripts/lint.sh` process both modules with GOWORK=off; `build.sh --all` builds both for six CGO=0 targets.
+See [cli/README.md](cli/README.md) for discovery, interactions and launch/exit contracts. Resource management, forwarding, SSH waiting/challenges and raw terminal bridging use real core responses; SFTP UI remains pending. Connection attempts outlive renderers; Bubble Tea must finish before the native bridge starts, and terminal input workers must join before returning to TUI. Challenge answers bind their displayed ID and invalidate prior polls. Default Agent forwarding only changes for an attempt after explicit retry confirmation. Resource writes remain sequential under the user’s scope: do not add partial-save recovery machinery, rollback or unknown-outcome reconciliation. `scripts/build.sh`, `scripts/test.sh` and `scripts/lint.sh` process both modules with GOWORK=off; `build.sh --all` builds both for six CGO=0 targets. Native macOS/Windows terminal behavior still needs runtime validation.
 
 ## Contributing
 

@@ -83,11 +83,12 @@ go build -o ../bin/knot-core ./cmd/core
 - ✅ 本地/远程/动态转发、持久定义及临时运行规则
 - 🚧 广播模式（计划中）
 - 🚧 配置同步（计划中）
-- 🚧 TUI 界面（双语资源 CRUD 和转发管理已实现，终端连接开发中）
+- 🚧 TUI 界面（双语资源 CRUD、转发管理和原生 SSH 已实现，SFTP 文件页开发中）
 
 独立 [CLI module](cli/README.md) 支持本地帮助/版本，以及真实 core 发现、
-双语资源 CRUD、搜索、详情、代理测试、同步凭据、转发管理及离线恢复。请手动启动 knot-core；
-SSH/SFTP 终端流程仍在开发中。根构建、测试、lint 脚本依次处理
+双语资源 CRUD、搜索、详情、代理测试、同步凭据、转发管理、离线恢复及带信任/认证交互的原生 SSH。
+请手动启动 knot-core；SFTP 文件页与传输仍在开发中。TUI 中按 c/Enter 登录，结束后返回服务器页；
+`knot <alias>` / `knot ssh <alias>` 直连并保留远端退出码。根构建、测试、lint 脚本依次处理
 core 和 cli。交付范围与验证见工作区根目录的 [阶段记录](../docs/cli-tui-progress.md)。
 
 ## 许可证

@@ -111,6 +111,11 @@ type Model struct {
 	exitCode          int
 	cancelProxyTest   context.CancelFunc
 	proxyTestRevision uint64
+	ssh               *sshAttempt
+	handoff           *sshAttempt
+	directStarted     bool
+	directMessage     string
+	resumeCmd         tea.Cmd
 }
 
 func New(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, runtimeFile string) *Model {
@@ -127,9 +132,22 @@ func New(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, ru
 	return &Model{ctx: ctx, launch: launch, tr: tr, runtimeFile: runtimeFile, load: coreclient.Load, page: page, focus: focus, state: Loading, width: 80, height: 24, search: input}
 }
 
-func (m *Model) Init() tea.Cmd { return tea.Batch(m.beginLoad(false), poll()) }
-func poll() tea.Cmd            { return tea.Tick(4*time.Second, func(time.Time) tea.Msg { return pollMsg{} }) }
+func (m *Model) Init() tea.Cmd {
+	if m.launch.Mode() == entry.AliasDirect {
+		return m.beginLoad(false)
+	}
+	resume := m.resumeCmd
+	m.resumeCmd = nil
+	return tea.Batch(m.beginLoad(false), poll(), resume)
+}
+func poll() tea.Cmd { return tea.Tick(4*time.Second, func(time.Time) tea.Msg { return pollMsg{} }) }
 func (m *Model) Close() {
+	if m.ssh != nil {
+		m.ssh.Attempt.Close()
+	}
+	m.pause()
+}
+func (m *Model) pause() {
 	if m.cancelProxyTest != nil {
 		m.cancelProxyTest()
 	}
@@ -238,6 +256,37 @@ func (m *Model) removeNotice(id string) {
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case sshResult:
+		return m, m.handleSSH(msg)
+	case sshPollMsg:
+		if m.ssh != nil && m.ssh.Attempt == msg.Attempt && m.ssh.Revision == msg.Revision && !m.ssh.Submitting {
+			return m, func() tea.Msg {
+				return sshResult{Attempt: msg.Attempt, Revision: msg.Revision, Result: msg.Attempt.Poll()}
+			}
+		}
+		return m, nil
+	case sshCancelMsg:
+		if m.ssh == nil || m.ssh.Attempt != msg.Attempt {
+			return m, nil
+		}
+		return m, m.cancelSSH()
+	case sshRetryMsg:
+		if m.ssh == nil || m.ssh.Attempt != msg.Attempt {
+			return m, nil
+		}
+		if m.snapshot.Runtime.InstanceID != msg.Attempt.Instance {
+			return m, m.finishSSH(coreclient.Failure("INSTANCE_CHANGED"))
+		}
+		m.ssh, m.modal = nil, nil
+		return m, m.startSSH(msg.Ref, msg.Resolve, false)
+	case sshCanceled:
+		var cmds []tea.Cmd
+		for _, code := range msg.Warnings {
+			cmds = append(cmds, m.notify(NoticeMsg{ID: "ssh-warning:" + code, Text: m.tr.Text("ui.warning", map[string]any{"Code": code}), Error: true}))
+		}
+		return m, tea.Batch(cmds...)
+	case aliasFinishedMsg:
+		return m, tea.Quit
 	case editorResult:
 		if m.modal == nil || m.modal.ID != msg.ModalID || msg.Instance != m.snapshot.Runtime.InstanceID {
 			return m, nil
@@ -311,6 +360,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.snapshot = coreclient.Snapshot{}
 			m.healthStatus = ""
 			m.removeNotice("health")
+			if m.launch.Mode() == entry.AliasDirect {
+				m.directStarted = true
+				m.directMessage = m.tr.ProtocolError(code)
+				m.exitCode = entry.ExitFailure
+				return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg { return aliasFinishedMsg{} })
+			}
 			return m, nil
 		}
 		changed := m.snapshot.Runtime.InstanceID != "" && (m.snapshot.Runtime.InstanceID != msg.snapshot.Runtime.InstanceID || !m.snapshot.Client.SameEndpoint(msg.snapshot.Client))
@@ -338,6 +393,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.removeNotice("health")
 		}
 		cmds = append(cmds, m.openStream())
+		if m.launch.Mode() == entry.AliasDirect && !m.directStarted {
+			m.directStarted = true
+			cmds = append(cmds, m.startSSH(m.launch.ServerRef(), true))
+		}
 		return m, tea.Batch(cmds...)
 	case streamResult:
 		if msg.epoch != m.streamEpoch {
@@ -417,6 +476,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.modal != nil {
 			return m, m.modalKey(msg)
+		}
+		if m.ssh != nil {
+			if msg.String() == "esc" {
+				return m, m.cancelSSH()
+			}
+			return m, nil
+		}
+		if m.launch.Mode() == entry.AliasDirect {
+			return m, nil
 		}
 		if m.focus == SearchFocus {
 			switch msg.String() {
@@ -541,7 +609,7 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 	case "enter":
 		if m.state == Ready && m.selectedID != "" {
 			if m.page == entry.Servers {
-				return m.pending()
+				return m.startSSH(m.selectedID, false)
 			}
 			return m.openDetail()
 		}

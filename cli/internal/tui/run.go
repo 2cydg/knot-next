@@ -14,6 +14,7 @@ import (
 	"knot-cli/internal/coreclient"
 	"knot-cli/internal/entry"
 	"knot-cli/internal/i18n"
+	"knot-cli/internal/terminal"
 )
 
 func Run(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, input io.Reader, output, diagnostics io.Writer) int {
@@ -26,36 +27,57 @@ func Run(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, in
 	if err != nil {
 		return runError(ctx, err, tr, diagnostics)
 	}
-	if launch.Mode() == entry.AliasDirect {
-		// Preserve direct-entry policy without starting a management menu. The
-		// real waiting/challenge/terminal controller is implemented next.
-		client, _, err := coreclient.Discover(path)
+	m := New(ctx, launch, tr, path)
+	defer m.Close()
+	for {
+		program := tea.NewProgram(m, tea.WithContext(ctx), tea.WithInput(input), tea.WithOutput(output))
+		_, err = program.Run()
+		// Run has joined Bubble Tea's reader and restored its terminal. Only
+		// now may the native bridge read stdin or change terminal modes.
+		m.pause()
+		if ctx.Err() != nil {
+			return entry.ExitCanceled
+		}
 		if err != nil {
 			return runError(ctx, err, tr, diagnostics)
 		}
-		defer client.Close()
-		if _, err := client.Resolve(ctx, launch.ServerRef()); err != nil {
-			return runError(ctx, err, tr, diagnostics)
+		if m.handoff == nil {
+			if launch.ReturnPolicy() == entry.ExitProgram && m.exitCode == entry.ExitFailure && m.directMessage != "" {
+				fmt.Fprintln(diagnostics, m.directMessage)
+			}
+			return m.exitCode
+		}
+		ssh := m.handoff
+		in, _ := input.(*os.File)
+		out, _ := output.(*os.File)
+		result := terminal.Run(ctx, ssh.Attempt.Client, ssh.Attempt.Instance, ssh.Session.ID, in, out)
+		if ctx.Err() != nil {
+			ssh.Attempt.Close()
+		}
+		warnings := ssh.Attempt.Finish()
+		m.ssh, m.handoff, m.modal = nil, nil, nil
+		if launch.ReturnPolicy() == entry.ExitProgram {
+			if result.Err != nil {
+				fmt.Fprintln(diagnostics, tr.ProtocolError(coreclient.Code(result.Err)))
+			}
+			if result.Detached {
+				fmt.Fprintln(diagnostics, tr.Text("ssh.detached", map[string]any{"ID": Display(ssh.Session.ID)}))
+			}
+			if result.Truncated {
+				fmt.Fprintln(diagnostics, tr.Message("ssh.truncated"))
+			}
+			for _, code := range warnings {
+				fmt.Fprintln(diagnostics, tr.Text("ui.warning", map[string]any{"Code": Display(code)}))
+			}
+			return result.Code()
 		}
 		if ctx.Err() != nil {
 			return entry.ExitCanceled
 		}
-		fmt.Fprintln(diagnostics, tr.Message("ui.ssh_pending"))
-		return entry.ExitFailure
+		m.page, m.focus = entry.Servers, OperationsFocus
+		m.search.SetValue("")
+		m.resumeCmd = m.showSSHResult(result, warnings, ssh.Session.ID)
 	}
-	uiCtx, cancel := context.WithCancel(ctx)
-	m := New(uiCtx, launch, tr, path)
-	program := tea.NewProgram(m, tea.WithContext(uiCtx), tea.WithInput(input), tea.WithOutput(output))
-	_, err = program.Run()
-	cancel()
-	m.Close()
-	if ctx.Err() != nil {
-		return entry.ExitCanceled
-	}
-	if err != nil {
-		return runError(ctx, err, tr, diagnostics)
-	}
-	return m.exitCode
 }
 
 func runError(ctx context.Context, err error, tr i18n.Translator, diagnostics io.Writer) int {

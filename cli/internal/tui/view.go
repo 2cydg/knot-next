@@ -116,6 +116,13 @@ func (m *Model) View() tea.View {
 	sidebar := box(strings.Join(menu, "\n\n"), m.sidebarWidth(), h-2, m.focus == MenuFocus && m.modal == nil)
 	main := box(lipgloss.NewStyle().Padding(0, 1).Render(m.mainContent(m.mainWidth()-4, h-4)), m.mainWidth(), h-2, m.focus != MenuFocus && m.modal == nil)
 	base := top + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, sidebar, " ", main)
+	if m.launch.Mode() == entry.AliasDirect {
+		message := m.directMessage
+		if message == "" {
+			message = m.tr.Message("ui.loading")
+		}
+		base = top + "\n\n" + wrap(Display(m.launch.ServerRef())+"\n"+message+"\n"+m.tr.Message("ssh.cancel_hint"), w)
+	}
 	canvas := lipgloss.NewCanvas(w, h).Compose(lipgloss.NewCompositor(lipgloss.NewLayer(base)))
 	// Notifications use available top-right space; a modal always renders above
 	// them so its body and confirmation keys cannot be obscured.

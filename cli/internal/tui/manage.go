@@ -58,6 +58,9 @@ func newResourceID(kind coreclient.Resource) (string, error) {
 }
 
 func (m *Model) businessAction(key string) tea.Cmd {
+	if m.page == entry.Servers && key == "c" {
+		return m.startSSH(m.selectedID, false)
+	}
 	kind := map[entry.Page]coreclient.Resource{entry.Servers: coreclient.Servers, entry.Keys: coreclient.Keys, entry.Proxies: coreclient.Proxies, entry.Sync: coreclient.Providers}[m.page]
 	if m.page == entry.Sync && key == "s" {
 		return m.openSyncPassword()

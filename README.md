@@ -7,7 +7,7 @@ A modern SSH connection manager providing powerful automation capabilities throu
 This repository contains **knot-core**: a local capability service that provides SSH/SFTP functionality through a standardized HTTP/WebSocket API.
 
 knot-core is designed to be consumed by:
-- Terminal clients (bilingual resource management implemented; SSH/SFTP terminal flows under development)
+- Terminal clients (bilingual resource management and native SSH implemented; SFTP UI under development)
 - Command-line scripts
 - AI agents and automation tools
 - Third-party applications
@@ -84,12 +84,14 @@ Current capabilities:
 - ✅ Local/remote/dynamic forwarding with temporary and server automatic rules
 - 🚧 Broadcast mode (planned)
 - 🚧 Configuration sync (planned)
-- 🚧 TUI interface (bilingual resource CRUD and forwarding management implemented; terminal connections under development)
+- 🚧 TUI interface (bilingual resource CRUD, forwarding and native SSH implemented; SFTP UI under development)
 
 The independent [CLI module](cli/README.md) supports local help/version and a
 bilingual TUI with real core discovery, resource CRUD, proxy tests, sync credentials,
-forwarding management and offline recovery. Start knot-core manually; SSH/SFTP
-terminal flows remain in development.
+forwarding management, offline recovery and native SSH with host trust and
+authentication prompts. Start knot-core manually; SFTP file UI and transfers
+remain in development. SSH exits return to the TUI when launched there;
+`knot <alias>` / `knot ssh <alias>` exit with the remote status.
 Root build/test/lint scripts process both modules. See the
 [workspace stage record](../docs/cli-tui-progress.md) for delivered scope and validation.
 
@@ -109,4 +111,4 @@ credential-store and terminal validation is deferred to CLI integration under
 user authorization. See [API docs](core/docs/api/README.md) and
 [acceptance evidence](core/docs/baseline-acceptance.md).
 
-Core gap completion contracts and executed validation: [acceptance](core/docs/gap-acceptance.md), [public API scenarios](core/examples/gaps/README.md). CLI/TUI remains the next phase; cross-builds are compile evidence, with native platform verification recorded separately.
+Core gap completion contracts and executed validation: [acceptance](core/docs/gap-acceptance.md), [public API scenarios](core/examples/gaps/README.md). SFTP UI and transfer integration remain next; cross-builds are compile evidence, with native platform verification recorded separately.

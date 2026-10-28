@@ -3,6 +3,7 @@ package coreclient
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -32,8 +33,22 @@ func (c *Client) dial(ctx context.Context, path string) (*Socket, error) {
 	header.Set("Authorization", "Bearer "+c.token)
 	conn, res, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(c.base, "http")+path, &websocket.DialOptions{HTTPClient: c.http, HTTPHeader: header})
 	if err != nil {
-		if res != nil && res.StatusCode == 401 {
-			return nil, Failure("UNAUTHORIZED")
+		if res != nil {
+			if res.Body != nil {
+				defer res.Body.Close()
+			}
+			if res.StatusCode == 401 {
+				return nil, &Error{Code: "UNAUTHORIZED", Status: 401}
+			}
+			if res.Body != nil {
+				var envelope struct {
+					Error *Error `json:"error"`
+				}
+				if json.NewDecoder(io.LimitReader(res.Body, maxResponse)).Decode(&envelope) == nil && envelope.Error != nil && envelope.Error.Code != "" {
+					envelope.Error.Status = res.StatusCode
+					return nil, envelope.Error
+				}
+			}
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
