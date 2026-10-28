@@ -116,4 +116,5 @@ func testCoreBinaryDiscoveryConfigAndEvents(t *testing.T, relative bool) {
 	if err != nil || resolved.ID != response.Data.ID {
 		t.Fatal("persistent resolution failed", err)
 	}
+	exerciseManagement(t, ctx, fresh.Client)
 }

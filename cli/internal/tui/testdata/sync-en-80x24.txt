@@ -2,8 +2,8 @@ Knot                                             cli 0.1.0-dev    core 0.1.0-dev
 ┌────┐ ┌───────────────────────────────────────────────────────────────────────┐
 │  S │ │ Sync services                                                         │
 │    │ │ [←/Esc] Menu  [↑↓] Select  [/] Search  [r] Refresh  [?] Help  [i]     │
-│  K │ │ Details  [n] New  [e] Edit  [d] Delete  [p] Credentials  [s] Set /    │
-│    │ │ clear default                                                         │
+│  K │ │ Details  [n] New  [e] Edit  [d] Delete  [p] Credentials  [a] Default  │
+│    │ │ [s] Sync password                                                     │
 │  P │ │ ───────────────────────────────────────────────────────────────────── │
 │    │ │ Search aliases                                                        │
 │> Y │ │ ┌───────────────────────────────────────────────────────────────────┐ │

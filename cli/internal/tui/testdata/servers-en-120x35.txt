@@ -2,7 +2,7 @@ Knot                                                                            
 ┌─────────────────┐ ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
 │> S Servers      │ │ Servers                                                                                          │
 │                 │ │ [←/Esc] Menu  [↑↓] Select  [/] Search  [r] Refresh  [?] Help  [i] Details  [n] New  [e] Edit     │
-│  K Keys         │ │ [Delete] Delete  [c/Enter] SSH  [f] SFTP                                                         │
+│  K Keys         │ │ [Delete] Delete  [c/Enter] SSH  [f] SFTP  [t] Forwarding                                         │
 │                 │ │ ──────────────────────────────────────────────────────────────────────────────────────────────── │
 │  P Proxies      │ │ Search aliases; / in the input searches tags                                                     │
 │                 │ │ ┌──────────────────────────────────────────────────────────────────┐ ┌─────────────────────────┐ │

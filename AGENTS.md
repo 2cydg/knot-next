@@ -2,7 +2,7 @@
 
 ## Repository Structure
 
-This repository contains two independent Go modules: **knot-core** and **knot-cli**. The CLI reads real resource lists through a bilingual root TUI; CRUD and SSH/SFTP flows are still under development. Stage status is recorded in the workspace [docs/cli-tui-progress.md](../docs/cli-tui-progress.md).
+This repository contains two independent Go modules: **knot-core** and **knot-cli**. The CLI reads real resource lists through a bilingual root TUI; resource CRUD, proxy testing and forwarding management use the public API; SSH/SFTP terminal flows are still under development. Stage status is recorded in the workspace [docs/cli-tui-progress.md](../docs/cli-tui-progress.md).
 
 Current structure:
 - `core/` - knot-core service (module: knot-core)
@@ -129,7 +129,7 @@ core/
 
 ### CLI (`cli/`)
 
-See [cli/README.md](cli/README.md) for discovery, prototype interactions and launch/exit contracts. Resource lists, search, details, offline/auth/error states and bounded event recovery use real core responses; mutations and actual SSH/SFTP are pending. `scripts/build.sh`, `scripts/test.sh` and `scripts/lint.sh` process both modules with GOWORK=off; `build.sh --all` builds both for six CGO=0 targets.
+See [cli/README.md](cli/README.md) for discovery, prototype interactions and launch/exit contracts. Resource lists, search, details, CRUD, proxy tests, sync credentials and persistent/temporary forward management use real core responses; actual SSH/SFTP terminal flows are pending. Resource writes are deliberately sequential under the user’s current scope: keep form errors/drafts and created IDs, but do not add partial-save recovery machinery, rollback or unknown-outcome reconciliation. `scripts/build.sh`, `scripts/test.sh` and `scripts/lint.sh` process both modules with GOWORK=off; `build.sh --all` builds both for six CGO=0 targets.
 
 ## Contributing
 

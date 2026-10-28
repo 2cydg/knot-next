@@ -82,33 +82,35 @@ type FormResult struct {
 // Model is the only owner of UI state. Cmds return values; workers never mutate
 // the model, drafts, selection or focus.
 type Model struct {
-	ctx            context.Context
-	launch         entry.LaunchContext
-	tr             i18n.Translator
-	runtimeFile    string
-	load           func(context.Context, string) (coreclient.Snapshot, error)
-	page           entry.Page
-	focus          Focus
-	state          ListState
-	width, height  int
-	search         textinput.Model
-	selectedID     string
-	snapshot       coreclient.Snapshot
-	lastError      error
-	modal          *Modal
-	modalSequence  uint64
-	notices        []Notice
-	noticeRevision uint64
-	generation     uint64
-	loading        bool
-	cancelLoad     context.CancelFunc
-	stream         *coreclient.Stream
-	streamEpoch    uint64
-	cancelStream   context.CancelFunc
-	streamOpening  bool
-	hasSnapshot    bool
-	healthStatus   string
-	exitCode       int
+	ctx               context.Context
+	launch            entry.LaunchContext
+	tr                i18n.Translator
+	runtimeFile       string
+	load              func(context.Context, string) (coreclient.Snapshot, error)
+	page              entry.Page
+	focus             Focus
+	state             ListState
+	width, height     int
+	search            textinput.Model
+	selectedID        string
+	snapshot          coreclient.Snapshot
+	lastError         error
+	modal             *Modal
+	modalSequence     uint64
+	notices           []Notice
+	noticeRevision    uint64
+	generation        uint64
+	loading           bool
+	cancelLoad        context.CancelFunc
+	stream            *coreclient.Stream
+	streamEpoch       uint64
+	cancelStream      context.CancelFunc
+	streamOpening     bool
+	hasSnapshot       bool
+	healthStatus      string
+	exitCode          int
+	cancelProxyTest   context.CancelFunc
+	proxyTestRevision uint64
 }
 
 func New(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, runtimeFile string) *Model {
@@ -128,6 +130,9 @@ func New(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, ru
 func (m *Model) Init() tea.Cmd { return tea.Batch(m.beginLoad(false), poll()) }
 func poll() tea.Cmd            { return tea.Tick(4*time.Second, func(time.Time) tea.Msg { return pollMsg{} }) }
 func (m *Model) Close() {
+	if m.cancelProxyTest != nil {
+		m.cancelProxyTest()
+	}
 	if m.cancelLoad != nil {
 		m.cancelLoad()
 	}
@@ -233,6 +238,23 @@ func (m *Model) removeNotice(id string) {
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case editorResult:
+		if m.modal == nil || m.modal.ID != msg.ModalID || msg.Instance != m.snapshot.Runtime.InstanceID {
+			return m, nil
+		}
+		if msg.Err != nil {
+			m.modal.Body = m.tr.ProtocolError(coreclient.Code(msg.Err))
+			return m, nil
+		}
+		return m, m.showEditor(msg.Draft)
+	case manageResult:
+		return m, m.handleManageResult(msg)
+	case proxyResult:
+		return m, m.handleProxyResult(msg)
+	case forwardsResult:
+		return m, m.handleForwards(msg)
+	case forwardActionResult:
+		return m, m.handleForwardAction(msg)
 	case tea.WindowSizeMsg:
 		m.width, m.height = max(1, msg.Width), max(1, msg.Height)
 		m.search.SetWidth(max(1, m.mainWidth()-4))
@@ -352,6 +374,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.beginLoad(false))
 			}
 		}
+		if strings.HasPrefix(event.Type, "forward.") && m.modal != nil && m.modal.Forwards != nil {
+			cmds = append(cmds, m.refreshForwards(m.modal))
+		}
 		if event.Level == "warn" || event.Level == "warning" || event.Level == "error" {
 			var warning struct {
 				Warning struct {
@@ -368,10 +393,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, readStream(msg.epoch, m.stream))
 		return m, tea.Batch(cmds...)
 	case pollMsg:
-		if m.loading {
-			return m, poll()
+		var forwardCmd tea.Cmd
+		if m.modal != nil && m.modal.Forwards != nil {
+			forwardCmd = m.refreshForwards(m.modal)
 		}
-		return m, tea.Batch(m.beginLoad(false), poll())
+		if m.loading {
+			return m, tea.Batch(forwardCmd, poll())
+		}
+		return m, tea.Batch(forwardCmd, m.beginLoad(false), poll())
 	case NoticeMsg:
 		return m, m.notify(msg)
 	case dismissMsg:
@@ -412,7 +441,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.PasteMsg:
 		if m.modal != nil {
 			if m.modal.Form != nil && !m.modal.Form.Busy {
-				return m, m.modal.Form.update(msg)
+				cmd := m.modal.Form.update(msg)
+				if m.modal.OnChange != nil {
+					m.modal.OnChange()
+				}
+				return m, cmd
 			}
 			return m, nil
 		}
@@ -512,9 +545,9 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 			}
 			return m.openDetail()
 		}
-	case "n", "e", "d", "delete", "c", "f", "p", "t", "s", "x":
+	case "n", "e", "d", "delete", "c", "f", "p", "t", "s", "x", "a":
 		if m.state == Ready && m.businessKeyAllowed(binding) {
-			return m.pending()
+			return m.businessAction(binding)
 		}
 	}
 	return nil
@@ -523,7 +556,10 @@ func (m *Model) businessKeyAllowed(binding string) bool {
 	if m.page == entry.Sync && !m.snapshot.Config.Settings.SyncPasswordSet {
 		return binding == "s"
 	}
-	keys := map[entry.Page]string{entry.Servers: "n e d delete c f p t", entry.Keys: "n d delete x", entry.Proxies: "n e d delete t", entry.Sync: "n e d p s"}
+	if m.page == entry.Sync && binding == "s" {
+		return true
+	}
+	keys := map[entry.Page]string{entry.Servers: "n e d delete c f p t", entry.Keys: "n d delete x", entry.Proxies: "n e d delete t", entry.Sync: "n e d delete p s a"}
 	for _, key := range strings.Fields(keys[m.page]) {
 		if key == binding {
 			return binding == "n" || m.selectedID != ""

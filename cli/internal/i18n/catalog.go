@@ -41,8 +41,8 @@ Start knot-core manually; the CLI never starts it or edits its configuration.
 Exit codes: remote SSH status 0–255, local failure 1, usage error 2, cancel 130.
 Missing SSH exit status is a failure. Management TUI stays open after SSH ends.
 
-This build supports resource lists, search and details from a running core.
-CRUD operations and SSH/SFTP connections are still under development.
+This build supports resource management, proxy tests and forwarding through core.
+SSH/SFTP terminal connections are still under development.
 `,
 		InvalidArguments:       "Invalid arguments: {{.Argument}}. Use knot --help.",
 		TTYRequired:            "This entry requires terminal input and output. Run knot in an interactive terminal.",
@@ -69,8 +69,8 @@ CRUD operations and SSH/SFTP connections are still under development.
 退出码：远端 SSH 状态 0–255，本地失败 1，用法错误 2，主动取消 130。
 缺少 SSH 退出状态视为失败；管理 TUI 在 SSH 结束后继续运行。
 
-当前构建支持从运行中的 core 读取资源列表、搜索和详情。
-CRUD 操作和 SSH/SFTP 连接仍在开发中。
+当前构建支持真实 core 资源管理、代理测试和转发管理。
+SSH/SFTP 终端连接仍在开发中。
 `,
 		InvalidArguments:       "参数无效：{{.Argument}}。请使用 knot --help。",
 		TTYRequired:            "此入口需要终端输入和输出，请在交互式终端中运行 knot。",
@@ -84,6 +84,7 @@ CRUD 操作和 SSH/SFTP 连接仍在开发中。
 
 var compiled = func() map[Language]map[Key]*template.Template {
 	addUICatalogs()
+	addManagementCatalogs()
 	result := make(map[Language]map[Key]*template.Template, len(catalogs))
 	for language, catalog := range catalogs {
 		result[language] = make(map[Key]*template.Template, len(catalog))

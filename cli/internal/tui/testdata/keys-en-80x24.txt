@@ -2,7 +2,7 @@ Knot                                             cli 0.1.0-dev    core 0.1.0-dev
 ┌────┐ ┌───────────────────────────────────────────────────────────────────────┐
 │  S │ │ Keys                                                                  │
 │    │ │ [←/Esc] Menu  [↑↓] Select  [/] Search  [r] Refresh  [?] Help  [i]     │
-│> K │ │ Details  [n] New  [Delete] Delete                                     │
+│> K │ │ Details  [n] New  [Delete] Delete  [x] Clear material                 │
 │    │ │ ───────────────────────────────────────────────────────────────────── │
 │  P │ │ Search aliases                                                        │
 │    │ │ ┌───────────────────────────────────────────────────────────────────┐ │

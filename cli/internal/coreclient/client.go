@@ -1,6 +1,7 @@
 package coreclient
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -70,7 +71,9 @@ func New(base, token string) (*Client, error) {
 		MaxIdleConns: 16, IdleConnTimeout: 30 * time.Second,
 	}
 	return &Client{base: strings.TrimRight(base, "/"), token: token, http: &http.Client{
-		Transport: transport, Timeout: 8 * time.Second,
+		// Allow the default 15-second proxy probe and forward stop to finish.
+		// UI operations also carry their own bounded contexts.
+		Transport: transport, Timeout: 20 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}, nil
 }
@@ -81,12 +84,27 @@ func (c *Client) SameEndpoint(other *Client) bool {
 }
 
 func (c *Client) get(ctx context.Context, path string, dest any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+path, nil)
+	return c.request(ctx, http.MethodGet, path, nil, dest)
+}
+
+func (c *Client) request(ctx context.Context, method, path string, value, dest any) error {
+	var input []byte
+	if value != nil {
+		var err error
+		input, err = json.Marshal(value)
+		if err != nil {
+			return Failure("PROTOCOL_ERROR")
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, bytes.NewReader(input))
 	if err != nil {
 		return Failure("PROTOCOL_ERROR")
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Accept", "application/json")
+	if value != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	res, err := c.http.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -126,8 +144,10 @@ func (c *Client) get(ctx context.Context, path string, dest any) error {
 	if res.StatusCode < 200 || res.StatusCode >= 300 || len(envelope.Data) == 0 || string(envelope.Data) == "null" {
 		return Failure("PROTOCOL_ERROR")
 	}
-	if err := json.Unmarshal(envelope.Data, dest); err != nil {
-		return Failure("PROTOCOL_ERROR")
+	if dest != nil {
+		if err := json.Unmarshal(envelope.Data, dest); err != nil {
+			return Failure("PROTOCOL_ERROR")
+		}
 	}
 	return nil
 }

@@ -7,7 +7,7 @@ A modern SSH connection manager providing powerful automation capabilities throu
 This repository contains **knot-core**: a local capability service that provides SSH/SFTP functionality through a standardized HTTP/WebSocket API.
 
 knot-core is designed to be consumed by:
-- Terminal clients (CLI entry/i18n foundation implemented; TUI pages under development)
+- Terminal clients (bilingual resource management implemented; SSH/SFTP terminal flows under development)
 - Command-line scripts
 - AI agents and automation tools
 - Third-party applications
@@ -84,11 +84,12 @@ Current capabilities:
 - ✅ Local/remote/dynamic forwarding with temporary and server automatic rules
 - 🚧 Broadcast mode (planned)
 - 🚧 Configuration sync (planned)
-- 🚧 TUI interface (bilingual resource lists/search/details implemented; CRUD and connections under development)
+- 🚧 TUI interface (bilingual resource CRUD and forwarding management implemented; terminal connections under development)
 
 The independent [CLI module](cli/README.md) supports local help/version and a
-bilingual TUI with real core discovery, resource lists, search, details and
-offline recovery. Start knot-core manually; CRUD and SSH/SFTP remain in development.
+bilingual TUI with real core discovery, resource CRUD, proxy tests, sync credentials,
+forwarding management and offline recovery. Start knot-core manually; SSH/SFTP
+terminal flows remain in development.
 Root build/test/lint scripts process both modules. See the
 [workspace stage record](../docs/cli-tui-progress.md) for delivered scope and validation.
 

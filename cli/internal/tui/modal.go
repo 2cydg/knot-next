@@ -12,6 +12,7 @@ const (
 	EditForm         ModalKind = "form"
 	Draft            ModalKind = "draft"
 	Picker           ModalKind = "picker"
+	ActionConfirm    ModalKind = "action-confirm"
 )
 
 type Choice struct {
@@ -37,10 +38,15 @@ type Modal struct {
 	anchor     Focus
 	resourceID string
 	instanceID string
+	Busy       bool
+	OnKey      func(tea.KeyPressMsg) (bool, tea.Cmd)
+	OnChange   func()
+	Edit       *resourceDraft
+	Forwards   *forwardManager
 }
 
 func (m *Modal) exclusive() bool {
-	return m.Kind == HostTrust || m.Kind == TransferConfirm || m.Kind == SFTPCloseConfirm
+	return m.Kind == HostTrust || m.Kind == TransferConfirm || m.Kind == SFTPCloseConfirm || m.Kind == ActionConfirm
 }
 
 func (m *Model) OpenModal(modal *Modal) tea.Cmd {
@@ -125,6 +131,9 @@ func (m *Model) modalCurrent() bool {
 }
 
 func (m *Model) confirmModal(value string) tea.Cmd {
+	if m.modal.Busy {
+		return nil
+	}
 	if !m.modalCurrent() {
 		return m.notify(NoticeMsg{ID: "modal-error", Text: m.tr.ProtocolError("INSTANCE_CHANGED"), Error: true})
 	}
@@ -133,6 +142,9 @@ func (m *Model) confirmModal(value string) tea.Cmd {
 func (m *Model) modalKey(key tea.KeyPressMsg) tea.Cmd {
 	modal := m.modal
 	binding := key.String()
+	if modal.Busy {
+		return nil
+	}
 	// These confirmations consume every key, including help and Ctrl+c/s.
 	if modal.exclusive() {
 		if binding == "esc" {
@@ -161,6 +173,11 @@ func (m *Model) modalKey(key tea.KeyPressMsg) tea.Cmd {
 		if modal.Form.Busy {
 			return nil
 		}
+		if modal.OnKey != nil {
+			if handled, cmd := modal.OnKey(key); handled {
+				return cmd
+			}
+		}
 		switch binding {
 		case "esc":
 			if modal.Form.Dirty() {
@@ -171,17 +188,33 @@ func (m *Model) modalKey(key tea.KeyPressMsg) tea.Cmd {
 		case "ctrl+s":
 			return m.submitForm()
 		case "enter", "tab":
-			if modal.Form.Index == len(modal.Form.Fields)-1 {
+			if modal.Form.next(1) == -1 {
 				return m.submitForm()
 			}
-			return modal.Form.Focus(modal.Form.Index + 1)
+			return modal.Form.Focus(modal.Form.next(1))
 		case "shift+tab":
-			return modal.Form.Focus(modal.Form.Index - 1)
+			if index := modal.Form.next(-1); index >= 0 {
+				return modal.Form.Focus(index)
+			}
+			return nil
+		case "ctrl+left":
+			return modal.Form.switchSection(-1)
+		case "ctrl+right":
+			return modal.Form.switchSection(1)
 		}
-		return modal.Form.update(key)
+		cmd := modal.Form.update(key)
+		if modal.OnChange != nil {
+			modal.OnChange()
+		}
+		return cmd
 	}
 	if binding == "esc" {
 		return m.closeModal()
+	}
+	if modal.OnKey != nil {
+		if handled, cmd := modal.OnKey(key); handled {
+			return cmd
+		}
 	}
 	if modal.Kind == Picker {
 		size := modal.PageSize

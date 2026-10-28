@@ -160,10 +160,10 @@ func (m *Model) View() tea.View {
 }
 
 var primaryActions = map[entry.Page][]string{
-	entry.Servers: {"n", "e", "Delete", "c/Enter", "f"},
-	entry.Keys:    {"n", "Delete"},
+	entry.Servers: {"n", "e", "Delete", "c/Enter", "f", "t"},
+	entry.Keys:    {"n", "Delete", "x"},
 	entry.Proxies: {"n", "e", "Delete", "t"},
-	entry.Sync:    {"n", "e", "d", "p", "s"},
+	entry.Sync:    {"n", "e", "d", "p", "a", "s"},
 }
 
 func (m *Model) mainContent(width, height int) string {
@@ -179,7 +179,14 @@ func (m *Model) mainContent(width, height int) string {
 	}
 	if m.focus != SearchFocus && m.state == Ready {
 		for _, key := range primaryActions[m.page] {
-			hints += "  [" + key + "] " + m.tr.Message("ui.action."+key)
+			label := m.tr.Message("ui.action." + key)
+			if key == "t" && m.page == entry.Servers {
+				label = m.tr.Message("manage.forwards")
+			}
+			if key == "s" && m.page == entry.Sync {
+				label = m.tr.Message("manage.sync_password")
+			}
+			hints += "  [" + key + "] " + label
 		}
 	}
 	if m.page == entry.Sync && m.hasSnapshot && !m.snapshot.Config.Settings.SyncPasswordSet {
@@ -341,6 +348,17 @@ func (m *Model) modalHeader(inner int) string {
 				break
 			}
 		}
+		if len(modal.Form.Sections) > 0 {
+			hints += "  " + m.tr.Message("manage.tabs_hint")
+		}
+		for _, f := range modal.Form.Fields {
+			if f.Static {
+				continue
+			} else if len(f.Choices) > 0 {
+				hints += "  " + m.tr.Message("manage.choice_hint")
+				break
+			}
+		}
 	}
 	// Header and hints are reserved; only body scrolls/crops in small windows.
 	return wrap(Display(modal.Title), inner) + "\n" + lipgloss.NewStyle().Foreground(green).Render(wrap(hints, inner)) + "\n" + strings.Repeat("─", inner)
@@ -370,15 +388,36 @@ func (m *Model) modalView() string {
 	}
 	if modal.Form != nil {
 		form := modal.Form
+		if len(form.Sections) > 0 {
+			var tabs []string
+			for _, s := range form.Sections {
+				label := s.Label
+				if s.ID == form.Section {
+					label = "[" + label + "]"
+				}
+				tabs = append(tabs, label)
+			}
+			body = append(body, wrap(strings.Join(tabs, " · "), inner))
+		}
 		start := max(0, form.Index)
 		for i := start; i < len(form.Fields); i++ {
 			f := form.Fields[i]
+			if !form.visible(i) || (f.Section != "" && f.Section != form.Section) {
+				continue
+			}
 			label := f.Label
 			if f.Required {
 				label += " *"
 			}
-			body = append(body, Display(label))
-			if f.Multiline {
+			body = append(body, wrap(Display(label), inner))
+			if f.Static {
+				if f.Error != "" {
+					body = append(body, wrap(Display(f.Error), inner))
+				}
+				continue
+			} else if len(f.Choices) > 0 {
+				body = append(body, fit("‹ "+Display(f.choiceLabel())+" ›", inner))
+			} else if f.Multiline {
 				body = append(body, wrap(displayWidget(f.Area.View()), inner))
 			} else {
 				body = append(body, fit(displayWidget(f.Input.View()), inner))
@@ -403,6 +442,9 @@ func (m *Model) modalView() string {
 				marker = "> "
 			}
 			body = append(body, fit(fmt.Sprintf("%s%d %s", marker, i-start+1, Display(modal.Choices[i].Label)), inner))
+		}
+		if modal.Forwards != nil {
+			body = append(body, wrap(displayMultiline(m.forwardDetail(modal)), inner))
 		}
 	}
 	available := max(1, m.height-6-lipgloss.Height(header))

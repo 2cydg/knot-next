@@ -2,7 +2,7 @@ Knot                                                                            
 ┌─────────────────┐ ┌──────────────────────────────────────────────────────────────────────────────────────────────────┐
 │  S Servers      │ │ Sync services                                                                                    │
 │                 │ │ [←/Esc] Menu  [↑↓] Select  [/] Search  [r] Refresh  [?] Help  [i] Details  [n] New  [e] Edit     │
-│  K Keys         │ │ [d] Delete  [p] Credentials  [s] Set / clear default                                             │
+│  K Keys         │ │ [d] Delete  [p] Credentials  [a] Default  [s] Sync password                                      │
 │                 │ │ ──────────────────────────────────────────────────────────────────────────────────────────────── │
 │  P Proxies      │ │ Search aliases                                                                                   │
 │                 │ │ ┌──────────────────────────────────────────────────────────────────┐ ┌─────────────────────────┐ │

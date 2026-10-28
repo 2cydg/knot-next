@@ -17,6 +17,25 @@ type Field struct {
 	Input     textinput.Model
 	Area      textarea.Model
 	Error     string
+	Choices   []Choice
+	Section   string
+	When      func(map[string]string) bool
+	Static    bool
+}
+
+func ChoiceField(name, label, value string, choices ...Choice) Field {
+	f := TextField(name, label, value, false, false)
+	f.Choices = choices
+	return f
+}
+
+func (f Field) choiceLabel() string {
+	for _, c := range f.Choices {
+		if c.ID == f.Value() {
+			return c.Label
+		}
+	}
+	return f.Value()
 }
 
 func TextField(name, label, value string, required, secret bool) Field {
@@ -52,12 +71,46 @@ func (f *Field) blur() {
 	}
 }
 func (f *Field) focus() tea.Cmd {
+	if f.Static || len(f.Choices) > 0 {
+		return nil
+	}
 	if f.Multiline {
 		return f.Area.Focus()
 	}
 	return f.Input.Focus()
 }
 func (f *Field) update(msg tea.Msg) tea.Cmd {
+	if f.Static {
+		return nil
+	}
+	if len(f.Choices) > 0 {
+		if key, ok := msg.(tea.KeyPressMsg); ok {
+			delta := 0
+			switch key.String() {
+			case "left":
+				delta = -1
+			case "right", " ", "space":
+				delta = 1
+			}
+			if delta != 0 {
+				index := 0
+				for i, c := range f.Choices {
+					if c.ID == f.Value() {
+						index = i
+						break
+					}
+				}
+				for n := 0; n < len(f.Choices); n++ {
+					index = (index + delta + len(f.Choices)) % len(f.Choices)
+					if !f.Choices[index].Disabled {
+						f.Input.SetValue(f.Choices[index].ID)
+						break
+					}
+				}
+			}
+		}
+		return nil
+	}
 	var cmd tea.Cmd
 	if paste, ok := msg.(tea.PasteMsg); ok && f.Multiline {
 		f.Area.InsertString(paste.Content)
@@ -74,10 +127,12 @@ func (f *Field) update(msg tea.Msg) tea.Cmd {
 // Form owns widget focus and submission routing; widgets never decide whether
 // pasted multiline data, Enter or Tab is a business submission.
 type Form struct {
-	Fields  []Field
-	Index   int
-	Busy    bool
-	initial []string
+	Fields   []Field
+	Index    int
+	Busy     bool
+	initial  []string
+	Sections []Choice
+	Section  string
 }
 
 func NewForm(fields ...Field) *Form {
@@ -96,7 +151,43 @@ func (f *Form) Focus(index int) tea.Cmd {
 		f.Index = -1
 		return nil
 	}
+	if f.Fields[f.Index].Section != "" {
+		f.Section = f.Fields[f.Index].Section
+	}
 	return f.Fields[f.Index].focus()
+}
+
+func (f *Form) visible(index int) bool {
+	field := f.Fields[index]
+	return field.When == nil || field.When(f.Values())
+}
+
+func (f *Form) next(delta int) int {
+	for i := f.Index + delta; i >= 0 && i < len(f.Fields); i += delta {
+		if f.visible(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (f *Form) switchSection(delta int) tea.Cmd {
+	index := 0
+	for i, s := range f.Sections {
+		if s.ID == f.Section {
+			index = i
+		}
+	}
+	if len(f.Sections) == 0 {
+		return nil
+	}
+	f.Section = f.Sections[(index+delta+len(f.Sections))%len(f.Sections)].ID
+	for i, field := range f.Fields {
+		if field.Section == f.Section && f.visible(i) {
+			return f.Focus(i)
+		}
+	}
+	return nil
 }
 
 func (f *Form) update(msg tea.Msg) tea.Cmd {
@@ -106,6 +197,9 @@ func (f *Form) update(msg tea.Msg) tea.Cmd {
 	return f.Fields[f.Index].update(msg)
 }
 func (f *Form) Dirty() bool {
+	if len(f.Fields) != len(f.initial) {
+		return true
+	}
 	for i, field := range f.Fields {
 		if field.Value() != f.initial[i] {
 			return true
@@ -125,7 +219,7 @@ func (f *Form) Validate(requiredMessage string) tea.Cmd {
 	for i := range f.Fields {
 		field := &f.Fields[i]
 		field.Error = ""
-		if field.Required && strings.TrimSpace(field.Value()) == "" {
+		if f.visible(i) && field.Required && strings.TrimSpace(field.Value()) == "" {
 			field.Error = requiredMessage
 			if first == -1 {
 				first = i

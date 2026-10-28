@@ -3,14 +3,14 @@ Knot                                             cli 0.1.0-dev    core 0.1.0-dev
 │> S │ │ Servers                                                               │
 │    │ │ [←/Esc] Menu  [↑↓] Select  [/] Search  [r] Refresh  [?] Help  [i]     │
 │  K │ │ Details  [n] New  [e] Edit  [Delete] Delete  [c/Enter] SSH  [f] SFTP  │
-│    │ │ ───────────────────────────────────────────────────────────────────── │
-│  P │ │ Search aliases; / in the input searches tags                          │
-│    │ │ ┌───────────────────────────────────────────────────────────────────┐ │
-│  Y │ │ │  Alias                            Target                          │ │
+│    │ │ [t] Forwarding                                                        │
+│  P │ │ ───────────────────────────────────────────────────────────────────── │
+│    │ │ Search aliases; / in the input searches tags                          │
+│  Y │ │ ┌───────────────────────────────────────────────────────────────────┐ │
+│    │ │ │  Alias                            Target                          │ │
 │    │ │ │───────────────────────────────────────────────────────────────────│ │
 │    │ │ │> alpha                            root@other:22                   │ │
 │    │ │ │· 全角é very-long-user-alias       ops@db:22                       │ │
-│    │ │ │                                                                   │ │
 │    │ │ │                                                                   │ │
 │    │ │ │                                                                   │ │
 │    │ │ │                                                                   │ │
