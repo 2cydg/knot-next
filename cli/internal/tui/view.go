@@ -186,9 +186,14 @@ func (m *Model) View() tea.View {
 		}
 	}
 	if modal != nil {
-		modal := m.modalView()
-		mw, mh := lipgloss.Width(modal), lipgloss.Height(modal)
-		canvas.Compose(lipgloss.NewCompositor(lipgloss.NewLayer(modal).X(max(0, (w-mw)/2)).Y(max(3, (h-mh)/2))))
+		content := m.modalView()
+		mw, mh := lipgloss.Width(content), lipgloss.Height(content)
+		y := max(3, (h-mh)/2)
+		if modal.Form != nil {
+			// Keep form titles and tabs anchored while their content grows or shrinks.
+			y = 3
+		}
+		canvas.Compose(lipgloss.NewCompositor(lipgloss.NewLayer(content).X(max(0, (w-mw)/2)).Y(y)))
 	}
 	v := tea.NewView(canvas.Render())
 	v.AltScreen = true

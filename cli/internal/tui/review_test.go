@@ -202,3 +202,37 @@ func TestResourceEditorTitlesNameResourceInBothLanguages(t *testing.T) {
 		}
 	}
 }
+
+func TestServerFormStaysAnchoredAcrossTabsAndWindowSizes(t *testing.T) {
+	for _, language := range []i18n.Language{i18n.English, i18n.Chinese} {
+		for _, create := range []bool{true, false} {
+			m := testModel(t, "servers")
+			m.tr = i18n.New(language)
+			m.showEditor(resourceDraft{Kind: coreclient.Servers, Create: create, Server: coreclient.ServerWrite{Alias: "example", Host: "example.com", Port: 22, User: "ops", AuthMethod: "password"}})
+			for _, size := range [][2]int{{120, 35}, {80, 24}, {120, 35}} {
+				m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+				titleLine := func() int {
+					view := ansi.Strip(m.View().Content)
+					checkSize(t, view, size)
+					at := strings.Index(view, m.modal.Title)
+					if at < 0 {
+						t.Fatal("form title is missing", view)
+					}
+					return strings.Count(view[:at], "\n")
+				}
+				initialLine := titleLine()
+				heights := map[int]bool{}
+				for range m.modal.Form.Sections {
+					heights[strings.Count(m.modalView(), "\n")] = true
+					m.Update(press("]"))
+					if titleLine() != initialLine {
+						t.Fatal("switching tabs moved the form title")
+					}
+				}
+				if len(heights) < 2 {
+					t.Fatal("form height should still adapt to each tab's content")
+				}
+			}
+		}
+	}
+}
