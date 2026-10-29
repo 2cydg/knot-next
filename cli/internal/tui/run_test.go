@@ -74,6 +74,21 @@ func TestAliasRunCancellationReleasesHTTPRequest(t *testing.T) {
 		close(requestDone)
 	}))
 	defer server.Close()
+	setRunRuntime(t, server)
+	launch, _ := entry.Parse([]string{"ssh", "alias"})
+	var diagnostics bytes.Buffer
+	if code := Run(ctx, launch, i18n.New(i18n.English), nil, io.Discard, &diagnostics); code != entry.ExitCanceled || diagnostics.Len() != 0 {
+		t.Fatal("alias cancellation reported failure", code, diagnostics.String())
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("canceled alias retained HTTP request")
+	}
+}
+
+func setRunRuntime(t *testing.T, server *httptest.Server) {
+	t.Helper()
 	dir := t.TempDir()
 	token := filepath.Join(dir, "token")
 	path := filepath.Join(dir, "core.json")
@@ -87,14 +102,4 @@ func TestAliasRunCancellationReleasesHTTPRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("KNOT_RUNTIME_FILE", path)
-	launch, _ := entry.Parse([]string{"ssh", "alias"})
-	var diagnostics bytes.Buffer
-	if code := Run(ctx, launch, i18n.New(i18n.English), nil, io.Discard, &diagnostics); code != entry.ExitCanceled || diagnostics.Len() != 0 {
-		t.Fatal("alias cancellation reported failure", code, diagnostics.String())
-	}
-	select {
-	case <-requestDone:
-	case <-time.After(3 * time.Second):
-		t.Fatal("canceled alias retained HTTP request")
-	}
 }

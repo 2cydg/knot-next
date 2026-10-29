@@ -12,12 +12,16 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"knot-cli/internal/coreclient"
+	"knot-cli/internal/directssh"
 	"knot-cli/internal/entry"
 	"knot-cli/internal/i18n"
 	"knot-cli/internal/terminal"
 )
 
 func Run(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, input io.Reader, output, diagnostics io.Writer) int {
+	if launch.Mode() == entry.AliasDirect {
+		return directssh.Run(ctx, launch.ServerRef(), tr, input, output, diagnostics)
+	}
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if ctx.Err() != nil {

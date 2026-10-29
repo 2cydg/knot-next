@@ -2,6 +2,10 @@ package i18n
 
 func addSSHCatalogs() {
 	entries := map[Key][2]string{
+		"ssh.direct_connecting":              {"Connecting to {{.Alias}}…", "正在连接 {{.Alias}}…"},
+		"ssh.host_unknown":                   {"The authenticity of host '{{.Host}}' ({{.Alias}}) cannot be established.\n{{.KeyType}} key fingerprint is {{.Fingerprint}}.", "无法确认主机 '{{.Host}}'（{{.Alias}}）的真实性。\n{{.KeyType}} 密钥指纹为 {{.Fingerprint}}。"},
+		"ssh.host_changed":                   {"WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\nHost: {{.Host}} ({{.Alias}})\n{{.KeyType}} key fingerprint is {{.Fingerprint}}.\nVerify the new fingerprint before accepting it.", "警告：远程主机的身份标识已发生变化！\n主机：{{.Host}}（{{.Alias}}）\n{{.KeyType}} 密钥指纹为 {{.Fingerprint}}。\n请核对新指纹后再接受。"},
+		"ssh.host_confirm":                   {"Are you sure you want to continue connecting (yes/no)? ", "是否继续连接（yes/no）？ "},
 		"ssh.connecting":                     {"Connecting to SSH… [Esc] Cancel", "正在连接 SSH… [Esc] 取消"},
 		"ssh.cancel_hint":                    {"[Esc] Cancel", "[Esc] 取消"},
 		"ssh.trust":                          {"Trust host key", "信任主机密钥"},
@@ -9,13 +13,14 @@ func addSSHCatalogs() {
 		"ssh.password":                       {"Password", "密码"},
 		"ssh.passphrase":                     {"Private key passphrase (this attempt only)", "私钥口令（仅本次连接）"},
 		"ssh.key":                            {"Private key", "私钥"},
-		"ssh.remember":                       {"Remember successful credentials", "记住验证成功的凭据"},
 		"ssh.canceled":                       {"SSH connection canceled.", "SSH 连接已取消。"},
 		"ssh.ended":                          {"SSH session ended.", "SSH 会话已结束。"},
 		"ssh.exit":                           {"SSH exited with status {{.Code}}.", "SSH 已退出，状态码 {{.Code}}。"},
 		"ssh.detached":                       {"Terminal disconnected; SSH session {{.ID}} remains available through core.", "终端连接中断；SSH 会话 {{.ID}} 保留在 core 中。"},
 		"ssh.truncated":                      {"Some terminal output was not retained or could not be delivered.", "部分终端输出未被保留或未能完整送达。"},
 		"error.CONNECTION_FAILED":            {"SSH connection failed.", "SSH 连接失败。"},
+		"error.AUTHENTICATION_FAILED":        {"SSH authentication failed.", "SSH 认证失败。"},
+		"error.HOST_KEY_VERIFICATION_FAILED": {"Host key verification failed.", "主机密钥验证失败。"},
 		"error.AUTH_CHALLENGE_EXPIRED":       {"Authentication confirmation expired; reconnect.", "认证确认已超时，请重新连接。"},
 		"error.CHALLENGE_ABORTED":            {"SSH confirmation was canceled or the connection closed.", "SSH 确认已取消或连接已关闭。"},
 		"error.agent_forwarding_unavailable": {"SSH Agent forwarding is unavailable. Start an Agent with a loaded key, then reconnect.", "SSH Agent 转发不可用。请启动 Agent 并加载密钥后重新连接。"},

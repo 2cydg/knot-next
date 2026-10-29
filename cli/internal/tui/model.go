@@ -96,6 +96,7 @@ type Model struct {
 	snapshot          coreclient.Snapshot
 	lastError         error
 	modal             *Modal
+	exitConfirm       *Modal
 	modalSequence     uint64
 	notices           []Notice
 	noticeRevision    uint64
@@ -293,6 +294,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 	case aliasFinishedMsg:
+		if m.exitConfirm != nil {
+			return m, tea.Tick(300*time.Millisecond, func(time.Time) tea.Msg { return aliasFinishedMsg{} })
+		}
 		return m, tea.Quit
 	case editorResult:
 		if m.modal == nil || m.modal.ID != msg.ModalID || msg.Instance != m.snapshot.Runtime.InstanceID {
@@ -479,9 +483,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case tea.KeyPressMsg:
+		if m.exitConfirm != nil {
+			return m, m.exitKey(msg)
+		}
 		if msg.String() == "ctrl+c" && (m.modal == nil || !m.modal.exclusive()) {
-			m.exitCode = entry.ExitCanceled
-			return m, tea.Quit
+			return m, m.openExitConfirm()
 		}
 		if m.modal != nil {
 			return m, m.modalKey(msg)
@@ -516,6 +522,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.key(msg)
 	case tea.PasteMsg:
+		if m.exitConfirm != nil {
+			return m, nil
+		}
 		if m.modal != nil {
 			if m.modal.Form != nil && !m.modal.Form.Busy {
 				cmd := m.modal.Form.update(msg)
@@ -565,6 +574,8 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 			}
 		}
 		switch binding {
+		case "esc":
+			return m.openExitConfirm()
 		case "down":
 			index = (index + 1) % len(pages)
 		case "up":
@@ -701,11 +712,7 @@ func (m *Model) rows() []row {
 func (m *Model) openDetail() tea.Cmd {
 	for _, r := range m.rows() {
 		if r.ID == m.selectedID {
-			var lines []string
-			for _, d := range r.Details {
-				lines = append(lines, m.tr.Message("ui."+d[0])+": "+d[1])
-			}
-			return m.OpenModal(&Modal{Kind: Information, Title: m.tr.Message("ui.detail") + " · " + r.Alias, Body: strings.Join(lines, "\n")})
+			return m.OpenModal(&Modal{Kind: Information, Title: m.tr.Message("ui.detail") + " · " + r.Alias, Details: r.Details})
 		}
 	}
 	return nil

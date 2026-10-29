@@ -44,6 +44,7 @@ type Challenge struct {
 	Host               string    `json:"host"`
 	KeyType            string    `json:"key_type"`
 	Fingerprint        string    `json:"fingerprint"`
+	Risk               string    `json:"risk"`
 	ServerAlias        string    `json:"server_alias"`
 	FailedMethod       string    `json:"failed_method"`
 	AllowedMethods     []string  `json:"allowed_methods"`

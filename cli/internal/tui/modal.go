@@ -1,6 +1,10 @@
 package tui
 
-import tea "charm.land/bubbletea/v2"
+import (
+	tea "charm.land/bubbletea/v2"
+
+	"knot-cli/internal/entry"
+)
 
 type ModalKind string
 
@@ -13,6 +17,7 @@ const (
 	Draft            ModalKind = "draft"
 	Picker           ModalKind = "picker"
 	ActionConfirm    ModalKind = "action-confirm"
+	ExitConfirm      ModalKind = "exit-confirm"
 )
 
 type Choice struct {
@@ -20,12 +25,40 @@ type Choice struct {
 	Label    string
 	Disabled bool
 }
+
+// Keep the underlying modal owned by its operation while exit is pending, so
+// background completions still reach it and declining exit preserves the draft.
+func (m *Model) openExitConfirm() tea.Cmd {
+	m.exitConfirm = &Modal{Kind: ExitConfirm, Title: m.tr.Message("ui.exit"), Body: m.tr.Message("ui.exit_prompt"), Index: 1}
+	return nil
+}
+
+func (m *Model) exitKey(key tea.KeyPressMsg) tea.Cmd {
+	switch key.String() {
+	case "ctrl+c", "y", "Y":
+		m.exitCode = entry.ExitCanceled
+		return tea.Quit
+	case "esc", "n", "N":
+		m.exitConfirm = nil
+	case "left", "right", "up", "down", "tab", "shift+tab":
+		m.exitConfirm.Index = 1 - m.exitConfirm.Index
+	case "enter":
+		if m.exitConfirm.Index == 0 {
+			m.exitCode = entry.ExitCanceled
+			return tea.Quit
+		}
+		m.exitConfirm = nil
+	}
+	return nil
+}
+
 type Modal struct {
 	ID         uint64
 	Scroll     int
 	Kind       ModalKind
 	Title      string
 	Body       string
+	Details    [][2]string
 	Form       *Form
 	Choices    []Choice
 	Index      int
@@ -197,10 +230,23 @@ func (m *Model) modalKey(key tea.KeyPressMsg) tea.Cmd {
 				return modal.Form.Focus(index)
 			}
 			return nil
-		case "ctrl+left":
-			return modal.Form.switchSection(-1)
-		case "ctrl+right":
-			return modal.Form.switchSection(1)
+		case "up", "down":
+			delta := -1
+			if binding == "down" {
+				delta = 1
+			}
+			if index := modal.Form.next(delta); index >= 0 {
+				return modal.Form.Focus(index)
+			}
+			return nil
+		case "[", "]":
+			if len(modal.Form.Sections) > 0 {
+				delta := -1
+				if binding == "]" {
+					delta = 1
+				}
+				return modal.Form.switchSection(delta)
+			}
 		}
 		cmd := modal.Form.update(key)
 		if modal.OnChange != nil {

@@ -124,6 +124,9 @@ func (m *Model) handleSSH(msg sshResult) tea.Cmd {
 		return tea.Batch(m.openSSHChallenge(*r.Challenge), sshPoll(current.Attempt, current.Revision))
 	}
 	if current.Session.Ready() {
+		if m.exitConfirm != nil {
+			return sshPoll(current.Attempt, current.Revision)
+		}
 		m.handoff = current
 		m.removeNotice("ssh")
 		return tea.Quit
@@ -222,7 +225,6 @@ func (m *Model) openSSHChallenge(c coreclient.Challenge) tea.Cmd {
 		conditional(m.text("password", "ssh.password", "", true, true), "method", "password"),
 		conditional(m.choice("key_id", "ssh.key", keyID, keys...), "method", "key"),
 		conditional(m.text("passphrase", "ssh.passphrase", "", c.PassphraseRequired, true), "method", "key"),
-		m.boolField("remember", "ssh.remember", false),
 	)
 	modal.OnKey = func(key tea.KeyPressMsg) (bool, tea.Cmd) {
 		if key.String() == "esc" {
@@ -231,7 +233,7 @@ func (m *Model) openSSHChallenge(c coreclient.Challenge) tea.Cmd {
 		return false, nil
 	}
 	modal.OnSubmit = func(values map[string]string) tea.Cmd {
-		answer := coreclient.ChallengeAnswer{ChallengeID: c.ID, Remember: values["remember"] == "true"}
+		answer := coreclient.ChallengeAnswer{ChallengeID: c.ID, Remember: true}
 		switch values["method"] {
 		case "password":
 			answer.Password = values["password"]

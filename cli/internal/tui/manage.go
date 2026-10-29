@@ -97,7 +97,7 @@ func (m *Model) openEditor(kind coreclient.Resource, create, credentials bool, s
 		if err != nil {
 			return m.notify(NoticeMsg{ID: "edit", Text: m.tr.ProtocolError(coreclient.Code(err)), Error: true})
 		}
-		d.Server = coreclient.ServerWrite{ID: d.ID, Port: 22, AuthMethod: "agent"}
+		d.Server = coreclient.ServerWrite{ID: d.ID, Port: 22, AuthMethod: "password"}
 		d.Proxy = coreclient.ProxyWrite{ID: d.ID, Type: "socks5", Port: 1080}
 		d.Provider = coreclient.ProviderWrite{ID: d.ID, Type: "webdav", Key: "config.toml.enc"}
 		return m.showEditor(d)
@@ -184,7 +184,7 @@ func (m *Model) showEditor(d resourceDraft) tea.Cmd {
 	switch d.Kind {
 	case coreclient.Servers:
 		if d.CredentialsOnly {
-			fields = m.passwordFields()
+			fields = []Field{m.text("password", "manage.password_keep", "", false, true)}
 			break
 		}
 		s := d.Server
@@ -194,9 +194,7 @@ func (m *Model) showEditor(d resourceDraft) tea.Cmd {
 			keys = append(keys, Choice{ID: key.ID, Label: key.Alias})
 		}
 		fields = append(fields, conditional(m.choice("key_id", "ui.auth.key", s.KeyID, keys...), "auth_method", "key"))
-		for _, f := range m.passwordFields() {
-			fields = append(fields, conditional(f, "auth_method", "password"))
-		}
+		fields = append(fields, conditional(m.text("password", "manage.password_keep", "", false, true), "auth_method", "password"))
 		fields = append(fields, m.text("tags", "manage.tags", strings.Join(s.Tags, ", "), false, false))
 		fields = section("basic", fields...)
 		proxies := []Choice{{ID: "", Label: m.tr.Message("ui.none")}}

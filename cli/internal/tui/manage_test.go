@@ -378,7 +378,7 @@ func TestForwardManagerUsesActualConnectionAndSeparatesDefinitions(t *testing.T)
 	if !strings.Contains(m.forwardDetail(modal), "could not start") {
 		t.Fatal("real forwarding failure hidden")
 	}
-	m.Update(press("tab"))
+	m.Update(press("]"))
 	if !modal.Forwards.Saved {
 		t.Fatal("saved/running tab did not switch")
 	}

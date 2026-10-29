@@ -79,8 +79,8 @@ func Run(ctx context.Context, client *coreclient.Client, instance, id string, in
 			result.Err = coreclient.Failure("TERMINAL_FAILED")
 		}
 	}()
-	// This release's fixed clear-on-connect default applies after the TUI has
-	// relinquished ownership, before any remote bytes are written.
+	// This release's fixed clear-on-connect default applies after the console
+	// prompt or TUI has relinquished input, before remote bytes are written.
 	if _, err := io.WriteString(output, "\x1b[2J\x1b[H"); err != nil {
 		return Result{Err: err}
 	}

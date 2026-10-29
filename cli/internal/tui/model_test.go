@@ -332,8 +332,12 @@ func checkSize(t *testing.T, view string, size [2]int) {
 func TestCancelAndUnavailableStates(t *testing.T) {
 	m := testModel(t, "servers")
 	_, cmd := m.Update(press("ctrl+c"))
+	if cmd != nil || m.exitConfirm == nil {
+		t.Fatal("exit confirmation missing")
+	}
+	_, cmd = m.Update(press("ctrl+c"))
 	if cmd == nil || m.exitCode != entry.ExitCanceled {
-		t.Fatal("cancel exit policy")
+		t.Fatal("confirmed cancel exit policy")
 	}
 	for _, tc := range []struct {
 		code  string

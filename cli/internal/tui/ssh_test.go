@@ -2,6 +2,9 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -12,6 +15,97 @@ import (
 	"knot-cli/internal/i18n"
 	"knot-cli/internal/terminal"
 )
+
+func TestSSHAuthAlwaysRemembersSuccessfulCredentials(t *testing.T) {
+	for _, method := range []string{"password", "key", "agent"} {
+		t.Run(method, func(t *testing.T) {
+			answers := make(chan coreclient.ChallengeAnswer, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/v1/runtime":
+					_, _ = w.Write([]byte(`{"data":{"instance_id":"instance-a"}}`))
+				case "/v1/sessions":
+					_, _ = w.Write([]byte(`{"data":{"id":"session-a","state":"auth_pending"}}`))
+				case "/v1/sessions/session-a/challenges/auth":
+					var answer coreclient.ChallengeAnswer
+					if err := json.NewDecoder(r.Body).Decode(&answer); err != nil {
+						t.Error(err)
+					}
+					answers <- answer
+					_, _ = w.Write([]byte(`{"data":{}}`))
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			m := testModel(t, "servers")
+			client, err := coreclient.New(server.URL, "token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.snapshot.Client.Close()
+			m.snapshot.Client = client
+			attempt := connection.New(m.ctx, client, "instance-a")
+			defer attempt.Finish()
+			started := attempt.Start(coreclient.SessionRequest{ServerRef: "opaque-a"})
+			if started.Err != nil {
+				t.Fatal(started.Err)
+			}
+			m.ssh = &sshAttempt{Attempt: attempt, Session: started.Session}
+			// Avoid a cleanup DELETE after the HTTP fixture has closed.
+			defer func() { m.ssh = nil }()
+			m.snapshot.Config.Keys[0].PrivateKeySet = true
+			challenge := coreclient.Challenge{ID: "displayed-auth", Type: "auth", AllowedMethods: []string{method}, ServerAlias: "alpha"}
+			m.ssh.Challenge = &challenge
+			m.openSSHChallenge(challenge)
+			if _, exists := m.modal.Form.Values()["remember"]; exists {
+				t.Fatal("remember credentials control is still present")
+			}
+			setField(m.modal.Form, "password", "secret")
+			setField(m.modal.Form, "passphrase", "temporary")
+			cmd := m.submitForm()
+			if cmd == nil {
+				t.Fatal("authentication did not submit")
+			}
+			result, ok := cmd().(sshResult)
+			if !ok || result.Result.Err != nil {
+				t.Fatal("authentication request failed", result.Result.Err)
+			}
+			select {
+			case answer := <-answers:
+				if !answer.Remember || answer.ChallengeID != challenge.ID {
+					t.Fatal("authentication did not remember the displayed challenge", answer)
+				}
+				if method == "password" && (answer.Password != "secret" || answer.Passphrase != "" || answer.KeyID != "") {
+					t.Fatal("password answer sent unrelated key credentials")
+				}
+				if method == "key" && (answer.KeyID != "key" || answer.Passphrase != "temporary" || answer.Password != "") {
+					t.Fatal("key answer sent incorrect credentials")
+				}
+				if method == "agent" && (answer.Password != "" || answer.KeyID != "" || answer.Passphrase != "") {
+					t.Fatal("Agent answer sent unrelated secrets")
+				}
+			default:
+				t.Fatal("no authentication request received")
+			}
+		})
+	}
+}
+
+func TestSSHWaitsForExitDecisionBeforeHandoff(t *testing.T) {
+	m, attempt := sshModel(t)
+	m.Update(press("ctrl+c"))
+	result := sshResult{Attempt: attempt, Result: connection.Result{Session: coreclient.Session{ID: "opaque", State: "connected"}}}
+	if cmd := m.handleSSH(result); cmd == nil || m.handoff != nil || m.exitConfirm == nil {
+		t.Fatal("SSH bypassed the pending exit decision")
+	}
+	m.Update(press("esc"))
+	m.handleSSH(result)
+	if m.handoff == nil {
+		t.Fatal("declining exit did not allow SSH handoff")
+	}
+}
 
 func sshModel(t *testing.T) (*Model, *connection.Attempt) {
 	t.Helper()

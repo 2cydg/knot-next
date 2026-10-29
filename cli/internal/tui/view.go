@@ -98,6 +98,10 @@ func (m *Model) View() tea.View {
 		return v
 	}
 	w, h := m.width, m.height
+	modal := m.modal
+	if m.exitConfirm != nil {
+		modal = m.exitConfirm
+	}
 	versions := "cli " + Display(buildinfo.Version) + "    core " + m.tr.Message("ui.unknown")
 	if m.hasSnapshot {
 		versions = "cli " + Display(buildinfo.Version) + "    core " + Display(m.snapshot.Version.Version)
@@ -118,14 +122,14 @@ func (m *Model) View() tea.View {
 		style := lipgloss.NewStyle().Foreground(muted)
 		if p == m.page {
 			style = style.Foreground(green)
-			if m.focus == MenuFocus && m.modal == nil {
+			if m.focus == MenuFocus && modal == nil {
 				style = style.Background(selected)
 			}
 		}
 		menu = append(menu, style.Render(value))
 	}
-	sidebar := box(strings.Join(menu, "\n\n"), m.sidebarWidth(), h-2, m.focus == MenuFocus && m.modal == nil)
-	main := box(lipgloss.NewStyle().Padding(0, 1).Render(m.mainContent(m.mainWidth()-4, h-4)), m.mainWidth(), h-2, m.focus != MenuFocus && m.modal == nil)
+	sidebar := box(strings.Join(menu, "\n\n"), m.sidebarWidth(), h-2, m.focus == MenuFocus && modal == nil)
+	main := box(lipgloss.NewStyle().Padding(0, 1).Render(m.mainContent(m.mainWidth()-4, h-4)), m.mainWidth(), h-2, m.focus != MenuFocus && modal == nil)
 	base := top + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, sidebar, " ", main)
 	if m.launch.Mode() == entry.AliasDirect {
 		message := m.directMessage
@@ -140,7 +144,7 @@ func (m *Model) View() tea.View {
 	if len(m.notices) > 0 {
 		nw := min(38, w-4)
 		available := min(h-3, 9)
-		if m.modal != nil {
+		if modal != nil {
 			available = 1
 		}
 		var parts []string
@@ -151,11 +155,11 @@ func (m *Model) View() tea.View {
 				color = red
 			}
 			content := wrap(Display(n.Text), nw-4)
-			if m.modal != nil {
+			if modal != nil {
 				content = ansi.Truncate(strings.ReplaceAll(content, "\n", " "), nw-4, "…")
 			}
 			part := lipgloss.NewStyle().Foreground(color).Background(background).Border(lipgloss.NormalBorder()).BorderForeground(color).Width(nw).MaxHeight(available).Render(content)
-			if m.modal != nil {
+			if modal != nil {
 				part = lipgloss.NewStyle().Foreground(color).Background(background).Render(fit(content, nw))
 			}
 			if lipgloss.Height(strings.Join(append(parts, part), "\n")) > available {
@@ -167,7 +171,7 @@ func (m *Model) View() tea.View {
 			canvas.Compose(lipgloss.NewCompositor(lipgloss.NewLayer(strings.Join(parts, "\n")).X(w - nw - 1).Y(1)))
 		}
 	}
-	if m.modal != nil {
+	if modal != nil {
 		modal := m.modalView()
 		mw, mh := lipgloss.Width(modal), lipgloss.Height(modal)
 		canvas.Compose(lipgloss.NewCompositor(lipgloss.NewLayer(modal).X(max(0, (w-mw)/2)).Y(max(3, (h-mh)/2))))
@@ -252,14 +256,12 @@ func (m *Model) mainContent(width, height int) string {
 		var detail []string
 		for _, r := range rows {
 			if r.ID == m.selectedID {
-				detail = append(detail, m.tr.Message("ui.detail"), Display(r.Alias))
-				for _, d := range r.Details {
-					detail = append(detail, m.tr.Message("ui."+d[0]), wrap(Display(d[1]), detailWidth-4))
-				}
+				contentWidth := detailWidth - 4
+				detail = append(detail, lipgloss.NewStyle().Foreground(muted).Render(m.tr.Message("ui.detail")), lipgloss.NewStyle().Foreground(green).Bold(true).Render(wrap(Display(r.Alias), contentWidth)), "", m.detailFields(r.Details, contentWidth))
 				break
 			}
 		}
-		table = lipgloss.JoinHorizontal(lipgloss.Top, table, " ", box(strings.Join(detail, "\n"), detailWidth, max(3, remaining), false))
+		table = lipgloss.JoinHorizontal(lipgloss.Top, table, " ", box(lipgloss.NewStyle().Padding(0, 1).Render(strings.Join(detail, "\n")), detailWidth, max(3, remaining), false))
 	}
 	return head + table
 }
@@ -317,9 +319,32 @@ func (m *Model) table(rows []row, width, height int) string {
 	}
 	return box(strings.Join(lines, "\n"), width, height, false)
 }
-func (m *Model) modalHeader(inner int) string {
-	modal := m.modal
+func (m *Model) detailFields(details [][2]string, width int) string {
+	var blocks []string
+	for _, d := range details {
+		label := lipgloss.NewStyle().Foreground(muted).Render(wrap(m.tr.Message("ui."+d[0]), width))
+		value := lipgloss.NewStyle().Foreground(text).Render(wrap(Display(d[1]), width-2))
+		blocks = append(blocks, label+"\n"+lipgloss.NewStyle().PaddingLeft(2).Render(value))
+	}
+	return strings.Join(blocks, "\n\n")
+}
+
+func (m *Model) modalBody(modal *Modal, width int) string {
+	var parts []string
+	if modal.Body != "" {
+		parts = append(parts, wrap(displayMultiline(modal.Body), width))
+	}
+	if len(modal.Details) > 0 {
+		parts = append(parts, m.detailFields(modal.Details, width))
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func (m *Model) modalHeader(modal *Modal, inner int) string {
 	hints := m.tr.Message("ui.close_hints")
+	if modal.Kind == ExitConfirm {
+		hints = m.tr.Message("ui.exit_hints")
+	}
 	if modal.exclusive() {
 		hints = m.tr.Message("ui.confirm_hints")
 		switch modal.Kind {
@@ -360,9 +385,9 @@ func (m *Model) modalHeader(inner int) string {
 
 func (m *Model) informationScrollLimit() int {
 	inner := max(1, min(78, m.width-4)-4)
-	header := m.modalHeader(inner)
+	header := m.modalHeader(m.modal, inner)
 	available := max(1, m.height-6-lipgloss.Height(header))
-	return max(0, lipgloss.Height(wrap(displayMultiline(m.modal.Body), inner))-available)
+	return max(0, lipgloss.Height(m.modalBody(m.modal, inner))-available)
 }
 
 func (m *Model) clampModalScroll() {
@@ -373,12 +398,26 @@ func (m *Model) clampModalScroll() {
 
 func (m *Model) modalView() string {
 	modal := m.modal
+	if m.exitConfirm != nil {
+		modal = m.exitConfirm
+	}
 	width := min(78, m.width-4)
 	inner := max(1, width-4)
-	header := m.modalHeader(inner)
+	header := m.modalHeader(modal, inner)
 	var body []string
-	if modal.Body != "" {
-		body = append(body, wrap(displayMultiline(modal.Body), inner))
+	if content := m.modalBody(modal, inner); content != "" {
+		body = append(body, content)
+	}
+	if modal.Kind == ExitConfirm {
+		var choices []string
+		for i, key := range []string{"ui.yes", "ui.no"} {
+			style := lipgloss.NewStyle().Foreground(muted).Padding(0, 1)
+			if i == modal.Index {
+				style = style.Foreground(green).Background(selected).Bold(true)
+			}
+			choices = append(choices, style.Render(m.tr.Message(key)))
+		}
+		body = append(body, "", strings.Join(choices, "  "))
 	}
 	if modal.Form != nil {
 		form := modal.Form

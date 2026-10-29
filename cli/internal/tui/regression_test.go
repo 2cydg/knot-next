@@ -83,7 +83,7 @@ func TestReenteringTUIRearmsRetainedNotificationTimers(t *testing.T) {
 	}
 }
 
-func TestCtrlCExitsSearchAndNonexclusiveModals(t *testing.T) {
+func TestCtrlCConfirmsExitFromSearchAndNonexclusiveModals(t *testing.T) {
 	for _, kind := range []ModalKind{"", Information, EditForm, Picker, Draft} {
 		t.Run(string(kind), func(t *testing.T) {
 			m := testModel(t, "servers")
@@ -92,12 +92,22 @@ func TestCtrlCExitsSearchAndNonexclusiveModals(t *testing.T) {
 			} else {
 				m.OpenModal(&Modal{Kind: kind})
 			}
+			prior, focus := m.modal, m.focus
 			_, cmd := m.Update(press("ctrl+c"))
+			if cmd != nil || m.exitConfirm == nil || m.exitConfirm.Index != 1 || m.modal != prior {
+				t.Fatal("Ctrl+c did not open confirmation with No selected")
+			}
+			m.Update(press("enter"))
+			if m.exitConfirm != nil || m.modal != prior || m.focus != focus {
+				t.Fatal("declining exit lost the previous view")
+			}
+			m.Update(press("ctrl+c"))
+			_, cmd = m.Update(press("ctrl+c"))
 			if cmd == nil || m.exitCode != entry.ExitCanceled {
-				t.Fatal("Ctrl+c was swallowed")
+				t.Fatal("Ctrl+c did not confirm exit")
 			}
 			if _, ok := cmd().(tea.QuitMsg); !ok {
-				t.Fatal("Ctrl+c did not quit")
+				t.Fatal("confirmed exit did not quit")
 			}
 		})
 	}

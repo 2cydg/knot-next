@@ -118,7 +118,7 @@ func (m *Model) forwardChoices(modal *Modal) {
 func (m *Model) forwardKey(modal *Modal, k tea.KeyPressMsg) (bool, tea.Cmd) {
 	f := modal.Forwards
 	switch k.String() {
-	case "tab":
+	case "[", "]":
 		f.Saved = !f.Saved
 		modal.Index = 0
 		modal.PickerPage = 0
