@@ -71,6 +71,17 @@ func fit(value string, width int) string {
 	return value + strings.Repeat(" ", max(0, width-ansi.StringWidth(value)))
 }
 func wrap(value string, width int) string { return ansi.Wrap(value, max(1, width), "") }
+
+// Catalog hints use "key description" pairs separated by two spaces.
+// Style each pair before wrapping so key and description keep distinct colors.
+func renderHints(value string, width int) string {
+	var parts []string
+	for _, hint := range strings.Split(value, "  ") {
+		key, description, _ := strings.Cut(hint, " ")
+		parts = append(parts, lipgloss.NewStyle().Foreground(green).Render(key)+" "+lipgloss.NewStyle().Foreground(muted).Render(description))
+	}
+	return wrap(strings.Join(parts, "  "), width)
+}
 func box(content string, width, height int, focus bool) string {
 	color := line
 	if focus {
@@ -109,7 +120,7 @@ func (m *Model) View() tea.View {
 	versions = ansi.Truncate(versions, max(1, w-7), "…")
 	top := lipgloss.NewStyle().Foreground(green).Render("Knot") + strings.Repeat(" ", max(1, w-4-ansi.StringWidth(versions))) + lipgloss.NewStyle().Foreground(muted).Render(versions)
 	var menu []string
-	icons := []string{"🖥️", "🔑", "🔀", "🔄"}
+	icons := []string{"🖥️", "🔑", "🔀", "🔄", "⚙️"}
 	for i, p := range pages {
 		value := "  " + icons[i]
 		if p == m.page {
@@ -136,7 +147,7 @@ func (m *Model) View() tea.View {
 		if message == "" {
 			message = m.tr.Message("ui.loading")
 		}
-		base = top + "\n\n" + wrap(Display(m.launch.ServerRef())+"\n"+message+"\n"+m.tr.Message("ssh.cancel_hint"), w)
+		base = top + "\n\n" + wrap(Display(m.launch.ServerRef())+"\n"+message, w) + "\n" + renderHints(m.tr.Message("ssh.cancel_hint"), w)
 	}
 	canvas := lipgloss.NewCanvas(w, h).Compose(lipgloss.NewCompositor(lipgloss.NewLayer(base)))
 	// Notifications use available top-right space; a modal always renders above
@@ -155,6 +166,9 @@ func (m *Model) View() tea.View {
 				color = red
 			}
 			content := wrap(Display(n.Text), nw-4)
+			if n.ID == "ssh" && m.ssh != nil {
+				content += "\n" + renderHints(m.tr.Message("ssh.cancel_hint"), nw-4)
+			}
 			if modal != nil {
 				content = ansi.Truncate(strings.ReplaceAll(content, "\n", " "), nw-4, "…")
 			}
@@ -189,18 +203,21 @@ var primaryActions = map[entry.Page][]string{
 }
 
 func (m *Model) mainContent(width, height int) string {
+	if m.page == entry.Settings {
+		return m.settingsContent(width)
+	}
 	hints := m.tr.Message("ui.region_hints")
 	for _, key := range primaryActions[m.page] {
 		label := m.tr.Message("ui.action." + key)
 		if key == "s" && m.page == entry.Sync {
 			label = m.tr.Message("manage.sync_password")
 		}
-		hints += "  [" + key + "] " + label
+		hints += "  " + key + " " + label
 	}
 	if m.page == entry.Sync && m.hasSnapshot && !m.snapshot.Config.Settings.SyncPasswordSet {
 		hints = m.tr.Message("ui.sync_hint")
 	}
-	head := lipgloss.NewStyle().Foreground(green).Render(m.pageName()) + "\n" + lipgloss.NewStyle().Foreground(green).Render(wrap(hints, width)) + "\n" + strings.Repeat("─", width)
+	head := lipgloss.NewStyle().Foreground(green).Render(m.pageName()) + "\n" + renderHints(hints, width) + "\n" + strings.Repeat("─", width)
 	if m.state != Ready {
 		key, hint := "ui.loading", "ui.loading_hint"
 		switch m.state {
@@ -257,11 +274,16 @@ func (m *Model) mainContent(width, height int) string {
 		for _, r := range rows {
 			if r.ID == m.selectedID {
 				contentWidth := detailWidth - 4
-				detail = append(detail, lipgloss.NewStyle().Foreground(muted).Render(m.tr.Message("ui.detail")), lipgloss.NewStyle().Foreground(green).Bold(true).Render(wrap(Display(r.Alias), contentWidth)), "", m.detailFields(r.Details, contentWidth))
+				padding := lipgloss.NewStyle().Padding(0, 1)
+				detail = append(detail, padding.Foreground(muted).Render(m.tr.Message("ui.detail")), strings.Repeat("─", detailWidth-2))
+				if m.page == entry.Sync {
+					detail = append(detail, padding.Foreground(green).Bold(true).Render(wrap(Display(r.Alias), contentWidth)), "")
+				}
+				detail = append(detail, padding.Render(m.detailFields(r.Details, contentWidth)))
 				break
 			}
 		}
-		table = lipgloss.JoinHorizontal(lipgloss.Top, table, " ", box(lipgloss.NewStyle().Padding(0, 1).Render(strings.Join(detail, "\n")), detailWidth, max(3, remaining), false))
+		table = lipgloss.JoinHorizontal(lipgloss.Top, table, " ", box(strings.Join(detail, "\n"), detailWidth, max(3, remaining), false))
 	}
 	return head + table
 }
@@ -310,6 +332,9 @@ func (m *Model) table(rows []row, width, height int) string {
 			cells = append(cells, fit(Display(r.Cells[i]), columnWidths[i]))
 		}
 		marker := "· "
+		if m.page == entry.Servers {
+			marker = "  "
+		}
 		style := lipgloss.NewStyle().Foreground(text)
 		if r.ID == m.selectedID {
 			marker = "> "
@@ -379,8 +404,11 @@ func (m *Model) modalHeader(modal *Modal, inner int) string {
 			}
 		}
 	}
+	if modal.Hints != "" {
+		hints += "  " + modal.Hints
+	}
 	// Header and hints are reserved; only body scrolls/crops in small windows.
-	return wrap(Display(modal.Title), inner) + "\n" + lipgloss.NewStyle().Foreground(green).Render(wrap(hints, inner)) + "\n" + strings.Repeat("─", inner)
+	return wrap(Display(modal.Title), inner) + "\n" + renderHints(hints, inner) + "\n" + strings.Repeat("─", inner)
 }
 
 func (m *Model) informationScrollLimit() int {
@@ -485,6 +513,9 @@ func formView(form *Form, width, height int) string {
 			label += " *"
 		}
 		parts := []string{wrap(Display(label), width)}
+		if f.Static {
+			parts = []string{renderHints(label, width)}
+		}
 		if !f.Static {
 			inputWidth := max(1, width-2)
 			value := ""

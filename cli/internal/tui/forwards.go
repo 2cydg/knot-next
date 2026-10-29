@@ -74,7 +74,8 @@ func (m *Model) handleForwards(msg forwardsResult) tea.Cmd {
 	f.Loading = false
 	if msg.Err != nil {
 		modal.Choices = nil
-		modal.Body = m.tr.ProtocolError(coreclient.Code(msg.Err)) + "\n" + m.tr.Message("manage.forward_keys")
+		modal.Body = m.tr.ProtocolError(coreclient.Code(msg.Err))
+		modal.Hints = m.tr.Message("manage.forward_keys")
 		return m.notify(NoticeMsg{ID: "forwards", Text: m.tr.ProtocolError(coreclient.Code(msg.Err)), Error: true})
 	}
 	selected := ""
@@ -95,12 +96,14 @@ func (m *Model) forwardChoices(modal *Modal) {
 	f := modal.Forwards
 	modal.Choices = nil
 	if f.Saved {
-		modal.Body = m.tr.Message("manage.saved_rules") + "\n" + m.tr.Message("manage.saved_scope") + "\n" + m.tr.Message("manage.saved_keys")
+		modal.Body = m.tr.Message("manage.saved_rules") + "\n" + m.tr.Message("manage.saved_scope")
+		modal.Hints = m.tr.Message("manage.saved_keys")
 		for _, d := range f.Definitions {
 			modal.Choices = append(modal.Choices, Choice{ID: d.ID, Label: fmt.Sprintf("%s %s → %s · %s", m.tr.Message("manage.forward."+d.Type), d.Bind, m.none(d.Target), m.boolean(d.Enabled))})
 		}
 	} else {
-		modal.Body = m.tr.Message("manage.running_rules") + "\n" + m.tr.Message("manage.forward_keys")
+		modal.Body = m.tr.Message("manage.running_rules")
+		modal.Hints = m.tr.Message("manage.forward_keys")
 		for _, r := range f.Runtime {
 			bind := r.BoundAddress
 			if bind == "" {

@@ -345,10 +345,11 @@ func TestDynamicCatalogKeysCoverActualPagesAndActions(t *testing.T) {
 }
 
 func TestOtherPagesBilingualGolden(t *testing.T) {
-	for _, page := range []entry.Page{entry.Keys, entry.Proxies, entry.Sync} {
+	for _, page := range []entry.Page{entry.Keys, entry.Proxies, entry.Sync, entry.Settings} {
 		for _, language := range []i18n.Language{i18n.English, i18n.Chinese} {
 			for _, size := range [][2]int{{80, 24}, {120, 35}} {
-				m := testModel(t, string(page))
+				m := testModel(t, "servers")
+				m.page = page
 				populateAllPages(m)
 				m.tr = i18n.New(language)
 				m.ensureSelection()

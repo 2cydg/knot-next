@@ -98,6 +98,8 @@ var compiled = func() map[Language]map[Key]*template.Template {
 
 type Translator struct{ language Language }
 
+func (t Translator) Language() Language { return t.language }
+
 func New(language Language) Translator {
 	if language != Chinese {
 		language = English

@@ -1,14 +1,14 @@
 Knot                                             cli 0.1.0-dev    core 0.1.0-dev
 ┌────┐ ┌───────────────────────────────────────────────────────────────────────┐
 │  🖥️│ │ Sync                                                                  │
-│    │ │ [↑↓] Select  [/] Search  [n] New  [e] Edit  [d] Delete  [p]           │
-│  🔑│ │ Credentials  [a] Default  [s] Sync password                           │
+│    │ │ ↑↓ Select  / Search  n New  e Edit  d Delete  p Credentials  a        │
+│  🔑│ │ Default  s Sync password                                              │
 │    │ │ ───────────────────────────────────────────────────────────────────── │
 │  🔀│ │ ┌───────────────────────────────────────────────────────────────────┐ │
 │    │ │ │Search aliases                                                     │ │
 │> 🔄│ │ └───────────────────────────────────────────────────────────────────┘ │
 │    │ │ ┌───────────────────────────────────────────────────────────────────┐ │
-│    │ │ │  Alias        Type         Location     Credentials  Default      │ │
+│  ⚙️│ │ │  Alias        Type         Location     Credentials  Default      │ │
 │    │ │ │───────────────────────────────────────────────────────────────────│ │
 │    │ │ │> s3-main      S3           backup/conf… Set          Yes          │ │
 │    │ │ │· 备份é        WebDAV       https://bac… Set          No           │ │

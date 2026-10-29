@@ -256,7 +256,7 @@ func (m *Model) showEditor(d resourceDraft) tea.Cmd {
 	title := m.editorTitle(d.Kind, d.Create)
 	modal := &Modal{Kind: EditForm, Title: title, Form: form, Edit: &d}
 	if d.Kind == coreclient.Proxies {
-		modal.Body = m.tr.Message("manage.proxy_form_hint")
+		modal.Hints = m.tr.Message("manage.proxy_form_hint")
 	}
 	modal.OnSubmit = func(v map[string]string) tea.Cmd { return m.saveResource(modal, v) }
 	modal.OnKey = func(k tea.KeyPressMsg) (bool, tea.Cmd) {

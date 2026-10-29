@@ -21,7 +21,7 @@ func TestMenuEntryShortcutsExecuteAndRestoreOperationsFocus(t *testing.T) {
 					m.page = page
 					m.snapshot.Config.Settings.SyncPasswordSet = passwordSet
 					gated := page == entry.Sync && !passwordSet
-					allowed := (!gated && (binding == "/" || binding == "n")) || (gated && binding == "s")
+					allowed := page != entry.Settings && ((!gated && (binding == "/" || binding == "n")) || (gated && binding == "s"))
 					m.Update(press(binding))
 					if !allowed {
 						if m.focus != MenuFocus || m.modal != nil {
@@ -75,13 +75,13 @@ func TestPageHintsStayFixedAcrossFocusAndRemovedKeysDoNothing(t *testing.T) {
 						t.Fatalf("hints changed with focus: %q != %q", got, want)
 					}
 				}
-				for _, removed := range []string{"[?]", "[r]", "[i]", "[←/Esc]", "[↑↓] Menu", "[↑↓] 菜单"} {
+				for _, removed := range []string{"? Help", "r Refresh", "i Details", "←/Esc", "↑↓ Menu", "↑↓ 菜单"} {
 					if strings.Contains(want, removed) {
 						t.Fatal("removed hint still visible", want)
 					}
 				}
-				if page != entry.Sync || passwordSet {
-					if !strings.Contains(want, "[/]") {
+				if page != entry.Settings && (page != entry.Sync || passwordSet) {
+					if !strings.Contains(want, "/ ") {
 						t.Fatal("search hint missing", want)
 					}
 				}
@@ -94,7 +94,7 @@ func TestPageHintsStayFixedAcrossFocusAndRemovedKeysDoNothing(t *testing.T) {
 					}
 				}
 				if page == entry.Servers {
-					if strings.Contains(want, "[t]") {
+					if strings.Contains(want, "  t ") {
 						t.Fatal("forwarding hint still visible")
 					}
 					_, cmd := m.Update(press("t"))
@@ -109,7 +109,7 @@ func TestPageHintsStayFixedAcrossFocusAndRemovedKeysDoNothing(t *testing.T) {
 
 func TestEmptyAndFilteredListsKeepTableHeaders(t *testing.T) {
 	for _, language := range []i18n.Language{i18n.English, i18n.Chinese} {
-		for _, page := range pages {
+		for _, page := range []entry.Page{entry.Servers, entry.Keys, entry.Proxies, entry.Sync} {
 			for _, size := range [][2]int{{80, 24}, {120, 35}} {
 				m := testModel(t)
 				m.page, m.tr = page, i18n.New(language)

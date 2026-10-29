@@ -340,7 +340,7 @@ func TestDraftProxyTestDoesNotSaveAndReportsScope(t *testing.T) {
 	m.openEditor(coreclient.Proxies, true, false)
 	current := m.modal
 	m.Update(result)
-	if current.Body != m.tr.Message("manage.proxy_form_hint") {
+	if current.Body != "" || current.Hints != m.tr.Message("manage.proxy_form_hint") {
 		t.Fatal("late test changed new draft")
 	}
 }
@@ -411,7 +411,7 @@ func TestResourceFormsFitBilingualSizesAndKeepInputKeys(t *testing.T) {
 						modal.Form.Focus(i)
 						view := ansi.Strip(m.View().Content)
 						checkSize(t, view, size)
-						if !strings.Contains(view, "[Ctrl+s]") {
+						if !strings.Contains(view, "Ctrl+s") {
 							t.Fatal("save hint hidden")
 						}
 					}

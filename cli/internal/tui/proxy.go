@@ -101,7 +101,7 @@ func (m *Model) handleProxyResult(msg proxyResult) tea.Cmd {
 		lines = append(lines, m.tr.ProtocolError(r.FailureCode))
 	}
 	if msg.ModalID != 0 {
-		m.modal.Body = m.tr.Message("manage.proxy_form_hint") + "\n" + strings.Join(lines, "\n")
+		m.modal.Body = strings.Join(lines, "\n")
 	}
 	return m.notify(NoticeMsg{ID: "proxy-test", Text: strings.Join(lines, "; "), Error: !r.Passed})
 }

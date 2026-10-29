@@ -310,7 +310,7 @@ func TestBilingualLayoutsAndModalKeysFitPrototypeSizes(t *testing.T) {
 			if !strings.HasPrefix(modal, "Knot") {
 				t.Fatal("overlay ignored coordinates", modal)
 			}
-			if !strings.Contains(modal, "[Enter]") || !strings.Contains(modal, "[Esc]") || !strings.Contains(modal, "SHA256") {
+			if !strings.Contains(modal, "Enter") || !strings.Contains(modal, "Esc") || !strings.Contains(modal, "SHA256") {
 				t.Fatal("confirmation obscured", modal)
 			}
 		}
@@ -378,7 +378,7 @@ func TestRefreshDoesNotRebuildDraftAndFormFailureReturnsFocus(t *testing.T) {
 	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	m.notify(NoticeMsg{ID: "warning", Text: "warning notification", Error: true})
 	view := ansi.Strip(m.View().Content)
-	if !strings.Contains(view, "warning notification") || !strings.Contains(view, "[Ctrl+s]") {
+	if !strings.Contains(view, "warning notification") || !strings.Contains(view, "Ctrl+s") {
 		t.Fatal("notice/form hints missing", view)
 	}
 }

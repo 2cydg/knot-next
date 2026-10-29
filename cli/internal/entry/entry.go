@@ -14,10 +14,11 @@ const (
 	Help        Mode = "help"
 	Version     Mode = "version"
 
-	Servers Page = "servers"
-	Keys    Page = "keys"
-	Proxies Page = "proxies"
-	Sync    Page = "sync"
+	Servers  Page = "servers"
+	Keys     Page = "keys"
+	Proxies  Page = "proxies"
+	Sync     Page = "sync"
+	Settings Page = "settings"
 
 	ReturnToTUI ReturnPolicy = "tui"
 	ExitProgram ReturnPolicy = "exit"

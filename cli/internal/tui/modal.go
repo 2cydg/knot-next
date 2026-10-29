@@ -58,6 +58,7 @@ type Modal struct {
 	Kind       ModalKind
 	Title      string
 	Body       string
+	Hints      string
 	Details    [][2]string
 	Form       *Form
 	Choices    []Choice

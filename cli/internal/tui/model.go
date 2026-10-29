@@ -88,6 +88,7 @@ type Model struct {
 	runtimeFile       string
 	load              func(context.Context, string) (coreclient.Snapshot, error)
 	page              entry.Page
+	settingsTab       int
 	focus             Focus
 	state             ListState
 	width, height     int
@@ -554,7 +555,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-var pages = []entry.Page{entry.Servers, entry.Keys, entry.Proxies, entry.Sync}
+var pages = []entry.Page{entry.Servers, entry.Keys, entry.Proxies, entry.Sync, entry.Settings}
 
 func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 	binding := msg.String()
@@ -562,7 +563,7 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 		// Only the page's entry shortcuts may cross from the menu. Once
 		// editing starts, Update routes all typing to the focused widget.
 		gated := m.page == entry.Sync && !m.snapshot.Config.Settings.SyncPasswordSet
-		if (!gated && (binding == "/" || binding == "n")) || (gated && binding == "s") {
+		if m.page != entry.Settings && ((!gated && (binding == "/" || binding == "n")) || (gated && binding == "s")) {
 			m.focus = OperationsFocus
 		}
 	}
@@ -593,7 +594,10 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 		m.page = pages[index]
 		m.search.SetValue("")
 		m.selectedID = ""
-		return m.beginLoad(true)
+		return m.beginLoad(m.page != entry.Settings)
+	}
+	if m.page == entry.Settings {
+		return m.settingsKey(binding)
 	}
 	switch binding {
 	case "left", "esc", "tab", "shift+tab":

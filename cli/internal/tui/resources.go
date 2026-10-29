@@ -67,19 +67,7 @@ func (m *Model) allRows() []row {
 				jumps = append(jumps, name)
 			}
 			r.Cells = []string{s.Alias, target, strings.Join(s.Tags, ", "), recent}
-			r.Details = [][2]string{{"target", target}, {"auth_method", m.auth(s.AuthMethod)}, {"proxy", m.none(proxy)}, {"jumps", m.none(strings.Join(jumps, " → "))}, {"tags", m.none(strings.Join(s.Tags, ", "))}, {"recent", recent}}
-			if s.AuthMethod == "password" {
-				r.Details = append(r.Details, [2]string{"password", m.presence(s.PasswordSet)})
-			}
-			if s.AuthMethod == "key" {
-				key := ""
-				for _, k := range config.Keys {
-					if k.ID == s.KeyID {
-						key = k.Alias
-					}
-				}
-				r.Details = append(r.Details, [2]string{"auth.key", m.none(key)})
-			}
+			r.Details = [][2]string{{"auth_method", m.auth(s.AuthMethod)}, {"proxy", m.none(proxy)}, {"jumps", m.none(strings.Join(jumps, " → "))}}
 			rows = append(rows, r)
 		}
 	case entry.Keys:
@@ -91,11 +79,11 @@ func (m *Model) allRows() []row {
 			if k.Length == 0 {
 				bits = m.tr.Message("ui.unverified")
 			}
-			rows = append(rows, row{ID: k.ID, Alias: k.Alias, Cells: []string{k.Alias, typeName, bits}, Details: [][2]string{{"type", typeName}, {"bits", bits}, {"references", m.references(k.ID, true)}, {"material", m.presence(k.PrivateKeySet)}, {"fingerprint", m.none(k.Fingerprint)}, {"encrypted", m.boolean(k.Encrypted)}}})
+			rows = append(rows, row{ID: k.ID, Alias: k.Alias, Cells: []string{k.Alias, typeName, bits}, Details: [][2]string{{"references", m.references(k.ID, true)}, {"material", m.presence(k.PrivateKeySet)}, {"fingerprint", m.none(k.Fingerprint)}, {"encrypted", m.boolean(k.Encrypted)}}})
 		}
 	case entry.Proxies:
 		for _, p := range config.Proxies {
-			rows = append(rows, row{ID: p.ID, Alias: p.Alias, Cells: []string{p.Alias, strings.ToUpper(p.Type), address(p.Host, p.Port), m.none(p.Username)}, Details: [][2]string{{"type", strings.ToUpper(p.Type)}, {"address", address(p.Host, p.Port)}, {"username", m.none(p.Username)}, {"references", m.references(p.ID, false)}, {"password", m.presence(p.PasswordSet)}}})
+			rows = append(rows, row{ID: p.ID, Alias: p.Alias, Cells: []string{p.Alias, strings.ToUpper(p.Type), address(p.Host, p.Port), m.none(p.Username)}, Details: [][2]string{{"references", m.references(p.ID, false)}, {"password", m.presence(p.PasswordSet)}}})
 		}
 	case entry.Sync:
 		if !config.Settings.SyncPasswordSet {

@@ -45,7 +45,7 @@ func Run(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, in
 			return entry.ExitCanceled
 		}
 		if err != nil {
-			return runError(ctx, err, tr, diagnostics)
+			return runError(ctx, err, m.tr, diagnostics)
 		}
 		if m.handoff == nil {
 			if launch.ReturnPolicy() == entry.ExitProgram && m.exitCode == entry.ExitFailure && m.directMessage != "" {
