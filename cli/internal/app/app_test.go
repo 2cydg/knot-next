@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"knot-cli/internal/entry"
+	"knot-cli/internal/i18n"
+	"knot-cli/internal/preferences"
 )
 
 type languageProvider struct{ languages []string }
@@ -19,6 +21,7 @@ func (p languageProvider) PreferredLanguages(context.Context) ([]string, error) 
 }
 
 func TestInformationDoesNotInitializeInteractiveFlow(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	for _, language := range []string{"zh-CN", "en-US"} {
 		for _, argument := range []string{"--help", "--version"} {
 			var output, diagnostics bytes.Buffer
@@ -45,6 +48,7 @@ func TestInformationDoesNotInitializeInteractiveFlow(t *testing.T) {
 }
 
 func TestDispatchPreservesEntryAndStartupDirectory(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	for _, tc := range []struct {
 		args   []string
 		mode   entry.Mode
@@ -79,6 +83,7 @@ func TestDispatchPreservesEntryAndStartupDirectory(t *testing.T) {
 }
 
 func TestInvalidAndNonTTYEntriesStopBeforeRunner(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	for _, language := range []string{"en", "zh"} {
 		for _, tc := range []struct {
 			args []string
@@ -108,6 +113,7 @@ type failedWriter struct{}
 func (failedWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
 
 func TestOutputFailureCancellationAndMissingFrontend(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	options := Options{LanguageProvider: languageProvider{[]string{"en"}}, Stdout: failedWriter{}}
 	if got := Run(context.Background(), []string{"--help"}, options); got != entry.ExitFailure {
 		t.Fatalf("closed stdout: %d", got)
@@ -127,5 +133,28 @@ func TestOutputFailureCancellationAndMissingFrontend(t *testing.T) {
 	options.Getwd = func() (string, error) { return t.TempDir(), nil }
 	if got := Run(context.Background(), nil, options); got != entry.ExitFailure || !strings.Contains(diagnostics.String(), "under development") {
 		t.Fatalf("missing runner: %d %s", got, diagnostics.String())
+	}
+}
+
+func TestSavedLanguageOverridesSystemPreference(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	if err := preferences.Save(preferences.Settings{Language: i18n.Chinese}); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	options := Options{Stdout: &output, LanguageProvider: languageProvider{[]string{"en"}}}
+	if code := Run(context.Background(), []string{"--help"}, options); code != entry.ExitOK || !strings.Contains(output.String(), "用法：") {
+		t.Fatal("saved language did not override the system on startup", code, output.String())
+	}
+	options.IsTerminal = func() bool { return true }
+	options.Getwd = func() (string, error) { return t.TempDir(), nil }
+	options.Runner = func(_ context.Context, launch Launch) int {
+		if launch.Translator.Language() != i18n.Chinese {
+			t.Fatal("saved language did not reach the interactive runner")
+		}
+		return entry.ExitOK
+	}
+	if code := Run(context.Background(), nil, options); code != entry.ExitOK {
+		t.Fatal("interactive startup failed", code)
 	}
 }

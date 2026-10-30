@@ -1,4 +1,4 @@
-// Package defaults owns this release's fixed frontend values, without a preferences file.
+// Package defaults owns fixed frontend values; language preferences live separately.
 package defaults
 
 import "path/filepath"

@@ -66,6 +66,7 @@ type Modal struct {
 	PickerPage int
 	PageSize   int
 	OnConfirm  func(string) tea.Cmd
+	OnDiscard  func() tea.Cmd
 	OnSubmit   func(map[string]string) tea.Cmd
 	OnCancel   tea.Cmd
 	Prior      *Modal
@@ -190,6 +191,18 @@ func (m *Model) modalKey(key tea.KeyPressMsg) tea.Cmd {
 		return nil
 	}
 	if modal.Kind == Draft {
+		// Local settings share the confirmation without a resource form or core.
+		if modal.OnConfirm != nil {
+			switch binding {
+			case "y", "Y":
+				return tea.Batch(m.closeModal(), modal.OnConfirm(""))
+			case "n", "N":
+				return tea.Batch(m.closeModal(), modal.OnDiscard())
+			case "esc":
+				return m.closeModal()
+			}
+			return nil
+		}
 		switch binding {
 		case "y", "Y":
 			m.modal = modal.Prior

@@ -14,6 +14,7 @@ import (
 	"knot-cli/internal/coreclient"
 	"knot-cli/internal/entry"
 	"knot-cli/internal/i18n"
+	"knot-cli/internal/preferences"
 )
 
 type Focus int
@@ -82,42 +83,46 @@ type FormResult struct {
 // Model is the only owner of UI state. Cmds return values; workers never mutate
 // the model, drafts, selection or focus.
 type Model struct {
-	ctx               context.Context
-	launch            entry.LaunchContext
-	tr                i18n.Translator
-	runtimeFile       string
-	load              func(context.Context, string) (coreclient.Snapshot, error)
-	page              entry.Page
-	settingsTab       int
-	focus             Focus
-	state             ListState
-	width, height     int
-	search            textinput.Model
-	selectedID        string
-	snapshot          coreclient.Snapshot
-	lastError         error
-	modal             *Modal
-	exitConfirm       *Modal
-	modalSequence     uint64
-	notices           []Notice
-	noticeRevision    uint64
-	generation        uint64
-	loading           bool
-	cancelLoad        context.CancelFunc
-	stream            *coreclient.Stream
-	streamEpoch       uint64
-	cancelStream      context.CancelFunc
-	streamOpening     bool
-	hasSnapshot       bool
-	healthStatus      string
-	exitCode          int
-	cancelProxyTest   context.CancelFunc
-	proxyTestRevision uint64
-	ssh               *sshAttempt
-	handoff           *sshAttempt
-	directStarted     bool
-	directMessage     string
-	resumeCmd         tea.Cmd
+	ctx                context.Context
+	launch             entry.LaunchContext
+	tr                 i18n.Translator
+	runtimeFile        string
+	load               func(context.Context, string) (coreclient.Snapshot, error)
+	page               entry.Page
+	settingsTab        int
+	settingsDraft      i18n.Language
+	settingsBusy       bool
+	settingsFieldFocus bool
+	saveSettings       func(preferences.Settings) error
+	focus              Focus
+	state              ListState
+	width, height      int
+	search             textinput.Model
+	selectedID         string
+	snapshot           coreclient.Snapshot
+	lastError          error
+	modal              *Modal
+	exitConfirm        *Modal
+	modalSequence      uint64
+	notices            []Notice
+	noticeRevision     uint64
+	generation         uint64
+	loading            bool
+	cancelLoad         context.CancelFunc
+	stream             *coreclient.Stream
+	streamEpoch        uint64
+	cancelStream       context.CancelFunc
+	streamOpening      bool
+	hasSnapshot        bool
+	healthStatus       string
+	exitCode           int
+	cancelProxyTest    context.CancelFunc
+	proxyTestRevision  uint64
+	ssh                *sshAttempt
+	handoff            *sshAttempt
+	directStarted      bool
+	directMessage      string
+	resumeCmd          tea.Cmd
 }
 
 func New(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, runtimeFile string) *Model {
@@ -132,7 +137,7 @@ func New(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, ru
 	if launch.Mode() == entry.PageDirect {
 		focus = OperationsFocus
 	}
-	return &Model{ctx: ctx, launch: launch, tr: tr, runtimeFile: runtimeFile, load: coreclient.Load, page: page, focus: focus, state: Loading, width: 80, height: 24, search: input}
+	return &Model{ctx: ctx, launch: launch, tr: tr, runtimeFile: runtimeFile, load: coreclient.Load, saveSettings: preferences.Save, page: page, focus: focus, state: Loading, width: 80, height: 24, search: input}
 }
 
 func (m *Model) Init() tea.Cmd {
@@ -265,6 +270,16 @@ func (m *Model) removeNotice(id string) {
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case settingsSaved:
+		m.settingsBusy = false
+		if msg.err != nil {
+			return m, m.notify(NoticeMsg{ID: "settings", Text: m.tr.Text("settings.save_failed", map[string]any{"Reason": msg.err.Error()}), Error: true})
+		}
+		m.tr = i18n.New(msg.language)
+		m.settingsDraft = ""
+		m.settingsFieldFocus = false
+		m.focus = MenuFocus
+		return m, m.notify(NoticeMsg{ID: "settings", Text: m.tr.Message("settings.saved")})
 	case sshResult:
 		return m, m.handleSSH(msg)
 	case sshPollMsg:
@@ -587,6 +602,9 @@ func (m *Model) key(msg tea.KeyPressMsg) tea.Cmd {
 			index = len(pages) - 1
 		case "right", "enter", "tab":
 			m.focus = OperationsFocus
+			if m.page == entry.Settings {
+				m.settingsFieldFocus = false
+			}
 			return nil
 		default:
 			return nil

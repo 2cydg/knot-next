@@ -15,6 +15,7 @@ import (
 	"knot-cli/internal/defaults"
 	"knot-cli/internal/entry"
 	"knot-cli/internal/i18n"
+	"knot-cli/internal/preferences"
 )
 
 type Launch struct {
@@ -48,6 +49,13 @@ func Run(ctx context.Context, args []string, options Options) int {
 		options.LanguageProvider = i18n.SystemProvider{}
 	}
 	translator := i18n.New(i18n.Detect(ctx, options.LanguageProvider).Language)
+	settings, settingsErr := preferences.Load()
+	if settings.Language != "" {
+		translator = i18n.New(settings.Language)
+	}
+	if settingsErr != nil {
+		fmt.Fprintln(options.Stderr, translator.Text("settings.load_failed", map[string]any{"Reason": settingsErr.Error()}))
+	}
 	launch, err := entry.Parse(args)
 	if err != nil {
 		var usageErr *entry.UsageError

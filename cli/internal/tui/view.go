@@ -17,13 +17,13 @@ import (
 
 var (
 	background = lipgloss.Color("#101313")
-	text       = lipgloss.Color("#d3d6d4")
-	muted      = lipgloss.Color("#8b9390")
-	line       = lipgloss.Color("#46504b")
-	green      = lipgloss.Color("#a7ccb2")
-	tagSearch  = lipgloss.Color("#8fb8d8")
-	red        = lipgloss.Color("#d6a19b")
-	selected   = lipgloss.Color("#283a31")
+	text       = lipgloss.Color("#d8dcd9")
+	muted      = lipgloss.Color("#97a29b")
+	line       = lipgloss.Color("#525d56")
+	green      = lipgloss.Color("#abd6b7")
+	tagSearch  = lipgloss.Color("#97c2e2")
+	red        = lipgloss.Color("#dda79e")
+	selected   = lipgloss.Color("#2d4237")
 )
 
 // Display escapes control bytes in user data without changing the stored value
@@ -89,6 +89,25 @@ func box(content string, width, height int, focus bool) string {
 	}
 	return coloredBox(content, width, height, color)
 }
+
+// Keep the title left-aligned in the top border, with a blank row before content.
+func titledBox(title, content string, width, height int, focus bool) string {
+	border := line
+	if focus {
+		border = green
+	}
+	rendered := coloredBox("\n"+content, width, height, border)
+	if width < 7 {
+		return rendered
+	}
+	title = ansi.Truncate(Display(title), width-6, "…")
+	style := lipgloss.NewStyle().Foreground(border).Background(background)
+	top := style.Render("┌─ ") + lipgloss.NewStyle().Foreground(green).Background(background).Render(title) +
+		style.Render(" "+strings.Repeat("─", max(0, width-5-ansi.StringWidth(title)))+"┐")
+	_, rest, _ := strings.Cut(rendered, "\n")
+	return top + "\n" + rest
+}
+
 func coloredBox(content string, width, height int, borderColor color.Color) string {
 	return lipgloss.NewStyle().Foreground(text).Background(background).Border(lipgloss.NormalBorder()).BorderForeground(borderColor).Width(max(1, width)).Height(max(1, height)).MaxWidth(width).MaxHeight(height).Render(content)
 }
@@ -140,7 +159,7 @@ func (m *Model) View() tea.View {
 		menu = append(menu, style.Render(value))
 	}
 	sidebar := box(strings.Join(menu, "\n\n"), m.sidebarWidth(), h-2, m.focus == MenuFocus && modal == nil)
-	main := box(lipgloss.NewStyle().Padding(0, 1).Render(m.mainContent(m.mainWidth()-4, h-4)), m.mainWidth(), h-2, m.focus != MenuFocus && modal == nil)
+	main := titledBox(m.pageName(), lipgloss.NewStyle().Padding(0, 1).Render(m.mainContent(m.mainWidth()-4, h-5)), m.mainWidth(), h-2, m.focus != MenuFocus && modal == nil)
 	base := top + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, sidebar, " ", main)
 	if m.launch.Mode() == entry.AliasDirect {
 		message := m.directMessage
@@ -222,7 +241,7 @@ func (m *Model) mainContent(width, height int) string {
 	if m.page == entry.Sync && m.hasSnapshot && !m.snapshot.Config.Settings.SyncPasswordSet {
 		hints = m.tr.Message("ui.sync_hint")
 	}
-	head := lipgloss.NewStyle().Foreground(green).Render(m.pageName()) + "\n" + renderHints(hints, width) + "\n" + strings.Repeat("─", width)
+	head := renderHints(hints, width) + "\n" + strings.Repeat("─", width)
 	if m.state != Ready {
 		key, hint := "ui.loading", "ui.loading_hint"
 		switch m.state {
@@ -280,7 +299,6 @@ func (m *Model) mainContent(width, height int) string {
 			if r.ID == m.selectedID {
 				contentWidth := detailWidth - 4
 				padding := lipgloss.NewStyle().Padding(0, 1)
-				detail = append(detail, padding.Foreground(muted).Render(m.tr.Message("ui.detail")), strings.Repeat("─", detailWidth-2))
 				if m.page == entry.Sync {
 					detail = append(detail, padding.Foreground(green).Bold(true).Render(wrap(Display(r.Alias), contentWidth)), "")
 				}
@@ -288,7 +306,7 @@ func (m *Model) mainContent(width, height int) string {
 				break
 			}
 		}
-		table = lipgloss.JoinHorizontal(lipgloss.Top, table, " ", box(strings.Join(detail, "\n"), detailWidth, max(3, remaining), false))
+		table = lipgloss.JoinHorizontal(lipgloss.Top, table, " ", titledBox(m.tr.Message("ui.detail"), strings.Join(detail, "\n"), detailWidth, max(3, remaining), false))
 	}
 	return head + table
 }
