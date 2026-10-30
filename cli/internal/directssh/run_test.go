@@ -7,10 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +15,7 @@ import (
 	"knot-cli/internal/coreclient"
 	"knot-cli/internal/entry"
 	"knot-cli/internal/i18n"
+	"knot-cli/internal/preferences"
 )
 
 type fixture struct {
@@ -117,18 +114,12 @@ func newFixture(t *testing.T, state string) *fixture {
 	}
 	t.Cleanup(client.Close)
 	f.snapshot = coreclient.Snapshot{Client: client, Runtime: coreclient.Runtime{InstanceID: "instance-a"}, Capabilities: []coreclient.Capability{{Name: "agent_forwarding", Available: true}}}
-	dir := t.TempDir()
-	f.path = filepath.Join(dir, "core.json")
-	token := filepath.Join(dir, "token")
-	u, _ := url.Parse(server.URL)
-	port, _ := strconv.Atoi(u.Port())
-	runtime, _ := json.Marshal(coreclient.Runtime{InstanceID: "instance-a", APIVersion: "v1", Port: port, ListenAddresses: []string{u.Host}, TokenPath: token})
-	if err := os.WriteFile(token, []byte("token"), 0600); err != nil {
+	setTestHome(t, t.TempDir())
+	f.path = server.URL
+	if err := preferences.Save(preferences.Settings{Core: &preferences.Core{URL: server.URL, Secret: "token"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(f.path, runtime, 0600); err != nil {
-		t.Fatal(err)
-	}
+
 	return f
 }
 

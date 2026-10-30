@@ -2,7 +2,6 @@ package lifecycle
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -43,7 +42,7 @@ func okHandler() http.Handler {
 // startTestRunner starts a runner that serves okHandler on a random port.
 func startTestRunner(t *testing.T, cfg Config) *Runner {
 	t.Helper()
-	if cfg.Layout.RuntimePath == "" {
+	if cfg.Layout.RuntimeDir == "" {
 		cfg.Layout = testLayout(t)
 	}
 	if cfg.Prepare == nil {
@@ -145,7 +144,7 @@ func TestConcurrentTriggersRunTeardownOnce(t *testing.T) {
 	if got := teardowns.Load(); got != 1 {
 		t.Fatalf("teardown ran %d times, want 1", got)
 	}
-	if _, err := os.Stat(layout.RuntimePath); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(layout.RuntimeDir, "core.json")); !os.IsNotExist(err) {
 		t.Fatalf("runtime file still present after teardown: %v", err)
 	}
 }
@@ -300,7 +299,7 @@ func TestRuntimeInfoMatchesListenerAndFile(t *testing.T) {
 			t.Fatalf("listen address %q does not match port %d", address, info.Port)
 		}
 	}
-	if info.RuntimePath != layout.RuntimePath || info.ConfigDir != layout.ConfigDir || info.StateDir != layout.StateDir {
+	if info.ConfigDir != layout.ConfigDir || info.StateDir != layout.StateDir {
 		t.Fatalf("runtime info paths do not match the layout: %+v", info)
 	}
 
@@ -313,20 +312,12 @@ func TestRuntimeInfoMatchesListenerAndFile(t *testing.T) {
 		t.Fatalf("holder %+v does not match runner info %+v", published, info)
 	}
 
-	raw, err := os.ReadFile(layout.RuntimePath)
-	if err != nil {
-		t.Fatalf("read runtime file: %v", err)
+	for _, path := range []string{filepath.Join(layout.RuntimeDir, "core.json"), filepath.Join(layout.RuntimeDir, "token")} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatal("discovery artifact created", path, err)
+		}
 	}
-	var onDisk coreruntime.Info
-	if err := json.Unmarshal(raw, &onDisk); err != nil {
-		t.Fatalf("decode runtime file: %v", err)
-	}
-	if onDisk.Port != info.Port || onDisk.InstanceID != info.InstanceID || onDisk.PID != info.PID {
-		t.Fatalf("runtime file %+v does not match runner info %+v", onDisk, info)
-	}
-	if !onDisk.TokenPresent {
-		t.Fatal("runtime file does not report the initialized token")
-	}
+
 }
 
 // R03: a runtime endpoint created before startup published anything must report
@@ -386,19 +377,14 @@ func TestSecondInstanceRejectedBeforeSharedStateInit(t *testing.T) {
 	}
 
 	// The first instance keeps working and its files are untouched.
-	infoBefore, err := os.ReadFile(layout.RuntimePath)
+	infoBefore := runner1.RuntimeInfo()
+	response, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/", runner1.Port()))
 	if err != nil {
-		t.Fatalf("read runtime file: %v", err)
+		t.Fatal(err)
 	}
-	if _, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/", runner1.Port())); err != nil {
-		t.Fatalf("first instance stopped serving: %v", err)
-	}
-	infoAfter, err := os.ReadFile(layout.RuntimePath)
-	if err != nil {
-		t.Fatalf("re-read runtime file: %v", err)
-	}
-	if string(infoBefore) != string(infoAfter) {
-		t.Fatal("second instance rewrote the first instance's runtime file")
+	response.Body.Close()
+	if runner1.RuntimeInfo().InstanceID != infoBefore.InstanceID {
+		t.Fatal("first instance changed")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -423,7 +409,6 @@ func TestStartupFailuresReleaseAcquiredResources(t *testing.T) {
 		name    string
 		prepare func(ctx context.Context, env Env) (http.Handler, error)
 		listen  func(port int) ([]net.Listener, []string, error)
-		write   func(path string, info coreruntime.Info) error
 	}{
 		{
 			name: "prepare fails",
@@ -435,12 +420,6 @@ func TestStartupFailuresReleaseAcquiredResources(t *testing.T) {
 			name: "listener fails",
 			listen: func(int) ([]net.Listener, []string, error) {
 				return nil, nil, errors.New("address in use")
-			},
-		},
-		{
-			name: "runtime file write fails",
-			write: func(string, coreruntime.Info) error {
-				return errors.New("read-only directory")
 			},
 		},
 	}
@@ -467,8 +446,7 @@ func TestStartupFailuresReleaseAcquiredResources(t *testing.T) {
 					}
 					return okHandler(), nil
 				},
-				Listen:           step.listen,
-				WriteRuntimeInfo: step.write,
+				Listen: step.listen,
 			})
 			if err != nil {
 				t.Fatalf("new runner: %v", err)
@@ -484,7 +462,7 @@ func TestStartupFailuresReleaseAcquiredResources(t *testing.T) {
 			if serviceCtx == nil || serviceCtx.Err() == nil {
 				t.Fatal("service context was not cancelled when startup aborted")
 			}
-			if _, err := os.Stat(layout.RuntimePath); !os.IsNotExist(err) {
+			if _, err := os.Stat(filepath.Join(layout.RuntimeDir, "core.json")); !os.IsNotExist(err) {
 				t.Fatalf("runtime file left behind after a failed start: %v", err)
 			}
 			// A failed start must not report success through the completion signal.
@@ -516,7 +494,7 @@ func TestShutdownReleasesPortAndLock(t *testing.T) {
 	}
 	<-runner.Done()
 
-	if _, err := os.Stat(layout.RuntimePath); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(layout.RuntimeDir, "core.json")); !os.IsNotExist(err) {
 		t.Fatalf("runtime file not removed on shutdown: %v", err)
 	}
 	if _, err := os.Open(filepath.Join(layout.RuntimeDir, ".instance.lock")); err != nil {
@@ -547,5 +525,48 @@ func TestShutdownCompletesPromptlyWhenIdle(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Fatalf("idle shutdown took %s, want it to finish without waiting out the grace period", elapsed)
+	}
+}
+
+func TestConfigDirectoryLockProtectsDifferentStateLayouts(t *testing.T) {
+	layout := testLayout(t)
+	first := startTestRunner(t, Config{Layout: layout})
+	otherLayout := paths.NewLayout(layout.ConfigDir, t.TempDir())
+	prepared := false
+	other, err := New(Config{Layout: otherLayout, Prepare: func(context.Context, Env) (http.Handler, error) { prepared = true; return okHandler(), nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Start(context.Background()); err == nil {
+		other.Shutdown(context.Background())
+		t.Fatal("shared configuration allowed concurrent initialization")
+	}
+	if prepared {
+		t.Fatal("second state directory bypassed shared config lock")
+	}
+	if first.RuntimeInfo().InstanceID == "" {
+		t.Fatal("first instance lost identity")
+	}
+}
+
+func TestOldDiscoveryArtifactsAreNeitherReadNorChanged(t *testing.T) {
+	layout := testLayout(t)
+	if err := layout.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(layout.RuntimeDir, "core.json"), filepath.Join(layout.RuntimeDir, "token")} {
+		if err := os.WriteFile(path, []byte("old-file-contents-do-not-parse"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runner := startTestRunner(t, Config{Layout: layout})
+	if err := runner.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(layout.RuntimeDir, "core.json"), filepath.Join(layout.RuntimeDir, "token")} {
+		raw, err := os.ReadFile(path)
+		if err != nil || string(raw) != "old-file-contents-do-not-parse" {
+			t.Fatal("old discovery artifact changed", path, err)
+		}
 	}
 }

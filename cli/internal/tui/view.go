@@ -409,6 +409,9 @@ func (m *Model) modalHeader(modal *Modal, inner int) string {
 	}
 	if modal.Form != nil {
 		hints = m.tr.Message("ui.form_hints")
+		if m.firstSetup && modal.Kind == CoreConnection {
+			hints = m.tr.Message("core.setup_hints")
+		}
 		for _, f := range modal.Form.Fields {
 			if f.Multiline {
 				hints += "  " + m.tr.Message("ui.multiline_hint")

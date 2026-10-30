@@ -12,15 +12,31 @@ GOWORK=off go build -o ../bin/knot .
 
 根目录 `scripts/build.sh`、`scripts/test.sh`、`scripts/lint.sh` 均依次处理 core 和 cli；`scripts/build.sh --all` 构建 linux/darwin/windows × amd64/arm64，CGO=0，Windows 带 `.exe`。两个 module 不互相 import。固定 Bubble Tea v2.1.0、Bubbles v2.2.1、Lip Gloss v2.0.6，WS 使用 coder/websocket v1.8.15；运行依赖许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-## 启动与发现
+## Core 连接配置
 
-先在另一个终端手动启动 `knot-core`，再运行 `knot` 或 `knot key/proxy/sync`。默认读取 `$XDG_STATE_HOME/knot/runtime/core.json`；未设置 XDG_STATE_HOME 时，三平台均与 core 一致使用用户目录 `.local/state/knot/runtime/core.json`。可用绝对路径环境变量 `KNOT_RUNTIME_FILE` 指定实际 runtime 文件；前端只读此文件及其中 `token_path`，不读取或改写业务配置。
+首次运行 `knot`、页面直达或别名直连都会先弹出连接配置表单。必须完成 API 校验并保存，才能恢复原入口；Esc 不能跳过，Ctrl+c 退出并返回 130。help/version 跳过连接配置。
 
-用户目录查询失败时与 core 一致回退到当前用户资料中的 HomeDir。相对 XDG_STATE_HOME 按 CLI 启动目录解析；core 发布相对 token 路径时，仅接受其 runtime_path 与 token_path 指向同目录 `core.json` / `token` 的布局，并按实际发现文件目录定位 token，因此显式 runtime 路径也可访问不同工作目录启动的 core。
+客户端偏好位于 `~/.config/knot/client.toml`，与语言设置共存：
 
-仅接受本机 loopback 地址，支持 core 实际 `host:port` 和 IPv6；认证头不经过系统 HTTP 代理或重定向。先从文件 bootstrap，再调用已认证 `/v1/runtime`、version、health、capabilities、config。读取前后核对 instance_id，服务重启/换地址/换 token 使旧资源状态失效。能力按 available 判定，HTTP 200 不等于 Agent/crypto 全部可用。
+```toml
+language = "zh"
+[core]
+url = "http://127.0.0.1:17898"
+secret = ""
+auto_start = false
+executable = ""
+config_file = ""
+```
 
-离线、认证失败和协议错误有独立状态，由后台轮询自动重试；不自动启动服务。事件断流以 GET 和重新订阅恢复，根模型每 4 秒复核实际状态；请求最长 15 秒，旧页面/请求结果不会覆盖新状态。完整响应重新创建 DTO，省略字段清空旧关联。
+Secret 可为空，输入时遮蔽，偏好文件限制为当前用户读写。设置页切换到“核心设置”，按 Enter 或 Ctrl+s 编辑相同字段；离线时仍可进入。已配置后断线不会清除配置。
+
+自动启动默认关闭。开启后填写 core 程序和配置文件路径；进入配置文件字段时，按程序同目录补全 `config.toml`，手动编辑的路径不会被覆盖。支持空格和 `~`，相对路径按 CLI 启动目录固定。CLI 只保存配置路径，不读取、解析、生成或修改 core 配置。
+
+每次保存先请求指定 URL 的版本和实例 API。服务可用则复用，认证/协议/版本错误均不启动进程；明确连接被拒绝时才允许按需执行 `knot-core --config <path>`。超时不触发启动。就绪等待有上限，同一客户端共享启动尝试，不在轮询中反复重启。后台进程不继承终端输入输出，CLI 退出后继续运行。
+
+仅接受 HTTP loopback IP 和显式端口（含 IPv6），不经过系统代理、不跟随重定向，不扫描或纠正地址。CLI 不依赖 `core.json`、token 文件或 `KNOT_RUNTIME_FILE`，只通过 HTTP/WS 读取实例身份和业务状态。读取前后复核实例，重启或更换连接后旧资源状态失效；可选能力降级保留提示。
+
+core 配置由用户准备：在目标目录运行 `knot-core init`，只生成 `config.toml`，写入端口 17898 和随机 32 位数字/大小写字母 Secret；已有文件不会覆盖。手动启动使用 `knot-core --config /path/config.toml`。CLI 的 URL 和 Secret 必须由用户与服务配置保持一致。
 
 ## 原型交互
 
@@ -38,7 +54,7 @@ GOWORK=off go build -o ../bin/knot .
 
 真实 core 协议联测：先构建 `core/cmd/core` 为 `/tmp/knot-core-tui`，再在 cli 运行 `KNOT_TEST_CORE_BIN=/tmp/knot-core-tui GOWORK=off go test ./internal/coreclient -run TestCoreBinary`。测试仅通过公开 API 在临时目录启动受控 core；普通测试未设置此变量时明确跳过此组合场景。
 
-菜单在 Sync 下方提供设置页，右侧为“客户端设置”和“核心设置”两个页签。功能区内用 [ / ] 切换页签，也接受中文输入法的【 / 】及全角［ / ］。客户端设置目前仅有语言，使用与服务器认证方式相同的 `‹ 当前选项 ›` 控件。进入功能区后，↓ 或 Enter 聚焦语言控件，←/→ 轮换 English / 中文；↑ 离开控件焦点，随后 ← 返回菜单、→ 从菜单进入功能区。空格和 Enter 不切换语言。快捷键栏只显示页签切换和 Ctrl+s 保存，不显示“← 菜单”及“空格/Enter 切换语言”。Ctrl+s 写入 TOML 成功后应用语言并自动将焦点返回左侧菜单。修改后按 Esc、Tab 或在控件未聚焦时按 ← 离开，复用表单的 Y 保存 / N 放弃 / Esc 返回编辑提示；保存失败保留草稿和原来的界面语言。核心设置暂为空白。设置页无需 core 在线；语言保存在 `$XDG_CONFIG_HOME/knot/client.toml`，未设置 XDG_CONFIG_HOME 时，三平台均使用 `~/.config/knot/client.toml`，格式为 `language = "en"` 或 `language = "zh"`。该文件与 core 的 config.toml 独立，启动时只读，不存在时不创建。所有页面与模态的快捷键统一使用 `key 说明`，按键为绿色、说明为灰色，页签提示合并为 `[] 切换页签`。
+菜单在 Sync 下方提供设置页，右侧为“客户端设置”和“核心设置”两个页签。功能区内用 [ / ] 切换页签，也接受中文输入法的【 / 】及全角［ / ］。客户端设置目前仅有语言，使用与服务器认证方式相同的 `‹ 当前选项 ›` 控件。进入功能区后，↓ 或 Enter 聚焦语言控件，←/→ 轮换 English / 中文；↑ 离开控件焦点，随后 ← 返回菜单、→ 从菜单进入功能区。空格和 Enter 不切换语言。快捷键栏只显示页签切换和 Ctrl+s 保存，不显示“← 菜单”及“空格/Enter 切换语言”。Ctrl+s 写入 TOML 成功后应用语言并自动将焦点返回左侧菜单。修改后按 Esc、Tab 或在控件未聚焦时按 ← 离开，复用表单的 Y 保存 / N 放弃 / Esc 返回编辑提示；保存失败保留草稿和原来的界面语言。核心设置可编辑并校验 core 连接。设置页无需 core 在线；语言保存在 `~/.config/knot/client.toml`，格式为 `language = "en"` 或 `language = "zh"`。该文件与 core 的 config.toml 独立，启动时只读，不存在时不创建。所有页面与模态的快捷键统一使用 `key 说明`，按键为绿色、说明为灰色，页签提示合并为 `[] 切换页签`。
 
 ## 资源管理
 
@@ -70,7 +86,7 @@ GOWORK=off go build -o ../bin/knot .
 
 `LaunchContext` 的 mode、initial_page、server_ref、return_policy 通过只读方法访问，controller 必须传递其退出策略。server_ref 此时仅是未解析别名；真实连接必须采用 core resolve 返回的持久服务器 ID。
 
-help/version 不检测终端、不读取启动目录、不发现 core。其余入口要求 stdin/stdout 同时为 TTY。`knot <alias>` 和 `knot ssh <alias>` 使用独立控制台流程，实际发现并 resolve 为持久服务器 ID；不创建 Bubble Tea 程序，也不切换 TUI 屏幕。控制台输出连接提示，仅在需要信任主机指纹时询问 yes/no，确认后直接进入原生 SSH。发现、解析、连接或认证失败时立即输出本地化错误并退出 1，不等待 TUI 通知，也不进入认证重试表单。前端不会自动启动 core，也不会读写 core 业务配置；只读写独立的客户端偏好文件。
+help/version 不检测终端、不读取启动目录、不检查或启动 core。其余入口要求 stdin/stdout 同时为 TTY。别名直连首次配置时临时显示表单，完成后结束 Bubble Tea 并释放终端，再恢复控制台流程；已配置时不创建管理 TUI。控制台只在需要信任主机指纹时询问 yes/no，随后进入原生 SSH。连接、解析、认证失败时输出本地化错误并退出 1，远端结束后直接退出程序。
 
 退出契约：远端 exit-status 0–255 原样保留，缺失/越界状态返回 1；本地连接/协议失败 1，参数错误 2，主动取消 130。管理 TUI 保留单次 SSH 结果继续运行。
 
@@ -101,3 +117,6 @@ Bubble Tea 完全结束并释放 stdin 后才启动 raw bridge；退出桥接时
 默认尽力启用 Agent 转发，并固定连接时清屏和前端启动目录。core 自身 idle/keepalive/log/recent 等默认值不由前端重写。
 
 阶段状态、验证和续接说明见工作区根目录的 [开发进度](../../docs/cli-tui-progress.md)。
+
+
+本轮连接改造的测试、构建及原生平台边界见 [CLI/Core 验收记录](../core/docs/cli-handoff.md#clicore-连接改造验收2026-10-30)。

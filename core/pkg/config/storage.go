@@ -3,6 +3,7 @@ package config
 // diskConfig preserves legacy TOML's root without API schema/timestamp fields.
 // Resource values are shared domain types; public responses use secret-free views.
 type diskConfig struct {
+	Service       ServiceSettings               `toml:"service"`
 	Settings      Settings                      `toml:"settings"`
 	Servers       map[string]ServerProfile      `toml:"servers"`
 	Proxies       map[string]ProxyProfile       `toml:"proxies"`
@@ -11,10 +12,10 @@ type diskConfig struct {
 }
 
 func diskFromConfig(cfg Config) diskConfig {
-	return diskConfig{Settings: cfg.Settings, Servers: cfg.Servers, Proxies: cfg.Proxies, Keys: cfg.Keys, SyncProviders: cfg.SyncProviders}
+	return diskConfig{Service: cfg.Service, Settings: cfg.Settings, Servers: cfg.Servers, Proxies: cfg.Proxies, Keys: cfg.Keys, SyncProviders: cfg.SyncProviders}
 }
 func configFromDisk(disk diskConfig) Config {
-	return Config{SchemaVersion: 1, Settings: disk.Settings, Servers: disk.Servers, Proxies: disk.Proxies, Keys: disk.Keys, SyncProviders: disk.SyncProviders}
+	return Config{SchemaVersion: 1, Service: disk.Service, Settings: disk.Settings, Servers: disk.Servers, Proxies: disk.Proxies, Keys: disk.Keys, SyncProviders: disk.SyncProviders}
 }
 
 // Disk defaults mirror knot/pkg/config.loadRawConfig at e0b4d51.

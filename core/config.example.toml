@@ -1,0 +1,10 @@
+# Generate a fresh private config with: knot-core init
+# Start with: knot-core --config /path/to/config.toml
+# Secret is restart-only and excluded from business API responses.
+[service]
+port = 17898
+secret = ""
+allowed_origins = []
+
+[settings]
+log_level = "info"

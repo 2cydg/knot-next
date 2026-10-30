@@ -18,7 +18,7 @@ import (
 func TestSettingsSaveLanguageWithoutCore(t *testing.T) {
 	for _, state := range []ListState{Ready, Loading, Offline, AuthFailed, ReadError} {
 		t.Run(string(state), func(t *testing.T) {
-			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			setTestHome(t, t.TempDir())
 			m := testModel(t)
 			m.state = state
 			m.Update(press("end"))
@@ -125,7 +125,7 @@ func TestSettingsTabsAndLanguageKeys(t *testing.T) {
 				}
 			}
 			m.Update(press("]"))
-			for _, key := range []string{"right", "down", " ", "enter", "n", "e", "s", "/", "ctrl+s"} {
+			for _, key := range []string{"right", "down", " ", "n", "e", "s", "/"} {
 				_, cmd := m.Update(press(key))
 				if cmd != nil {
 					t.Fatal("core settings triggered an operation", key)
@@ -133,7 +133,7 @@ func TestSettingsTabsAndLanguageKeys(t *testing.T) {
 			}
 			view := ansi.Strip(m.View().Content)
 			if m.settingsDirty() || m.modal != nil || m.settingsFieldFocus || strings.Contains(view, "‹") {
-				t.Fatal("core settings must remain empty", view)
+				t.Fatal("core settings must not change language", view)
 			}
 			m.Update(press("["))
 			view = ansi.Strip(m.View().Content)

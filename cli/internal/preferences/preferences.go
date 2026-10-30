@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 
@@ -14,19 +15,34 @@ import (
 
 type Settings struct {
 	Language i18n.Language `toml:"language"`
+	Core     *Core         `toml:"core,omitempty"`
 }
 
-// Path uses the same XDG/home layout as core, with a separate client file.
-func Path() (string, error) {
-	base := os.Getenv("XDG_CONFIG_HOME")
-	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		base = filepath.Join(home, ".config")
+const DefaultCoreURL = "http://127.0.0.1:17898"
+
+type Core struct {
+	URL        string `toml:"url"`
+	Secret     string `toml:"secret" json:"-"`
+	AutoStart  bool   `toml:"auto_start"`
+	Executable string `toml:"executable"`
+	ConfigFile string `toml:"config_file"`
+}
+
+func (s Settings) Configured() bool {
+	if s.Core == nil || strings.TrimSpace(s.Core.URL) == "" {
+		return false
 	}
-	base, err := filepath.Abs(base)
+	return !s.Core.AutoStart || strings.TrimSpace(s.Core.Executable) != "" && strings.TrimSpace(s.Core.ConfigFile) != ""
+}
+
+// Path places client preferences under the user home directory.
+func Path() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Join(home, ".config")
+	base, err = filepath.Abs(base)
 	if err != nil {
 		return "", err
 	}
@@ -51,7 +67,11 @@ func Load() (Settings, error) {
 		if errors.Is(err, os.ErrNotExist) {
 			return Settings{}, nil
 		}
-		return Settings{}, err
+		var pathError *os.PathError
+		if errors.As(err, &pathError) {
+			return Settings{}, err
+		}
+		return Settings{}, errors.New("invalid client preferences TOML")
 	}
 	if err := settings.validate(); err != nil {
 		return Settings{}, err
@@ -63,6 +83,16 @@ func Load() (Settings, error) {
 func Save(settings Settings) error {
 	if err := settings.validate(); err != nil {
 		return err
+	}
+	existing, err := Load()
+	if err != nil {
+		return err
+	}
+	if settings.Core == nil {
+		settings.Core = existing.Core
+	}
+	if settings.Language == "" {
+		settings.Language = existing.Language
 	}
 	path, err := Path()
 	if err != nil {

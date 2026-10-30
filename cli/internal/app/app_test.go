@@ -21,7 +21,7 @@ func (p languageProvider) PreferredLanguages(context.Context) ([]string, error) 
 }
 
 func TestInformationDoesNotInitializeInteractiveFlow(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	for _, language := range []string{"zh-CN", "en-US"} {
 		for _, argument := range []string{"--help", "--version"} {
 			var output, diagnostics bytes.Buffer
@@ -48,7 +48,7 @@ func TestInformationDoesNotInitializeInteractiveFlow(t *testing.T) {
 }
 
 func TestDispatchPreservesEntryAndStartupDirectory(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	for _, tc := range []struct {
 		args   []string
 		mode   entry.Mode
@@ -83,7 +83,7 @@ func TestDispatchPreservesEntryAndStartupDirectory(t *testing.T) {
 }
 
 func TestInvalidAndNonTTYEntriesStopBeforeRunner(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	for _, language := range []string{"en", "zh"} {
 		for _, tc := range []struct {
 			args []string
@@ -113,7 +113,7 @@ type failedWriter struct{}
 func (failedWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
 
 func TestOutputFailureCancellationAndMissingFrontend(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	options := Options{LanguageProvider: languageProvider{[]string{"en"}}, Stdout: failedWriter{}}
 	if got := Run(context.Background(), []string{"--help"}, options); got != entry.ExitFailure {
 		t.Fatalf("closed stdout: %d", got)
@@ -137,7 +137,7 @@ func TestOutputFailureCancellationAndMissingFrontend(t *testing.T) {
 }
 
 func TestSavedLanguageOverridesSystemPreference(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	if err := preferences.Save(preferences.Settings{Language: i18n.Chinese}); err != nil {
 		t.Fatal(err)
 	}

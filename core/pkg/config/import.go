@@ -195,7 +195,9 @@ func (s *Service) readImportSource(path string) (Config, string, bool, error) {
 		encrypted = encrypted || strings.HasPrefix(v, secretPrefix)
 		return v, nil
 	})
-	sourceSvc := NewService(paths.NewLayout(filepath.Dir(path), s.layout.StateDir), nil)
+	sourceLayout := paths.NewLayout(filepath.Dir(path), s.layout.StateDir)
+	sourceLayout.ConfigFile = path
+	sourceSvc := NewService(sourceLayout, nil)
 	if encrypted {
 		open := crypto.OpenExistingProvider
 		if s.importProvider != nil {

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -511,7 +510,6 @@ type HealthCheck struct {
 
 type HealthInput struct {
 	TokenAvailable  bool
-	RuntimePath     string
 	ListenAddresses []string
 }
 
@@ -524,7 +522,6 @@ func (s *Service) Health(authenticated bool, input HealthInput) Health {
 
 	checks := []HealthCheck{
 		checkToken(input.TokenAvailable),
-		checkRuntimeFile(input.RuntimePath),
 		checkListener(input.ListenAddresses),
 	}
 	checks = append(checks, checkConfig(configService))
@@ -548,23 +545,9 @@ func (s *Service) Health(authenticated bool, input HealthInput) Health {
 
 func checkToken(available bool) HealthCheck {
 	if !available {
-		return HealthCheck{Name: "token", Status: "failed", Detail: "token verifier is not configured"}
+		return HealthCheck{Name: "token", Status: "ok", Detail: "Secret authentication disabled"}
 	}
 	return HealthCheck{Name: "token", Status: "ok"}
-}
-
-func checkRuntimeFile(path string) HealthCheck {
-	if path == "" {
-		return HealthCheck{Name: "runtime_file", Status: "failed", Detail: "runtime path is not configured"}
-	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return HealthCheck{Name: "runtime_file", Status: "failed", Detail: err.Error()}
-	}
-	if err := file.Close(); err != nil {
-		return HealthCheck{Name: "runtime_file", Status: "failed", Detail: err.Error()}
-	}
-	return HealthCheck{Name: "runtime_file", Status: "ok", Detail: path}
 }
 
 func checkListener(addresses []string) HealthCheck {
@@ -663,7 +646,7 @@ func (s *Service) CapabilitiesContext(ctx context.Context) []Capability {
 		{Name: "core", Status: "available", Risk: "READ_ONLY"},
 		{Name: "http_api", Status: "available", Risk: "READ_ONLY"},
 		{Name: "token_auth", Status: "available", Risk: "READ_ONLY"},
-		{Name: "runtime_discovery", Status: "available", Risk: "READ_ONLY"},
+		{Name: "runtime_identity", Status: "available", Risk: "READ_ONLY"},
 		{Name: "config", Status: capabilityStatus(configAvailable), Risk: "LOCAL_MUTATION"},
 		{Name: "secret", Status: capabilityStatus(secretAvailable), Risk: "LOCAL_MUTATION"},
 		{Name: "session", Status: capabilityStatus(sessionAvailable), Risk: "LONG_RUNNING"},

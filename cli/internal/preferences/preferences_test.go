@@ -10,9 +10,9 @@ import (
 
 func TestClientSettingsRoundTripAndIndependentFile(t *testing.T) {
 	base := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", base)
+	setTestHome(t, base)
 	path, err := Path()
-	if err != nil || path != filepath.Join(base, "knot", "client.toml") {
+	if err != nil || path != filepath.Join(base, ".config", "knot", "client.toml") {
 		t.Fatal("unexpected client settings path", path, err)
 	}
 	if settings, err := Load(); err != nil || settings.Language != "" {
@@ -50,7 +50,7 @@ func TestClientSettingsRoundTripAndIndependentFile(t *testing.T) {
 }
 
 func TestClientSettingsTOMLValidationAndWriteFailure(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	setTestHome(t, t.TempDir())
 	if err := Save(Settings{Language: i18n.Chinese}); err != nil {
 		t.Fatal(err)
 	}
@@ -73,8 +73,64 @@ func TestClientSettingsTOMLValidationAndWriteFailure(t *testing.T) {
 		t.Fatal("valid TOML comments and literal strings must work", settings, err)
 	}
 	// A file in place of the config directory produces an error on all platforms.
-	t.Setenv("XDG_CONFIG_HOME", path)
+	setTestHome(t, path)
 	if err := Save(Settings{Language: i18n.English}); err == nil {
 		t.Fatal("unwritable settings must report failure")
+	}
+}
+
+func TestLanguageAndCoreSavesPreserveEachOther(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	if err := Save(Settings{Language: i18n.Chinese}); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := Load()
+	if err != nil || legacy.Configured() {
+		t.Fatal("language-only preferences must require setup", err)
+	}
+	core := Core{URL: DefaultCoreURL, Secret: "", AutoStart: true, Executable: "/path with spaces/core", ConfigFile: "/separate/config.toml"}
+	if err := Save(Settings{Core: &core}); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(Settings{Language: i18n.English}); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := Load()
+	if err != nil || !saved.Configured() || *saved.Core != core || saved.Language != i18n.English {
+		t.Fatal("settings group was lost", err)
+	}
+	core.Secret = "private-secret"
+	if err := Save(Settings{Core: &core}); err != nil {
+		t.Fatal(err)
+	}
+	saved, err = Load()
+	if err != nil || saved.Language != i18n.English || saved.Core.Secret != core.Secret {
+		t.Fatal("core save lost language", err)
+	}
+	path, _ := Path()
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm()&0077 != 0 {
+		t.Fatal("client credentials have permissive mode", err)
+	}
+}
+
+func TestIncompleteAutoStartPreferencesRequireSetup(t *testing.T) {
+	for _, core := range []*Core{nil, {}, {URL: " "}, {URL: DefaultCoreURL, AutoStart: true}, {URL: DefaultCoreURL, AutoStart: true, Executable: "core"}} {
+		if (Settings{Core: core}).Configured() {
+			t.Fatal("incomplete preferences bypass setup")
+		}
+	}
+	if !(Settings{Core: &Core{URL: DefaultCoreURL}}).Configured() {
+		t.Fatal("empty Secret requires configuration")
+	}
+}
+
+func TestClientPathIgnoresXDGConfigHome(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	path, err := Path()
+	if err != nil || path != filepath.Join(home, ".config", "knot", "client.toml") {
+		t.Fatal("client path used XDG_CONFIG_HOME", path, err)
 	}
 }

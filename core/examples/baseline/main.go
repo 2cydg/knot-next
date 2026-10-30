@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -270,12 +269,7 @@ func run(ctx context.Context, c *client, server, source, target string, trust bo
 	}
 }
 func main() {
-	home, _ := os.UserHomeDir()
-	state := os.Getenv("XDG_STATE_HOME")
-	if state == "" {
-		state = filepath.Join(home, ".local", "state")
-	}
-	runtimePath := flag.String("runtime", filepath.Join(state, "knot", "runtime", "core.json"), "daemon runtime file")
+	base := flag.String("url", "http://127.0.0.1:17898", "core API URL")
 	server := flag.String("server", "", "existing server ID or alias")
 	source := flag.String("source", "", "local upload file")
 	target := flag.String("target", "", "new remote file path")
@@ -286,25 +280,8 @@ func main() {
 		os.Exit(2)
 	}
 	err := func() error {
-		raw, err := os.ReadFile(*runtimePath)
-		if err != nil {
-			return err
-		}
-		var runtime struct {
-			ListenAddresses []string `json:"listen_addresses"`
-			TokenPath       string   `json:"token_path"`
-		}
-		if err = json.Unmarshal(raw, &runtime); err != nil {
-			return err
-		}
-		if len(runtime.ListenAddresses) == 0 {
-			return errors.New("runtime has no listener")
-		}
-		token, err := os.ReadFile(runtime.TokenPath)
-		if err != nil {
-			return err
-		}
-		c := &client{base: "http://" + runtime.ListenAddresses[0], token: strings.TrimSpace(string(token)), http: &http.Client{Timeout: 15 * time.Second}}
+		c := &client{base: *base, token: os.Getenv("KNOT_EXAMPLE_SECRET"), http: &http.Client{Timeout: 15 * time.Second}}
+
 		defer c.http.CloseIdleConnections()
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 		defer stop()

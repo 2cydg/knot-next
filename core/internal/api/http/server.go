@@ -172,7 +172,6 @@ func (s *Server) getHealth(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	info := s.runtimeInfo()
 	response.JSON(w, stdhttp.StatusOK, s.core.Health(true, core.HealthInput{
 		TokenAvailable:  s.token.Available(),
-		RuntimePath:     info.RuntimePath,
 		ListenAddresses: info.ListenAddresses,
 	}))
 }

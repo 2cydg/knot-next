@@ -12,6 +12,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 
 	"knot-cli/internal/coreclient"
+	"knot-cli/internal/corestart"
 	"knot-cli/internal/entry"
 	"knot-cli/internal/i18n"
 	"knot-cli/internal/preferences"
@@ -86,7 +87,15 @@ type Model struct {
 	ctx                context.Context
 	launch             entry.LaunchContext
 	tr                 i18n.Translator
-	runtimeFile        string
+	endpoint           string
+	coreSettings       preferences.Core
+	coordinator        *corestart.Coordinator
+	startupDirectory   string
+	firstSetup         bool
+	setupOnly          bool
+	setupComplete      bool
+	canceled           bool
+	cancelSetup        context.CancelFunc
 	load               func(context.Context, string) (coreclient.Snapshot, error)
 	page               entry.Page
 	settingsTab        int
@@ -125,7 +134,7 @@ type Model struct {
 	resumeCmd          tea.Cmd
 }
 
-func New(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, runtimeFile string) *Model {
+func New(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, endpoint string) *Model {
 	input := textinput.New()
 	input.Prompt = ""
 	input.CharLimit = 1024
@@ -137,10 +146,15 @@ func New(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, ru
 	if launch.Mode() == entry.PageDirect {
 		focus = OperationsFocus
 	}
-	return &Model{ctx: ctx, launch: launch, tr: tr, runtimeFile: runtimeFile, load: coreclient.Load, saveSettings: preferences.Save, page: page, focus: focus, state: Loading, width: 80, height: 24, search: input}
+	return &Model{ctx: ctx, launch: launch, tr: tr, endpoint: endpoint, load: func(ctx context.Context, url string) (coreclient.Snapshot, error) {
+		return coreclient.Load(ctx, url, "")
+	}, coordinator: corestart.New(corestart.Dependencies{}), saveSettings: preferences.Save, page: page, focus: focus, state: Loading, width: 80, height: 24, search: input}
 }
 
 func (m *Model) Init() tea.Cmd {
+	if m.firstSetup {
+		return m.openCoreConnection(true)
+	}
 	if m.launch.Mode() == entry.AliasDirect {
 		return m.beginLoad(false)
 	}
@@ -156,6 +170,9 @@ func (m *Model) Init() tea.Cmd {
 }
 func poll() tea.Cmd { return tea.Tick(4*time.Second, func(time.Time) tea.Msg { return pollMsg{} }) }
 func (m *Model) Close() {
+	if m.cancelSetup != nil {
+		m.cancelSetup()
+	}
 	if m.ssh != nil {
 		m.ssh.Attempt.Close()
 	}
@@ -186,6 +203,9 @@ func (m *Model) stopStream() {
 	m.streamOpening = false
 }
 func (m *Model) beginLoad(showLoading bool) tea.Cmd {
+	if m.firstSetup || m.canceled {
+		return nil
+	}
 	if m.cancelLoad != nil {
 		m.cancelLoad()
 	}
@@ -197,7 +217,7 @@ func (m *Model) beginLoad(showLoading bool) tea.Cmd {
 	if showLoading {
 		m.state = Loading
 	}
-	loader, path := m.load, m.runtimeFile
+	loader, path := m.load, m.endpoint
 	return func() tea.Msg {
 		defer cancel()
 		s, err := loader(ctx, path)
@@ -270,6 +290,8 @@ func (m *Model) removeNotice(id string) {
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case coreConnectionResult:
+		return m, m.handleCoreConnection(msg)
 	case settingsSaved:
 		m.settingsBusy = false
 		if msg.err != nil {
@@ -372,10 +394,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.lastError = msg.err
 			code := coreclient.Code(msg.err)
 			m.state = ReadError
-			if code == "RUNTIME_UNAVAILABLE" || code == "OFFLINE" {
+			if code == "UNREACHABLE" || code == "OFFLINE" {
 				m.state = Offline
 			}
-			if code == "UNAUTHORIZED" || code == "AUTH_FILE_INVALID" {
+			if code == "UNAUTHORIZED" {
 				m.state = AuthFailed
 			}
 			m.hasSnapshot = false
@@ -499,6 +521,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case tea.KeyPressMsg:
+		if m.firstSetup && msg.String() == "ctrl+c" {
+			m.canceled = true
+			m.exitCode = entry.ExitCanceled
+			if m.cancelSetup != nil {
+				m.cancelSetup()
+			}
+			return m, tea.Quit
+		}
 		if m.exitConfirm != nil {
 			return m, m.exitKey(msg)
 		}

@@ -12,8 +12,6 @@ type Runtime struct {
 	InstanceID      string   `json:"instance_id"`
 	Port            int      `json:"port"`
 	ListenAddresses []string `json:"listen_addresses"`
-	TokenPath       string   `json:"token_path"`
-	RuntimePath     string   `json:"runtime_path"`
 }
 
 type Version struct {

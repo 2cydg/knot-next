@@ -20,9 +20,16 @@ import (
 	"knot-cli/internal/coreclient"
 	"knot-cli/internal/entry"
 	"knot-cli/internal/i18n"
+	"knot-cli/internal/preferences"
 )
 
 func TestAliasRunUsesConsoleTrustAndNativeTerminalWithoutTUI(t *testing.T) {
+	testAliasTerminal(t, false)
+}
+func TestFirstSetupReleasesTerminalBeforeAliasSSH(t *testing.T) {
+	testAliasTerminal(t, true)
+}
+func testAliasTerminal(t *testing.T, firstUse bool) {
 	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|unix.O_NOCTTY, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -40,6 +47,9 @@ func TestAliasRunUsesConsoleTrustAndNativeTerminalWithoutTUI(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer slave.Close()
+	if err := unix.IoctlSetWinsize(int(slave.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Row: 24, Col: 80}); err != nil {
+		t.Fatal(err)
+	}
 	before, err := term.GetState(int(slave.Fd()))
 	if err != nil {
 		t.Fatal(err)
@@ -100,18 +110,27 @@ func TestAliasRunUsesConsoleTrustAndNativeTerminalWithoutTUI(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	setRunRuntime(t, server)
+	if firstUse {
+		setTestHome(t, t.TempDir())
+	} else {
+		setRunRuntime(t, server)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	captured := make(chan string, 1)
 	go func() {
 		var output strings.Builder
 		answered := false
+		configured := false
 		buffer := make([]byte, 4096)
 		for {
 			n, err := master.Read(buffer)
 			output.Write(buffer[:n])
 			text := output.String()
+			if firstUse && !configured && strings.Contains(text, "Core URL") {
+				configured = true
+				_, _ = master.Write([]byte("\x01\x0b" + server.URL + "\x13"))
+			}
 			if !answered && strings.Contains(text, "yes/no") {
 				answered = true
 				_, _ = master.Write([]byte("yes\n"))
@@ -134,8 +153,19 @@ func TestAliasRunUsesConsoleTrustAndNativeTerminalWithoutTUI(t *testing.T) {
 	if code != 7 || !trusted.Load() || !strings.Contains(output, "REMOTE_OUTPUT") || !strings.Contains(output, "The authenticity of host") || !strings.Contains(output, "SHA256:console-host") {
 		t.Fatal("console trust/bridge flow failed", code, output)
 	}
-	if strings.Contains(output, "\x1b[?1049") || strings.ContainsAny(output, "┌┐└┘") || !strings.Contains(output, "\x1b]0;production\x07") {
+	if (!firstUse && (strings.Contains(output, "\x1b[?1049") || strings.ContainsAny(output, "┌┐└┘"))) || !strings.Contains(output, "\x1b]0;production\x07") {
 		t.Fatal("alias started a TUI or did not set the connected title", output)
+	}
+	if firstUse {
+		settings, err := preferences.Load()
+		if err != nil || !settings.Configured() || settings.Core.URL != server.URL {
+			t.Fatal("first setup did not save connection", err)
+		}
+		leave := strings.LastIndex(output, "\x1b[?1049l")
+		prompt := strings.Index(output, "The authenticity of host")
+		if leave < 0 || prompt < leave {
+			t.Fatal("console prompt started before setup released terminal")
+		}
 	}
 	request := <-requests
 	if request.AllowAuthRetry || request.ServerRef != "persistent-id" {

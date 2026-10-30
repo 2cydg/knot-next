@@ -46,13 +46,12 @@
 {
   "version": "0.1.0-dev",
   "api_version": "v1",
+  "instance_id": "opaque-instance-id",
   "pid": 12345,
   "port": 48652,
   "listen_addresses": ["127.0.0.1:48652", "[::1]:48652"],
-  "token_path": "/path/to/token",
   "token_present": true,
   "log_path": "/path/to/core.log",
-  "runtime_path": "/path/to/runtime.json",
   "config_dir": "/path/to/config",
   "state_dir": "/path/to/state",
   "started_at": "2026-05-15T12:00:00Z"
@@ -61,10 +60,9 @@
 
 说明：
 
-- 该结构同时用于本地 runtime 文件内容和 `GET /v1/runtime` 的响应 `data`
-- `token_path` 指向由 `knot-core` 管理的本地 token 文件
-- `token_present=true` 表示服务启动时已经成功加载或生成 token
-- `runtime_path` 是当前 runtime 文件自身路径，便于 client 做诊断与重新发现
+- `/v1/runtime` 返回内存中的实例身份和真实运行状态，不发布运行文件。
+- `token_present` 表示启动时是否配置非空 Secret；为 false 是合法免认证模式。
+- 返回内容不含 Secret、token 路径或 runtime 文件路径。
 
 ### Status
 
@@ -123,7 +121,7 @@
 说明：
 
 - `status` 为 `ok` 或 `degraded`
-- `checks` 当前包含 `token`、`runtime_file`、`listener`、`config`、`crypto`、`ssh_pool`
+- `checks` 当前包含 `token`、`listener`、`config`、`crypto`、`ssh_pool`
 
 ### GET `/v1/capabilities`
 
@@ -134,7 +132,7 @@
 - `core`
 - `http_api`
 - `token_auth`
-- `runtime_discovery`
+- `runtime_identity`
 - `config`
 - `secret`
 - `session`
@@ -156,14 +154,7 @@
 
 ### GET `/v1/runtime`
 
-返回运行时发现信息，用于本地客户端发现 daemon。
-
-说明：
-
-- 该接口本身仍然需要 token 认证
-- 它适合已认证 client 查询当前 runtime 状态，不适合作为首次 bootstrap 的入口
-- 首次 bootstrap 时，client 应先读取本地 runtime 文件，再读取 `token_path` 指向的 token 文件
-- token 不属于 `config.toml` 配置模型，也不通过 config API 管理
+返回内存中的实例 ID 和真实监听信息。客户端请求自身配置的 URL，不能用此接口重新选择端口。非空 Secret 时需要认证，空 Secret 时免认证；版本接口遵循同样规则。客户端在一组 API 读取前后核对实例身份，避免混合服务重启前后的状态。Secret 属于 core 的 TOML 启动配置，不通过业务配置 API 返回或管理。
 
 ### GET `/v1/status`
 

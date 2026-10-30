@@ -49,7 +49,8 @@ go build -o ../bin/knot-core ./cmd/core
 
 1. 启动 core 服务：
    ```bash
-   knot-core --port 17898
+   knot-core init
+   knot-core --config ./config.toml
    ```
 
 2. 使用 HTTP/WebSocket API 管理连接：
@@ -85,9 +86,9 @@ go build -o ../bin/knot-core ./cmd/core
 - 🚧 配置同步（计划中）
 - 🚧 TUI 界面（双语资源 CRUD、转发管理和原生 SSH 已实现，SFTP 文件页开发中）
 
-独立 [CLI module](cli/README.md) 支持本地帮助/版本，以及真实 core 发现、
+独立 [CLI module](cli/README.md) 支持本地帮助/版本，以及真实 core URL/Secret 连接、
 双语资源 CRUD、搜索、详情、代理测试、同步凭据、转发管理、离线恢复及带信任/认证交互的原生 SSH。
-请手动启动 knot-core；SFTP 文件页与传输仍在开发中。TUI 中按 c/Enter 登录，结束后返回服务器页；
+首次配置支持按需启动 knot-core；SFTP 文件页与传输仍在开发中。TUI 中按 c/Enter 登录，结束后返回服务器页；
 `knot <alias>` / `knot ssh <alias>` 直连并保留远端退出码。根构建、测试、lint 脚本依次处理
 core 和 cli。交付范围与验证见工作区根目录的 [阶段记录](../docs/cli-tui-progress.md)。
 

@@ -2,7 +2,7 @@
 
 公开协议入口：[API](api/README.md)。可直接执行的真实调用链：[示例](../examples/baseline/README.md)。基线验证和平台边界：[验收](baseline-acceptance.md)。正式 CLI module 尚未开发。新增 core 能力的执行证据见 [本轮验收](gap-acceptance.md)，受控公开调用示例见 [gaps](../examples/gaps/README.md)。
 
-1. 从本地 runtime 文件发现监听地址和 token_path，再携带 Bearer token 调用；runtime API 本身需要认证。离线时展示启动/重试，不用配置文件替代 API。
+1. 客户端显式配置 URL/Secret，只通过公开 HTTP/WS API 通信。core 不发布 runtime/token 文件；Secret 非空时包括版本接口在内均需要 Bearer 认证，空时免 Secret 校验，Origin 检查保持独立。自动启动只传 `--config <path>`，客户端不读取 core 配置。首次配置完成后恢复管理、页面直达或别名直连入口。
 2. 201 只表示资源受理。SSH 等 connected，SFTP 等 open；host_key_pending/auth_pending 显示明确 challenge，响应后继续等待。GET 是事实来源；未知状态/机器码保留原值并显示可理解的失败，禁止猜测成功。
 3. CRUD 使用无秘密 DTO；密码/私钥走 secrets API。passphrase 属于当前尝试；Remember 仅在认证成功后提交方式及所选凭据。订阅全局 warning 以观察异步保存失败，避免泄漏错误内秘密。
 4. WS 初始 snapshot 与后续事件共同消费；断线重连后用 GET 恢复。传输 POST 202 后即使已完成也可从 snapshot/GET 得到 completed/failed/partial_failed/canceled。WS 事件只用于通知，不把断线当作 completed。
@@ -24,3 +24,22 @@ CI 使用 Go 1.27.1，全量三平台测试/构建、Linux race 和六目标 CGO
 - 代理测试使用当前草稿/保存 ID，明确 password 省略与空值，展示 endpoint/negotiation/tunnel 实际范围。无 target 的 HTTP TCP 通不代表 CONNECT/认证成功。
 - 临时转发省略 connection_id 才使用最新目标连接；POST 202 后查询 starting/active/failed，停止固定原连接。服务器持久规则仅影响新 transport，自动失败只警告。WS 断流用原 ID GET，停止超时显示实际收尾待完成。
 - 解码完整 GET/control/snapshot 时创建新的 DTO，再替换模型；omitempty 的清空关联字段在 JSON 中可能省略，不能把响应合并进仍带旧值的结构体。
+
+
+## CLI/Core 连接改造验收（2026-10-30）
+
+实现范围：core 从 `[service]` 加载端口、Secret 和 Origin；显式配置文件路径贯穿保存、加密初始化、锁及引导恢复。实例身份保存在内存，HTTP/WS 使用统一的可选 Secret 认证。客户端使用独立偏好文件中的 URL/Secret，提供首次配置表单及核心设置入口，并按需启动后台进程。
+
+`knot-core init` 在当前目录创建 `config.toml`，填入默认端口 17898 和随机 32 位数字、大小写字母混合 Secret，不启动服务、不覆盖已有文件。启动使用 `knot-core --config <文件>`；免 Secret 模式需在文件中手动设为空字符串或省略 Secret。客户端不读取或修改 core 配置内容。
+
+验证结果：
+
+- `KNOT_TEST_CORE_BIN=<本次构建的 knot-core> scripts/test.sh --race`：两个 module 完整测试通过，包含真实 core API、进程启动、引导恢复、SSH/WS、事件恢复、Linux 伪终端及首次配置后别名直连交接。
+- `scripts/lint.sh`：gofmt 和两个 module 的 go vet 通过。
+- `scripts/build.sh`：原生 Linux 二进制已更新至 `knot-next/bin/knot-core`、`knot-next/bin/knot`。
+- `scripts/build.sh --all`：Linux、macOS、Windows 的 amd64/arm64 共六组交叉编译通过。
+- 独立 Linux CLI/core 进程实测：在隔离临时目录中先运行 init，再经伪终端填写 URL、Secret、自动启动选项和含空格的程序路径；配置路径自动补全，服务启动并保存连接。CLI 经 Ctrl+c 确认退出返回 130 后，core 仍可通过版本 API 访问。Secret 未出现在终端输出，core 配置字节未被 CLI 修改，未生成 core.json 或 token 文件。实测服务最后通过 API 关闭并确认释放端口。
+
+测试还覆盖：语言与 core 设置互相保留、旧语言文件触发首次设置、空 Secret 有效、80×24/120×35 双语表单、动态字段、路径手填与自动来源、重复提交/过期结果/取消后不保存、认证和协议错误不启动、超时不启动、并发复用启动、子进程提前退出时仍等待竞争实例、已启动服务断线后不循环拉起、配置目录跨状态目录的实例锁，以及旧运行文件保持原样。
+
+macOS/Windows 原生后台进程、终端及凭据存储行为仍待实机验收；交叉编译结果只证明编译通过。

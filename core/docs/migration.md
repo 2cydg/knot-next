@@ -6,8 +6,8 @@
 
 | 数据 | core 的行为 |
 | --- | --- |
-| 配置 | `$XDG_CONFIG_HOME/knot/config.toml`；未设置 XDG 时为 `~/.config/knot/config.toml`，三平台沿用旧规则 |
-| 最近使用 | `$XDG_STATE_HOME/knot/state.json`；未设置时为 `~/.local/state/knot/state.json`；保留原文件与 ID，成功使用回调在 B09 接入 |
+| 配置 | `~/.config/knot/config.toml`；指定 `--config` 时使用指定文件 |
+| 最近使用 | `~/.local/state/knot/state.json`；指定 `--config` 时位于配置文件所在目录的 `.knot-state/state.json` |
 | 信任 | 显式 `known_hosts_path` 优先，否则配置目录中的 `known_hosts`；保留 hashed host 和非默认端口记录 |
 | 密文 | 保留 `ENC:` + 单层 Base64；provider 接收原始密文字节；普通写入不重新加密未修改的密文 |
 | Linux | 复用 `.salt`、`.crypto-state`，固定已选 provider；Secret Service 身份为 `knot` / `knot-master-key`，fallback 为旧 machine-id + NUL + UID 派生 |
@@ -82,3 +82,5 @@ ID 与 alias 分别命中不同目标对象属于歧义冲突，三种策略都�
 扩展 forward 的 bind 现在只接受有效 IP（IPv6 可带 zone）或精确的 `localhost`，不接受 `myhost:8080` 等 hostname bind。这相对于此前仅检查 host:port 的手写配置是兼容性收窄，保留它是为了在保存和创建实例前判定绑定地址，不隐含选择 DNS 解析出的接口。
 
 只读加载及 GET 仍可原样显示已有 hostname bind，但后续配置写入的最终校验、新运行实例创建和显式导入会拒绝它；自动启用时会留下失败结果，不静默改写或声称已启用。可先通过 GET/PUT forwards 整组把 bind 改为需要绑定的具体 IP（仅本机访问可用 `127.0.0.1`、`[::1]` 或 `localhost`），也可在停止 daemon 后编辑 TOML。其他普通配置写入须在修正后进行。target 仍接受合法 hostname，此收窄不适用于转发目标地址。
+
+此前通过 XDG 环境变量使用自定义目录的用户，需要自行将原数据迁至新默认目录，或使用 `--config` 指向原配置文件。显式配置文件的状态目录位于其所在目录的 `.knot-state`。

@@ -1,74 +1,16 @@
 package auth
 
 import (
-	"crypto/rand"
 	"crypto/subtle"
-	"encoding/base64"
 	"errors"
 	"net/http"
-	"os"
 	"strings"
 )
-
-const tokenBytes = 32
 
 var (
 	ErrMissingToken = errors.New("missing token")
 	ErrInvalidToken = errors.New("invalid token")
 )
-
-type TokenStore struct {
-	Path string
-}
-
-func (s TokenStore) LoadOrCreate() (string, error) {
-	token, err := s.Load()
-	if err == nil {
-		return token, nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return "", err
-	}
-	token, err = GenerateToken()
-	if err != nil {
-		return "", err
-	}
-	file, err := os.OpenFile(s.Path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return s.Load()
-		}
-		return "", err
-	}
-	defer file.Close()
-	if _, err := file.WriteString(token + "\n"); err != nil {
-		return "", err
-	}
-	return token, nil
-}
-
-func (s TokenStore) Load() (string, error) {
-	raw, err := os.ReadFile(s.Path)
-	if err != nil {
-		return "", err
-	}
-	token := strings.TrimSpace(string(raw))
-	if token == "" {
-		return "", ErrInvalidToken
-	}
-	if err := os.Chmod(s.Path, 0o600); err != nil {
-		return "", err
-	}
-	return token, nil
-}
-
-func GenerateToken() (string, error) {
-	buf := make([]byte, tokenBytes)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
-}
 
 type Verifier struct {
 	token string
@@ -83,6 +25,9 @@ func (v Verifier) Available() bool {
 }
 
 func (v Verifier) VerifyRequest(r *http.Request) error {
+	if v.token == "" {
+		return nil
+	}
 	got := ExtractToken(r)
 	if got == "" {
 		return ErrMissingToken

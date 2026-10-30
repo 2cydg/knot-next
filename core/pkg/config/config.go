@@ -62,7 +62,7 @@ type Service struct {
 
 func NewService(layout paths.Layout, provider crypto.Provider) *Service {
 	return &Service{
-		path:      filepath.Join(layout.ConfigDir, "config.toml"),
+		path:      layout.ConfigurationFile(),
 		layout:    layout,
 		recent:    recent.New(layout, nil),
 		crypto:    provider,
@@ -71,6 +71,7 @@ func NewService(layout paths.Layout, provider crypto.Provider) *Service {
 }
 
 type Config struct {
+	Service       ServiceSettings               `json:"-" toml:"service"`
 	Warnings      []ValidationError             `json:"-" toml:"-"`
 	SchemaVersion int                           `json:"schema_version" toml:"-"`
 	Settings      Settings                      `json:"settings" toml:"settings"`
@@ -1345,6 +1346,7 @@ func (s *Service) decryptSecret(value string) (string, error) {
 func defaultConfig() Config {
 	now := time.Now().UTC()
 	return Config{
+		Service:       ServiceSettings{Port: DefaultServicePort},
 		SchemaVersion: 1,
 		Settings: Settings{
 			ForwardAgent:          true,
@@ -1381,6 +1383,7 @@ func ensureMaps(cfg *Config) {
 
 func cloneConfig(cfg Config) Config {
 	clone := cfg
+	clone.Service.AllowedOrigins = append([]string(nil), cfg.Service.AllowedOrigins...)
 	clone.Warnings = append([]ValidationError(nil), cfg.Warnings...)
 	clone.Servers = make(map[string]ServerProfile, len(cfg.Servers))
 	for id, server := range cfg.Servers {

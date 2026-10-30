@@ -451,6 +451,6 @@ func allowSaltInitialization(layout paths.Layout, initialize bool) bool {
 	if !initialize {
 		return false
 	}
-	raw, err := os.ReadFile(filepath.Join(layout.ConfigDir, "config.toml"))
+	raw, err := os.ReadFile(layout.ConfigurationFile())
 	return errors.Is(err, os.ErrNotExist) || err == nil && !bytes.Contains(raw, []byte("ENC:"))
 }

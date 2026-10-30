@@ -10,8 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
 	apihttp "knot-core/internal/api/http"
@@ -31,7 +29,7 @@ import (
 )
 
 const (
-	defaultPort = 17898
+	defaultPort = config.DefaultServicePort
 
 	// shutdownGracePeriod bounds the graceful phase of teardown. It lives here
 	// rather than at the call site so every trigger — the API, a signal, or a
@@ -46,11 +44,23 @@ func main() {
 }
 
 func run() error {
-	var port int
-	var origins string
-	flag.IntVar(&port, "port", envInt("KNOT_CORE_PORT", defaultPort), "loopback HTTP port")
-	flag.StringVar(&origins, "allowed-origin", "", "comma-separated browser origins allowed to call the local API")
+	if len(os.Args) > 1 && os.Args[1] == "init" {
+		if len(os.Args) != 2 {
+			return fmt.Errorf("usage: knot-core init")
+		}
+		return initializeConfig("config.toml", os.Stdout)
+	}
+	flag.Usage = func() {
+		fmt.Fprintln(flag.CommandLine.Output(), "Usage: knot-core [--config <file>]\n       knot-core init (create config.toml without starting core)")
+		flag.PrintDefaults()
+	}
+
+	var configFile string
+	flag.StringVar(&configFile, "config", "", "core TOML configuration file (defaults to the user configuration)")
 	flag.Parse()
+	if flag.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments; use knot-core --help")
+	}
 
 	startedAt := time.Now().UTC()
 
@@ -62,12 +72,22 @@ func run() error {
 		return fmt.Errorf("resolve paths: %w", err)
 	}
 
+	if configFile != "" {
+		layout, err = paths.WithConfig(configFile)
+		if err != nil {
+			return fmt.Errorf("resolve configuration: %w", err)
+		}
+	}
+	startup, err := config.LoadService(layout, configFile != "")
+	if err != nil {
+		return err
+	}
 	runtimeInfo := coreruntime.NewHolder()
 	connTracker := apihttp.NewConnTracker()
 
 	runner, err := lifecycle.New(lifecycle.Config{
 		Layout:      layout,
-		Port:        port,
+		Port:        startup.Port,
 		Version:     core.DefaultVersion,
 		APIVersion:  core.APIVersion,
 		StartedAt:   startedAt,
@@ -81,7 +101,7 @@ func run() error {
 			MaxHeaderBytes:    1 << 20,
 		},
 		Prepare: func(ctx context.Context, env lifecycle.Env) (stdhttp.Handler, error) {
-			return prepareServices(env, layout, startedAt, origins, runtimeInfo, connTracker)
+			return prepareServices(env, layout, startedAt, startup, runtimeInfo, connTracker)
 		},
 	})
 	if err != nil {
@@ -119,7 +139,7 @@ func prepareServices(
 	env lifecycle.Env,
 	layout paths.Layout,
 	startedAt time.Time,
-	origins string,
+	startup config.ServiceSettings,
 	runtimeInfo *coreruntime.Holder,
 	connTracker *apihttp.ConnTracker,
 ) (handler stdhttp.Handler, resultErr error) {
@@ -147,11 +167,7 @@ func prepareServices(
 		logger.UseRedactor(previousRedactor)
 		return err
 	})
-	token, err := auth.TokenStore{Path: layout.TokenPath}.LoadOrCreate()
-	if err != nil {
-		return nil, fmt.Errorf("load token: %w", err)
-	}
-	// Discovery reports the token that actually exists, not a placeholder.
+	token := startup.Secret
 	env.SetTokenPresent(token != "")
 	file.Redactor().Add(token)
 
@@ -218,34 +234,7 @@ func prepareServices(
 		coreService,
 		runtimeInfo,
 		auth.NewVerifier(token),
-		auth.NewOriginChecker(splitCSV(origins)),
+		auth.NewOriginChecker(startup.AllowedOrigins),
 		apihttp.WithConnTracker(connTracker),
 	).Handler(), nil
-}
-
-func envInt(key string, fallback int) int {
-	raw := os.Getenv(key)
-	if raw == "" {
-		return fallback
-	}
-	value, err := strconv.Atoi(raw)
-	if err != nil {
-		return fallback
-	}
-	return value
-}
-
-func splitCSV(raw string) []string {
-	if raw == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
 }

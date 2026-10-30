@@ -6,7 +6,7 @@ This repository contains two independent Go modules: **knot-core** and **knot-cl
 
 Current structure:
 - `core/` - knot-core service (module: knot-core)
-- `cli/` - Frontend module: entry/i18n, typed public core client, discovery and root TUI
+- `cli/` - Frontend module: entry/i18n, typed public core client, connection setup and root TUI
 
 ## Architecture
 
@@ -75,7 +75,8 @@ go test ./... -v
 
 1. Start core in development mode:
    ```bash
-   ./bin/knot-core --port 17898
+   ./bin/knot-core init
+   knot-core --config ./config.toml
    ```
 
 2. Test with HTTP/WebSocket API:
@@ -114,7 +115,7 @@ core/
 │   ├── api/            # HTTP/WS handlers
 │   ├── auth/           # Token authentication
 │   ├── paths/          # Path management
-│   └── runtime/        # Runtime file management
+│   └── runtime/        # In-memory instance identity
 ├── pkg/
 │   ├── config/         # Configuration
 │   ├── crypto/         # Encryption
@@ -129,7 +130,7 @@ core/
 
 ### CLI (`cli/`)
 
-See [cli/README.md](cli/README.md) for discovery, interactions and launch/exit contracts. Resource management, forwarding, SSH waiting/challenges and raw terminal bridging use real core responses; SFTP UI remains pending. Connection attempts outlive renderers; Bubble Tea must finish before the native bridge starts, and terminal input workers must join before returning to TUI. Challenge answers bind their displayed ID and invalidate prior polls. CLI Agent forwarding is best effort: skip it when core reports unavailable and silently retry once without it if setup fails; do not prompt for optional Agent availability. Keep host trust and authentication confirmations intact. Resource writes remain sequential under the user’s scope: do not add partial-save recovery machinery, rollback or unknown-outcome reconciliation. `scripts/build.sh`, `scripts/test.sh` and `scripts/lint.sh` process both modules with GOWORK=off; `build.sh --all` builds both for six CGO=0 targets. Native macOS/Windows terminal behavior still needs runtime validation.
+See [cli/README.md](cli/README.md) for connection setup, interactions and launch/exit contracts. Resource management, forwarding, SSH waiting/challenges and raw terminal bridging use real core responses; SFTP UI remains pending. Connection attempts outlive renderers; Bubble Tea must finish before the native bridge starts, and terminal input workers must join before returning to TUI. Challenge answers bind their displayed ID and invalidate prior polls. CLI Agent forwarding is best effort: skip it when core reports unavailable and silently retry once without it if setup fails; do not prompt for optional Agent availability. Keep host trust and authentication confirmations intact. Resource writes remain sequential under the user’s scope: do not add partial-save recovery machinery, rollback or unknown-outcome reconciliation. `scripts/build.sh`, `scripts/test.sh` and `scripts/lint.sh` process both modules with GOWORK=off; `build.sh --all` builds both for six CGO=0 targets. Native macOS/Windows terminal behavior still needs runtime validation.
 
 ## Contributing
 
@@ -152,7 +153,7 @@ When contributing:
 - Core service binds to localhost only
 - Token-based authentication
 - Platform-specific secret encryption (Keychain/Secret Service/DPAPI)
-- Configuration contains no plaintext secrets by default
+- Business secrets are encrypted; the restart-only service Secret is stored in the private core TOML file
 
 ## Migration from Legacy knot
 
@@ -175,3 +176,16 @@ cannot be withdrawn through x/crypto/ssh; late workers remain tracked and retain
 shared client leases until the protocol settles or transport closes. Do not
 claim a public timeout means cleanup already finished. Native non-Linux runtime
 validation and a formal terminal client remain outside this baseline batch.
+
+Core startup uses only TOML service settings via `knot-core --config <file>`.
+`knot-core init` creates a local config with port 17898 and a random 32-character
+alphanumeric Secret without starting services or overwriting existing files.
+CLI stores URL/Secret/auto_start/executable/config_file in client.toml, gates first
+use on validated setup, and may launch a detached core on connection refusal.
+It never reads core config, runtime files or token files. Empty Secret disables
+Secret authentication; nonempty Secret protects all business HTTP/WS endpoints,
+including version. Origin validation stays independent. Instance identity lives
+in memory and remains API-visible. Explicit config paths govern writes and locks;
+config-directory instance locks also protect shared crypto/trust state.
+
+Default data directories use the user home (`.config/knot` and `.local/state/knot`); XDG directory environment variables do not override them. Explicit core --config retains its config-directory state layout.

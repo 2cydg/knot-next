@@ -5,18 +5,20 @@ import (
 	"testing"
 )
 
-func TestDefaultLayoutUsesLegacyXDGPathsAndSeparateDiscovery(t *testing.T) {
+func TestDefaultLayoutIgnoresXDGPaths(t *testing.T) {
 	root := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
-	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "state"))
+	t.Setenv("HOME", root)
+	t.Setenv("USERPROFILE", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "ignored-config"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(root, "ignored-state"))
 	layout, err := DefaultLayout()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if layout.ConfigDir != filepath.Join(root, "config", "knot") || layout.StateDir != filepath.Join(root, "state", "knot") {
+	if layout.ConfigDir != filepath.Join(root, ".config", "knot") || layout.StateDir != filepath.Join(root, ".local", "state", "knot") {
 		t.Fatal("legacy business directories changed")
 	}
-	if layout.TokenPath != filepath.Join(layout.StateDir, "runtime", "token") || layout.RuntimePath != filepath.Join(layout.StateDir, "runtime", "core.json") {
-		t.Fatal("core discovery collides with legacy daemon files")
+	if layout.ConfigurationFile() != filepath.Join(layout.ConfigDir, "config.toml") {
+		t.Fatal("default configuration file changed")
 	}
 }

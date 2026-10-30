@@ -77,9 +77,6 @@ func newSSHBackedTestServer(t *testing.T, sshSrv *sshserver.Server) (*Server, st
 	coreService.UseSSHPool(sharedPool)
 
 	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, "attach-test-instance", 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)
-	if err := coreruntime.WriteInfo(layout.RuntimePath, runtimeInfo); err != nil {
-		t.Fatalf("write runtime info: %v", err)
-	}
 	return NewServer(coreService, testRuntimeHolder(runtimeInfo), auth.NewVerifier("test-token"), auth.NewOriginChecker(nil)), profile.ID
 }
 

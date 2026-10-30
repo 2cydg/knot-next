@@ -53,6 +53,8 @@ func coreBinaryPath(t *testing.T) string {
 // coreInstance is a running core process with an isolated layout.
 type coreInstance struct {
 	cmd         *exec.Cmd
+	configPath  string
+	secret      string
 	configDir   string
 	stateDir    string
 	runtimePath string
@@ -98,13 +100,26 @@ func startCore(t *testing.T, extraArgs ...string) *coreInstance {
 
 	root := t.TempDir()
 	configDir := filepath.Join(root, "config")
-	stateDir := filepath.Join(root, "state")
 
-	args := append([]string{"-port", "0"}, extraArgs...)
+	selected := filepath.Join(configDir, "knot", "selected.toml")
+	if err := os.MkdirAll(filepath.Dir(selected), 0700); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	const secret = "integration-secret-keep-private"
+	if err := os.WriteFile(selected, []byte(fmt.Sprintf("[service]\nport=%d\nsecret=%q\n", port, secret)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	args := append([]string{"--config", selected}, extraArgs...)
 	cmd := exec.Command(coreBinaryPath(t), args...)
 	cmd.Env = append(os.Environ(),
-		"XDG_CONFIG_HOME="+configDir,
-		"XDG_STATE_HOME="+stateDir,
+		"HOME="+root,
+		"USERPROFILE="+root,
 	)
 	// Lifecycle tests must not create or depend on the user's Secret Service
 	// item. A private nonexistent bus forces the legacy machine fallback.
@@ -120,10 +135,13 @@ func startCore(t *testing.T, extraArgs ...string) *coreInstance {
 
 	inst := &coreInstance{
 		cmd:         cmd,
+		configPath:  selected,
+		secret:      secret,
+		info:        runtimeFile{Port: port},
 		configDir:   filepath.Join(configDir, "knot"),
-		stateDir:    filepath.Join(stateDir, "knot"),
-		runtimePath: filepath.Join(stateDir, "knot", "runtime", "core.json"),
-		tokenPath:   filepath.Join(stateDir, "knot", "runtime", "token"),
+		stateDir:    filepath.Join(configDir, "knot", ".knot-state"),
+		runtimePath: filepath.Join(configDir, "knot", ".knot-state", "runtime", "core.json"),
+		tokenPath:   filepath.Join(configDir, "knot", ".knot-state", "runtime", "token"),
 	}
 	t.Cleanup(func() { inst.kill(t) })
 
@@ -138,7 +156,7 @@ func (c *coreInstance) waitReady(t *testing.T) runtimeFile {
 	deadline := time.Now().Add(20 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		info, err := c.readRuntimeFile()
+		info, err := c.runtimeInfo()
 		if err != nil {
 			lastErr = err
 			time.Sleep(50 * time.Millisecond)
@@ -169,25 +187,26 @@ func (c *coreInstance) waitReady(t *testing.T) runtimeFile {
 	return runtimeFile{}
 }
 
-func (c *coreInstance) readRuntimeFile() (runtimeFile, error) {
-	raw, err := os.ReadFile(c.runtimePath)
+func (c *coreInstance) runtimeInfo() (runtimeFile, error) {
+	request, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/v1/runtime", c.info.Port), nil)
 	if err != nil {
 		return runtimeFile{}, err
+	}
+	request.Header.Set("Authorization", "Bearer "+c.secret)
+	response, err := (&http.Client{Timeout: time.Second}).Do(request)
+	if err != nil {
+		return runtimeFile{}, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return runtimeFile{}, fmt.Errorf("runtime status %d", response.StatusCode)
 	}
 	var info runtimeFile
-	if err := json.Unmarshal(raw, &info); err != nil {
-		return runtimeFile{}, err
-	}
-	return info, nil
+	err = json.NewDecoder(response.Body).Decode(&envelope[runtimeFile]{Data: &info})
+	return info, err
 }
 
-func (c *coreInstance) token() string {
-	raw, err := os.ReadFile(c.tokenPath)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(raw))
-}
+func (c *coreInstance) token() string { return c.secret }
 
 // request performs an authenticated call against the running instance.
 func (c *coreInstance) request(t *testing.T, method, path string, info runtimeFile) (*http.Response, error) {
@@ -248,7 +267,7 @@ func assertStopped(t *testing.T, c *coreInstance, exitCode int) {
 // TestShutdownViaAuthenticatedAPI covers L05 through the API trigger.
 func TestShutdownViaAuthenticatedAPI(t *testing.T) {
 	inst := startCore(t)
-	assertRuntimeMatchesFile(t, inst)
+	assertRuntimeMatchesListener(t, inst)
 
 	resp, err := inst.request(t, http.MethodPost, "/v1/shutdown", inst.info)
 	if err != nil {
@@ -270,10 +289,10 @@ func TestShutdownViaAuthenticatedAPI(t *testing.T) {
 	assertStopped(t, inst, inst.waitExit(t, 15*time.Second))
 
 	// The instance lock is free, so a fresh instance starts on the same layout.
-	cmd := exec.Command(coreBinaryPath(t), "-port", "0")
+	cmd := exec.Command(coreBinaryPath(t), "--config", inst.configPath)
 	cmd.Env = append(os.Environ(),
-		"XDG_CONFIG_HOME="+filepath.Dir(inst.configDir),
-		"XDG_STATE_HOME="+filepath.Dir(inst.stateDir),
+		"HOME="+filepath.Dir(filepath.Dir(inst.configDir)),
+		"USERPROFILE="+filepath.Dir(filepath.Dir(inst.configDir)),
 	)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("restart core: %v", err)
@@ -282,7 +301,7 @@ func TestShutdownViaAuthenticatedAPI(t *testing.T) {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	}()
-	waitForReadyProcess(t, cmd, inst.runtimePath, inst.tokenPath)
+	(&coreInstance{cmd: cmd, info: inst.info, secret: inst.secret}).waitReady(t)
 }
 
 // TestShutdownSignals covers the SIGINT and SIGTERM triggers, which must run the
@@ -330,9 +349,9 @@ func TestShutdownSignals(t *testing.T) {
 	}
 }
 
-// TestRuntimeEndpointAgreesWithDiscoveryFile covers L01: the API and the file
+// TestRuntimeEndpointAgreesWithListenerWithoutDiscoveryFiles covers L01: the API and the file
 // must describe the same running instance.
-func TestRuntimeEndpointAgreesWithDiscoveryFile(t *testing.T) {
+func TestRuntimeEndpointAgreesWithListenerWithoutDiscoveryFiles(t *testing.T) {
 	inst := startCore(t)
 	defer func() {
 		if _, err := inst.request(t, http.MethodPost, "/v1/shutdown", inst.info); err == nil {
@@ -340,13 +359,13 @@ func TestRuntimeEndpointAgreesWithDiscoveryFile(t *testing.T) {
 		}
 	}()
 
-	assertRuntimeMatchesFile(t, inst)
+	assertRuntimeMatchesListener(t, inst)
 }
 
-func assertRuntimeMatchesFile(t *testing.T, inst *coreInstance) {
+func assertRuntimeMatchesListener(t *testing.T, inst *coreInstance) {
 	t.Helper()
 
-	fileInfo, err := inst.readRuntimeFile()
+	fileInfo, err := inst.runtimeInfo()
 	if err != nil {
 		t.Fatalf("read runtime file: %v", err)
 	}
@@ -359,10 +378,10 @@ func assertRuntimeMatchesFile(t *testing.T, inst *coreInstance) {
 	if !fileInfo.TokenPresent {
 		t.Fatal("runtime file reports token_present=false")
 	}
-	if fileInfo.TokenPath != inst.tokenPath {
+	if fileInfo.TokenPath != "" {
 		t.Fatalf("runtime file token path = %q, want %q", fileInfo.TokenPath, inst.tokenPath)
 	}
-	if fileInfo.RuntimePath != inst.runtimePath {
+	if fileInfo.RuntimePath != "" {
 		t.Fatalf("runtime file runtime path = %q, want %q", fileInfo.RuntimePath, inst.runtimePath)
 	}
 	if fileInfo.ConfigDir != inst.configDir || fileInfo.StateDir != inst.stateDir {
@@ -371,8 +390,10 @@ func assertRuntimeMatchesFile(t *testing.T, inst *coreInstance) {
 	if fileInfo.Version == "" || fileInfo.Version == "1.0.0" {
 		t.Fatalf("runtime file version = %q, want the build version", fileInfo.Version)
 	}
-	if strings.Contains(string(mustRead(t, inst.runtimePath)), inst.token()) {
-		t.Fatal("runtime file contains the token in plaintext")
+	for _, path := range []string{inst.runtimePath, inst.tokenPath} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatal("discovery artifact created", path, err)
+		}
 	}
 
 	resp, err := inst.request(t, http.MethodGet, "/v1/runtime", fileInfo)
@@ -420,7 +441,7 @@ func assertRuntimeMatchesFile(t *testing.T, inst *coreInstance) {
 	if health.Status != "ok" {
 		t.Fatalf("health status = %q, checks = %+v", health.Status, health.Checks)
 	}
-	for _, name := range []string{"token", "runtime_file", "listener"} {
+	for _, name := range []string{"token", "listener"} {
 		found := false
 		for _, check := range health.Checks {
 			if check.Name == name {
@@ -451,14 +472,14 @@ func TestSecondInstanceRejectedWithoutTouchingSharedState(t *testing.T) {
 	inst := startCore(t)
 
 	before := map[string][]byte{}
-	for _, path := range []string{inst.runtimePath, inst.tokenPath} {
+	for _, path := range []string{inst.configPath, filepath.Join(inst.configDir, ".crypto-state")} {
 		before[path] = mustRead(t, path)
 	}
 
-	second := exec.Command(coreBinaryPath(t), "-port", "0")
+	second := exec.Command(coreBinaryPath(t), "--config", inst.configPath)
 	second.Env = append(os.Environ(),
-		"XDG_CONFIG_HOME="+filepath.Dir(inst.configDir),
-		"XDG_STATE_HOME="+filepath.Dir(inst.stateDir),
+		"HOME="+filepath.Dir(filepath.Dir(inst.configDir)),
+		"USERPROFILE="+filepath.Dir(filepath.Dir(inst.configDir)),
 	)
 	output, err := second.CombinedOutput()
 	if err == nil {
@@ -490,35 +511,6 @@ func TestSecondInstanceRejectedWithoutTouchingSharedState(t *testing.T) {
 	assertStopped(t, inst, inst.waitExit(t, 15*time.Second))
 }
 
-// waitForReadyProcess waits for a freshly started process to publish a runtime
-// file and answer an authenticated health request.
-func waitForReadyProcess(t *testing.T, cmd *exec.Cmd, runtimePath, tokenPath string) {
-	t.Helper()
-	deadline := time.Now().Add(20 * time.Second)
-	for time.Now().Before(deadline) {
-		raw, err := os.ReadFile(runtimePath)
-		if err == nil {
-			var info runtimeFile
-			if json.Unmarshal(raw, &info) == nil && info.Port > 0 {
-				token, err := os.ReadFile(tokenPath)
-				if err == nil {
-					req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/v1/health", info.Port), nil)
-					req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
-					client := &http.Client{Timeout: time.Second}
-					if resp, err := client.Do(req); err == nil {
-						_ = resp.Body.Close()
-						if resp.StatusCode == http.StatusOK {
-							return
-						}
-					}
-				}
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("restarted core did not become ready")
-}
-
 // rebind proves a port was really released by binding it again.
 func rebind(port int) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
@@ -526,4 +518,27 @@ func rebind(port int) error {
 		return err
 	}
 	return ln.Close()
+}
+
+func TestInitCommandCreatesOnlyCurrentDirectoryConfig(t *testing.T) {
+	dir := t.TempDir()
+	cmd := exec.Command(coreBinaryPath(t), "init")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "HOME="+filepath.Join(dir, "unused-home"), "USERPROFILE="+filepath.Join(dir, "unused-home"))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("init failed: %v %s", err, output)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "config.toml" {
+		t.Fatal("init touched service state", err)
+	}
+	original := mustRead(t, filepath.Join(dir, "config.toml"))
+	cmd = exec.Command(coreBinaryPath(t), "init")
+	cmd.Dir = dir
+	if err := cmd.Run(); err == nil {
+		t.Fatal("init accepted existing configuration")
+	}
+	if string(mustRead(t, filepath.Join(dir, "config.toml"))) != string(original) {
+		t.Fatal("init overwrote configuration")
+	}
 }

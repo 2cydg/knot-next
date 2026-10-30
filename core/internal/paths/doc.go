@@ -1,2 +1,2 @@
-// Package paths resolves config, state, runtime, token, and log paths.
+// Package paths resolves configuration, state, lock and log locations.
 package paths

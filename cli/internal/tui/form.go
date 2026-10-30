@@ -128,12 +128,14 @@ func (f *Field) update(msg tea.Msg) tea.Cmd {
 // Form owns widget focus and submission routing; widgets never decide whether
 // pasted multiline data, Enter or Tab is a business submission.
 type Form struct {
-	Fields   []Field
-	Index    int
-	Busy     bool
-	initial  []string
-	Sections []Choice
-	Section  string
+	BeforeValidate func()
+	OnFocus        func(int)
+	Fields         []Field
+	Index          int
+	Busy           bool
+	initial        []string
+	Sections       []Choice
+	Section        string
 }
 
 func NewForm(fields ...Field) *Form {
@@ -144,6 +146,9 @@ func NewForm(fields ...Field) *Form {
 	return f
 }
 func (f *Form) Focus(index int) tea.Cmd {
+	if f.OnFocus != nil {
+		f.OnFocus(index)
+	}
 	for i := range f.Fields {
 		f.Fields[i].blur()
 	}

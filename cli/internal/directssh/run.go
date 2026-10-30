@@ -16,8 +16,10 @@ import (
 
 	"knot-cli/internal/connection"
 	"knot-cli/internal/coreclient"
+	"knot-cli/internal/corestart"
 	"knot-cli/internal/entry"
 	"knot-cli/internal/i18n"
+	"knot-cli/internal/preferences"
 	"knot-cli/internal/terminal"
 )
 
@@ -36,12 +38,29 @@ func Run(ctx context.Context, ref string, tr i18n.Translator, input io.Reader, o
 		fmt.Fprintln(diagnostics, tr.ProtocolError(display(coreclient.Code(err))))
 		return entry.ExitFailure
 	}
-	path, err := coreclient.RuntimeFile()
+	settings, err := preferences.Load()
+	if err != nil {
+		return fail(err)
+	}
+	if !settings.Configured() {
+		return fail(coreclient.Failure("CLIENT_CONFIG_INVALID"))
+	}
+	directory, err := os.Getwd()
+	if err != nil {
+		return fail(err)
+	}
+	selected, err := corestart.ResolvePaths(*settings.Core, directory)
 	if err != nil {
 		return fail(err)
 	}
 	loadCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	snapshot, err := coreclient.Load(loadCtx, path)
+	coordinator := corestart.New(corestart.Dependencies{})
+	err = coordinator.Ensure(loadCtx, selected)
+	if err != nil {
+		cancel()
+		return fail(err)
+	}
+	snapshot, err := coreclient.Load(loadCtx, selected.URL, selected.Secret)
 	cancel()
 	if err != nil {
 		return fail(err)

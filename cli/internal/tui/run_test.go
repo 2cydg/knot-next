@@ -3,24 +3,21 @@ package tui
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 
-	"knot-cli/internal/coreclient"
 	"knot-cli/internal/entry"
 	"knot-cli/internal/i18n"
+	"knot-cli/internal/preferences"
 )
 
 func TestRunErrorMapsInterruptsWithoutProtocolDiagnostic(t *testing.T) {
@@ -37,7 +34,7 @@ func TestRunErrorMapsInterruptsWithoutProtocolDiagnostic(t *testing.T) {
 }
 
 func TestRunCanceledBeforeDiscovery(t *testing.T) {
-	t.Setenv("KNOT_RUNTIME_FILE", "invalid-relative-path")
+	setTestHome(t, t.TempDir())
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	for _, args := range [][]string{nil, {"ssh", "alias"}} {
@@ -50,7 +47,14 @@ func TestRunCanceledBeforeDiscovery(t *testing.T) {
 }
 
 func TestRunSetsAndRestoresTitleWhenDiscoveryFails(t *testing.T) {
-	t.Setenv("KNOT_RUNTIME_FILE", "invalid-relative-path")
+	setTestHome(t, t.TempDir())
+	path, _ := preferences.Path()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("invalid = ["), 0600); err != nil {
+		t.Fatal(err)
+	}
 	for _, args := range [][]string{nil, {"ssh", "alias"}} {
 		launch, _ := entry.Parse(args)
 		var output, diagnostics bytes.Buffer
@@ -89,17 +93,8 @@ func TestAliasRunCancellationReleasesHTTPRequest(t *testing.T) {
 
 func setRunRuntime(t *testing.T, server *httptest.Server) {
 	t.Helper()
-	dir := t.TempDir()
-	token := filepath.Join(dir, "token")
-	path := filepath.Join(dir, "core.json")
-	u, _ := url.Parse(server.URL)
-	port, _ := strconv.Atoi(u.Port())
-	runtime, _ := json.Marshal(coreclient.Runtime{InstanceID: "instance", APIVersion: "v1", Port: port, ListenAddresses: []string{u.Host}, TokenPath: token})
-	if err := os.WriteFile(token, []byte("token"), 0600); err != nil {
+	setTestHome(t, t.TempDir())
+	if err := preferences.Save(preferences.Settings{Core: &preferences.Core{URL: server.URL, Secret: "token"}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, runtime, 0600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("KNOT_RUNTIME_FILE", path)
 }

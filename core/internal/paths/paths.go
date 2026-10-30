@@ -8,21 +8,20 @@ import (
 )
 
 type Layout struct {
-	ConfigDir   string `json:"config_dir"`
-	StateDir    string `json:"state_dir"`
-	RuntimeDir  string `json:"runtime_dir"`
-	LogDir      string `json:"log_dir"`
-	TokenPath   string `json:"token_path"`
-	RuntimePath string `json:"runtime_path"`
-	LogPath     string `json:"log_path"`
+	ConfigFile string `json:"-"`
+	ConfigDir  string `json:"config_dir"`
+	StateDir   string `json:"state_dir"`
+	RuntimeDir string `json:"runtime_dir"`
+	LogDir     string `json:"log_dir"`
+	LogPath    string `json:"log_path"`
 }
 
 func DefaultLayout() (Layout, error) {
-	configBase, err := legacyBaseDir("XDG_CONFIG_HOME", ".config")
+	configBase, err := legacyBaseDir(".config")
 	if err != nil {
 		return Layout{}, err
 	}
-	stateBase, err := legacyBaseDir("XDG_STATE_HOME", filepath.Join(".local", "state"))
+	stateBase, err := legacyBaseDir(filepath.Join(".local", "state"))
 	if err != nil {
 		return Layout{}, err
 	}
@@ -33,13 +32,11 @@ func NewLayout(configDir, stateDir string) Layout {
 	runtimeDir := filepath.Join(stateDir, "runtime")
 	logDir := filepath.Join(stateDir, "log")
 	return Layout{
-		ConfigDir:   configDir,
-		StateDir:    stateDir,
-		RuntimeDir:  runtimeDir,
-		LogDir:      logDir,
-		TokenPath:   filepath.Join(runtimeDir, "token"),
-		RuntimePath: filepath.Join(runtimeDir, "core.json"),
-		LogPath:     filepath.Join(logDir, "core.log"),
+		ConfigDir:  configDir,
+		StateDir:   stateDir,
+		RuntimeDir: runtimeDir,
+		LogDir:     logDir,
+		LogPath:    filepath.Join(logDir, "core.log"),
 	}
 }
 
@@ -56,10 +53,7 @@ func (l Layout) Ensure() error {
 }
 
 // Legacy Knot used the same home fallbacks on all three platforms.
-func legacyBaseDir(env, suffix string) (string, error) {
-	if dir := os.Getenv(env); dir != "" {
-		return dir, nil
-	}
+func legacyBaseDir(suffix string) (string, error) {
 	home, err := os.UserHomeDir()
 	if err == nil && home != "" {
 		return filepath.Join(home, suffix), nil
@@ -72,4 +66,29 @@ func legacyBaseDir(env, suffix string) (string, error) {
 		return "", err
 	}
 	return "", userErr
+}
+
+// ConfigurationFile is the single source for configuration writes and locks.
+func (l Layout) ConfigurationFile() string {
+	if l.ConfigFile != "" {
+		return l.ConfigFile
+	}
+	return filepath.Join(l.ConfigDir, "config.toml")
+}
+
+// WithConfig anchors explicit files and their state to a canonical directory.
+// Configurations sharing crypto/trust state also share the instance lock.
+func WithConfig(path string) (Layout, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return Layout{}, err
+	}
+	absolute, err = filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return Layout{}, err
+	}
+	dir := filepath.Dir(absolute)
+	layout := NewLayout(dir, filepath.Join(dir, ".knot-state"))
+	layout.ConfigFile = absolute
+	return layout, nil
 }

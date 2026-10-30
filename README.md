@@ -49,7 +49,8 @@ Scripts / Terminal / AI / Third-party Clients
 
 1. Start the core service:
    ```bash
-   knot-core --port 17898
+   knot-core init
+   knot-core --config ./config.toml
    ```
 
 2. Use HTTP/WebSocket API to manage connections:
@@ -87,7 +88,7 @@ Current capabilities:
 - 🚧 TUI interface (bilingual resource CRUD, forwarding and native SSH implemented; SFTP UI under development)
 
 The independent [CLI module](cli/README.md) supports local help/version and a
-bilingual TUI with real core discovery, resource CRUD, proxy tests, sync credentials,
+bilingual TUI with explicit core URL/Secret setup, resource CRUD, proxy tests, sync credentials,
 forwarding management, offline recovery and native SSH with host trust and
 authentication prompts. Start knot-core manually; SFTP file UI and transfers
 remain in development. SSH exits return to the TUI when launched there;

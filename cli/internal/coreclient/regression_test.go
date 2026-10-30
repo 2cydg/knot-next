@@ -2,12 +2,9 @@ package coreclient
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"os/user"
 	"path/filepath"
 	"testing"
 	"time"
@@ -38,15 +35,15 @@ func TestClientDoesNotDependOnGlobalTransport(t *testing.T) {
 }
 
 func TestFailedLoadReturnsNoUsableSnapshot(t *testing.T) {
-	for _, code := range []string{"OFFLINE", "UNAUTHORIZED"} {
+	for _, code := range []string{"PROTOCOL_ERROR", "UNAUTHORIZED"} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if code == "UNAUTHORIZED" {
 				w.WriteHeader(401)
 				return
 			}
-			fixtureHandler(t, func() string { return "restarted" })(w, r)
+			_, _ = w.Write([]byte(`{"data":{}}`))
 		}))
-		s, err := Load(context.Background(), runtimeFixture(t, server, "original"))
+		s, err := Load(context.Background(), server.URL, "private-token")
 		server.Close()
 		if err == nil || s.Client != nil || s.Runtime.InstanceID != "" || len(s.Config.Servers) != 0 {
 			t.Fatal("failed load exposed a partial or closed snapshot", s, err)
@@ -54,53 +51,16 @@ func TestFailedLoadReturnsNoUsableSnapshot(t *testing.T) {
 	}
 }
 
-func TestRuntimeFileUsesCoreHomeFallbackAndRelativeXDG(t *testing.T) {
-	home := t.TempDir()
-	getenv := func(string) string { return "" }
-	path, err := runtimeFile(getenv, func() (string, error) { return "", errors.New("no home environment") }, func() (*user.User, error) { return &user.User{HomeDir: home}, nil })
-	if err != nil || path != filepath.Join(home, ".local", "state", "knot", "runtime", "core.json") {
-		t.Fatal("user.Current fallback differs from core", path, err)
-	}
-	t.Setenv("KNOT_RUNTIME_FILE", "")
-	t.Setenv("XDG_STATE_HOME", "relative-state")
-	path, err = RuntimeFile()
-	want, _ := filepath.Abs(filepath.Join("relative-state", "knot", "runtime", "core.json"))
-	if err != nil || path != want {
-		t.Fatal("relative XDG layout differs from core", path, err)
-	}
-}
-
-func TestRelativeRuntimeTokenIsAnchoredToDiscoveredFile(t *testing.T) {
+func TestOldRuntimeFilesAreIgnored(t *testing.T) {
+	t.Setenv("KNOT_RUNTIME_FILE", filepath.Join(t.TempDir(), "core.json"))
+	t.Setenv("XDG_STATE_HOME", "unusable-state")
 	server := httptest.NewServer(fixtureHandler(t, func() string { return "instance" }))
 	defer server.Close()
-	path := runtimeFixture(t, server, "instance")
-	data, err := os.ReadFile(path)
+	snapshot, err := Load(context.Background(), server.URL, "private-token")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var runtime Runtime
-	if err := json.Unmarshal(data, &runtime); err != nil {
-		t.Fatal(err)
-	}
-	runtime.RuntimePath = filepath.Join("other-working-directory", "state", "knot", "runtime", "core.json")
-	runtime.TokenPath = filepath.Join(filepath.Dir(runtime.RuntimePath), "token")
-	write := func() {
-		data, _ := json.Marshal(runtime)
-		if err := os.WriteFile(path, data, 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write()
-	s, err := Load(context.Background(), path)
-	if err != nil {
-		t.Fatal("relative core paths not resolved", err)
-	}
-	s.Client.Close()
-	runtime.TokenPath = filepath.Join("elsewhere", "token")
-	write()
-	if _, _, err := Discover(path); Code(err) != "INVALID_RUNTIME" {
-		t.Fatal("unrelated relative token path accepted", err)
-	}
+	snapshot.Client.Close()
 }
 
 func TestIdleEventStreamCancellationClosesReaderAndSocket(t *testing.T) {

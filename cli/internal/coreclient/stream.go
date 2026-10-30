@@ -30,7 +30,9 @@ func (s *Socket) Read(ctx context.Context) (websocket.MessageType, []byte, error
 func (s *Socket) Close() { _ = s.conn.CloseNow() }
 func (c *Client) dial(ctx context.Context, path string) (*Socket, error) {
 	header := http.Header{}
-	header.Set("Authorization", "Bearer "+c.token)
+	if c.token != "" {
+		header.Set("Authorization", "Bearer "+c.token)
+	}
 	conn, res, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(c.base, "http")+path, &websocket.DialOptions{HTTPClient: c.http, HTTPHeader: header})
 	if err != nil {
 		if res != nil {

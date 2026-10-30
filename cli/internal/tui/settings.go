@@ -65,10 +65,16 @@ func (m *Model) settingsKey(binding string) tea.Cmd {
 		m.settingsTab = 1 - m.settingsTab
 		m.settingsFieldFocus = false
 	case "ctrl+s":
+		if m.settingsTab == 1 {
+			return m.openCoreConnection(false)
+		}
 		if m.settingsTab == 0 {
 			return m.persistSettings()
 		}
 	case "down", "enter":
+		if m.settingsTab == 1 && binding == "enter" {
+			return m.openCoreConnection(false)
+		}
 		if m.settingsTab == 0 {
 			m.settingsFieldFocus = true
 		}
@@ -117,6 +123,12 @@ func (m *Model) settingsContent(width int) string {
 		body += "\n\n" + m.tr.Message("settings.language") + "\n" + box(value, choiceWidth, 3, m.focus == OperationsFocus && m.settingsFieldFocus)
 		if m.settingsDirty() {
 			body += "\n" + lipgloss.NewStyle().Foreground(muted).Render(m.tr.Message("settings.unsaved"))
+		}
+	}
+	if m.settingsTab == 1 {
+		body += "\n\n" + m.tr.Message("core.edit_hint")
+		if m.coreSettings.URL != "" {
+			body += "\n\n" + m.tr.Message("core.url") + "\n" + Display(m.coreSettings.URL)
 		}
 	}
 	if m.settingsBusy {

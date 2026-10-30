@@ -28,9 +28,9 @@ func addUICatalogs() {
 		"ui.loading":                       {"Loading…", "正在读取…"},
 		"ui.loading_hint":                  {"Waiting for core to return the actual state.", "等待服务返回实际状态。"},
 		"ui.offline":                       {"core offline", "core 离线"},
-		"ui.offline_hint":                  {"Start knot-core manually; the list retries automatically. Resource state is unconfirmed.", "请手动启动 knot-core，列表会自动重试。当前资源状态尚未确认。"},
+		"ui.offline_hint":                  {"Connection failed. Check core connection settings; the list retries automatically.", "连接失败，请检查核心连接设置，列表会自动重试。"},
 		"ui.auth":                          {"core authentication failed", "core 认证失败"},
-		"ui.auth_hint":                     {"Check core and its token file; the list retries automatically.", "请检查服务及认证文件，列表会自动重试。"},
+		"ui.auth_hint":                     {"Check Secret in core connection settings; the list retries automatically.", "请检查核心连接设置中的 Secret，列表会自动重试。"},
 		"ui.error":                         {"Read failed", "读取失败"},
 		"ui.empty":                         {"No resources yet", "尚未创建资源"},
 		"ui.empty_hint":                    {"Start with your first configuration.", "从第一条配置开始。"},
@@ -102,16 +102,11 @@ func addUICatalogs() {
 		"ui.pending":                       {"This operation is still under development.", "此操作仍在开发中。"},
 		"ui.ssh_pending":                   {"SSH connections are still under development.", "SSH 连接仍在开发中。"},
 		"ui.small":                         {"Enlarge the terminal to continue.", "请增大终端窗口以继续。"},
-		"error.RUNTIME_UNAVAILABLE":        {"Runtime file unavailable. Start knot-core manually and retry.", "运行时文件不可用，请手动启动 knot-core 后重试。"},
-		"error.INVALID_RUNTIME":            {"Invalid core runtime file or local endpoint.", "core 运行时文件或本机地址无效。"},
-		"error.AUTH_FILE_INVALID":          {"Cannot read a valid core token; check the authentication file.", "无法读取有效 core token，请检查认证文件。"},
-		"error.UNAUTHORIZED":               {"core authentication failed. Reload the runtime and token before retrying.", "core 认证失败，请重新发现运行时及 token 后重试。"},
-		"error.OFFLINE":                    {"Cannot reach core. Start it manually and retry.", "无法连接 core，请手动启动服务后重试。"},
 		"error.TIMEOUT":                    {"core request timed out; resource state is unconfirmed.", "core 请求超时，当前资源状态尚未确认。"},
 		"error.PROTOCOL_ERROR":             {"Unexpected core response; resource state is unconfirmed.", "core 响应不符合协议，当前资源状态尚未确认。"},
 		"error.RESPONSE_TOO_LARGE":         {"core response exceeds the client limit.", "core 响应超过前端读取上限。"},
 		"error.API_UNSUPPORTED":            {"Unsupported core API version.", "core API 版本不受支持。"},
-		"error.INSTANCE_CHANGED":           {"core instance changed during the request. Retry discovery.", "请求期间 core 实例已变化，请重新发现。"},
+		"error.INSTANCE_CHANGED":           {"core instance changed during the request. Retry the connection.", "请求期间 core 实例已变化，请重新连接。"},
 		"error.CAPABILITY_UNAVAILABLE":     {"The required core capability is unavailable.", "所需 core 能力不可用。"},
 		"error.EVENTS_UNAVAILABLE":         {"Event stream disconnected. State will be restored through GET.", "事件流已断开，将通过 GET 恢复实际状态。"},
 		"error.NOT_FOUND":                  {"Resource not found or no longer retained.", "资源不存在或记录已不再保留。"},
@@ -120,6 +115,25 @@ func addUICatalogs() {
 		"error.HOST_KEY_CHALLENGE_EXPIRED": {"Host trust confirmation expired; reconnect.", "主机信任确认已超时，请重新连接。"},
 		"error.AUTH_CHALLENGE_EXPIRED":     {"Authentication confirmation expired; reconnect.", "认证确认已超时，请重新连接。"},
 	}
+	entries["core.title"] = [2]string{"Core connection", "Core 连接配置"}
+	entries["core.url"] = [2]string{"Core URL", "Core URL"}
+	entries["core.secret"] = [2]string{"Secret", "Secret"}
+	entries["core.auto_start"] = [2]string{"Start core automatically", "自动启动 core"}
+	entries["core.executable"] = [2]string{"Core executable", "Core 程序路径"}
+	entries["core.config_file"] = [2]string{"Core configuration file", "Core 配置文件路径"}
+	entries["core.edit_hint"] = [2]string{"Enter / Ctrl+s Configure core connection", "Enter / Ctrl+s 配置 core 连接"}
+	entries["core.setup_hints"] = [2]string{"↑/↓ Fields  Ctrl+s Save  Ctrl+c Exit", "↑/↓ 切换字段  Ctrl+s 保存  Ctrl+c 退出"}
+	entries["core.save_failed"] = [2]string{"Could not save client settings.", "客户端设置保存失败。"}
+	entries["error.INVALID_URL"] = [2]string{"Invalid local core URL.", "Core URL 格式无效。"}
+	entries["error.INVALID_SECRET"] = [2]string{"Secret cannot contain whitespace.", "Secret 不能包含空白字符。"}
+	entries["error.UNAUTHORIZED"] = [2]string{"Secret authentication failed.", "Secret 认证失败。"}
+	entries["error.OFFLINE"] = [2]string{"Connection failed.", "连接失败。"}
+	entries["error.UNREACHABLE"] = [2]string{"Connection failed.", "连接失败。"}
+	entries["error.EXECUTABLE_INVALID"] = [2]string{"Core executable does not exist or cannot be executed.", "Core 程序不存在或没有执行权限。"}
+	entries["error.CONFIG_PATH_INVALID"] = [2]string{"Core configuration file path is required.", "请填写 Core 配置文件路径。"}
+	entries["error.CORE_START_FAILED"] = [2]string{"Core exited before becoming ready; check its configuration and diagnostic log.", "Core 启动失败：进程在就绪前退出，请检查其配置和诊断日志。"}
+	entries["error.CLIENT_CONFIG_INVALID"] = [2]string{"Cannot read client connection settings.", "无法读取客户端连接配置。"}
+	entries["core.start_exit"] = [2]string{"Core exited before becoming ready (exit code {{.Code}}). Check its configuration.", "Core 启动失败：进程在就绪前退出（退出码 {{.Code}}），请检查配置。"}
 	for key, pair := range entries {
 		catalogs[English][key] = pair[0]
 		catalogs[Chinese][key] = pair[1]

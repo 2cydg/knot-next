@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -56,15 +57,15 @@ type Client struct {
 func New(base, token string) (*Client, error) {
 	u, err := url.Parse(base)
 	if err != nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
-		return nil, Failure("INVALID_RUNTIME")
+		return nil, Failure("INVALID_URL")
 	}
 	ip := net.ParseIP(u.Hostname())
 	port, err := strconv.Atoi(u.Port())
 	if ip == nil || !ip.IsLoopback() || err != nil || port < 1 || port > 65535 {
-		return nil, Failure("INVALID_RUNTIME")
+		return nil, Failure("INVALID_URL")
 	}
-	if token == "" || strings.ContainsAny(token, "\r\n") {
-		return nil, Failure("AUTH_FILE_INVALID")
+	if strings.ContainsAny(token, " \t\r\n") {
+		return nil, Failure("INVALID_SECRET")
 	}
 	transport := &http.Transport{
 		DialContext:  (&net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -100,7 +101,9 @@ func (c *Client) request(ctx context.Context, method, path string, value, dest a
 	if err != nil {
 		return Failure("PROTOCOL_ERROR")
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	req.Header.Set("Accept", "application/json")
 	if value != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -113,6 +116,9 @@ func (c *Client) request(ctx context.Context, method, path string, value, dest a
 		var n net.Error
 		if errors.As(err, &n) && n.Timeout() {
 			return Failure("TIMEOUT")
+		}
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return Failure("UNREACHABLE")
 		}
 		return Failure("OFFLINE")
 	}

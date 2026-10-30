@@ -29,8 +29,7 @@ import (
 	"knot-core/pkg/sshpool"
 )
 
-// testRuntimeHolder publishes discovery information the way startup does, so
-// the API reports the same values the tests wrote to disk.
+// testRuntimeHolder publishes instance information in memory, as startup does.
 func testRuntimeHolder(info coreruntime.Info) *coreruntime.Holder {
 	holder := coreruntime.NewHolder()
 	holder.Set(info)
@@ -192,7 +191,6 @@ func TestServerHealthReportsChecks(t *testing.T) {
 		t.Fatalf("health status = %q, want ok: %+v", body.Data.Status, body.Data.Checks)
 	}
 	assertHealthCheck(t, body.Data.Checks, "token", "ok")
-	assertHealthCheck(t, body.Data.Checks, "runtime_file", "ok")
 	assertHealthCheck(t, body.Data.Checks, "config", "ok")
 	assertHealthCheck(t, body.Data.Checks, "crypto", "ok")
 	assertHealthCheck(t, body.Data.Checks, "ssh_pool", "ok")
@@ -210,9 +208,6 @@ func TestServerHealthReportsDegradedConfig(t *testing.T) {
 		t.Fatalf("write invalid config: %v", err)
 	}
 	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, "test-instance-id", 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)
-	if err := coreruntime.WriteInfo(layout.RuntimePath, runtimeInfo); err != nil {
-		t.Fatalf("write runtime info: %v", err)
-	}
 	provider := crypto.NewStaticProvider([]byte("test-key"))
 	configService := config.NewService(layout, provider)
 	coreService := core.New(core.DefaultVersion, startedAt)
@@ -238,7 +233,6 @@ func TestServerHealthReportsDegradedConfig(t *testing.T) {
 		t.Fatalf("health status = %q, want degraded", body.Data.Status)
 	}
 	assertHealthCheck(t, body.Data.Checks, "token", "ok")
-	assertHealthCheck(t, body.Data.Checks, "runtime_file", "ok")
 	assertHealthCheck(t, body.Data.Checks, "config", "failed")
 	assertHealthCheck(t, body.Data.Checks, "crypto", "ok")
 	assertHealthCheck(t, body.Data.Checks, "ssh_pool", "ok")
@@ -1516,9 +1510,6 @@ func newTestServerWithOrigins(t testing.TB, origins []string) *Server {
 		t.Fatalf("ensure layout: %v", err)
 	}
 	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, "test-instance-id", 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)
-	if err := coreruntime.WriteInfo(layout.RuntimePath, runtimeInfo); err != nil {
-		t.Fatalf("write runtime info: %v", err)
-	}
 	return NewServer(core.New(core.DefaultVersion, startedAt), testRuntimeHolder(runtimeInfo), auth.NewVerifier("test-token"), auth.NewOriginChecker(origins))
 }
 
@@ -1552,9 +1543,6 @@ func newStatefulTestServerWithOptions(t *testing.T, opts ...Option) *Server {
 	coreService.UseSFTP(sftpService)
 	coreService.UseSSHPool(sharedPool)
 	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, "test-instance-id", 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)
-	if err := coreruntime.WriteInfo(layout.RuntimePath, runtimeInfo); err != nil {
-		t.Fatalf("write runtime info: %v", err)
-	}
 	return NewServer(coreService, testRuntimeHolder(runtimeInfo), auth.NewVerifier("test-token"), auth.NewOriginChecker(nil), opts...)
 }
 

@@ -13,7 +13,7 @@ import (
 
 func TestProcessFileLogUsesRuntimePathAndClosesOnShutdown(t *testing.T) {
 	instance := startCore(t)
-	raw, err := os.ReadFile(instance.runtimePath)
+	response, err := instance.request(t, http.MethodGet, "/v1/runtime", instance.info)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,8 +21,13 @@ func TestProcessFileLogUsesRuntimePathAndClosesOnShutdown(t *testing.T) {
 		LogPath    string `json:"log_path"`
 		InstanceID string `json:"instance_id"`
 	}
-	if err = json.Unmarshal(raw, &discovery); err != nil || discovery.LogPath == "" {
-		t.Fatalf("missing log discovery %s %v", raw, err)
+	err = json.NewDecoder(response.Body).Decode(&envelope[struct {
+		LogPath    string `json:"log_path"`
+		InstanceID string `json:"instance_id"`
+	}]{Data: &discovery})
+	response.Body.Close()
+	if err != nil || discovery.LogPath == "" {
+		t.Fatal("missing log metadata", err)
 	}
 	logData, err := os.ReadFile(discovery.LogPath)
 	if err != nil {
@@ -31,10 +36,7 @@ func TestProcessFileLogUsesRuntimePathAndClosesOnShutdown(t *testing.T) {
 	if !bytes.Contains(logData, []byte("core.ready")) || !bytes.Contains(logData, []byte(discovery.InstanceID)) {
 		t.Fatalf("log lacks real readiness/instance: %s", logData)
 	}
-	token, err := os.ReadFile(instance.tokenPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	token := []byte(instance.secret)
 	client := &sftpAPIClient{baseURL: fmt.Sprintf("http://127.0.0.1:%d", instance.info.Port), token: string(bytes.TrimSpace(token)), http: &http.Client{Timeout: 3e9}}
 	var profile struct {
 		ID string `json:"id"`

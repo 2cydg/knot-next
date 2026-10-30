@@ -105,9 +105,10 @@ func (s *Service) Initialize() error {
 }
 
 type bootstrapCommit struct {
-	OldConfig string `json:"old_config"`
-	Config    []byte `json:"config,omitempty"`
-	State     []byte `json:"state"`
+	ConfigPath string `json:"config_path,omitempty"`
+	OldConfig  string `json:"old_config"`
+	Config     []byte `json:"config,omitempty"`
+	State      []byte `json:"state"`
 }
 
 func fileRevision(path string) (string, error) {
@@ -125,7 +126,7 @@ func contentRevision(raw []byte) string { sum := sha256.Sum256(raw); return hex.
 // The recovery marker contains encrypted TOML and the encrypted probe only.
 // It is published before either replacement, making forced exit replayable.
 func commitBootstrap(layout paths.Layout, configRaw, stateRaw []byte) error {
-	configPath := filepath.Join(layout.ConfigDir, "config.toml")
+	configPath := layout.ConfigurationFile()
 	rev, err := fileRevision(configPath)
 	if err != nil {
 		return err
@@ -139,7 +140,7 @@ func commitBootstrap(layout paths.Layout, configRaw, stateRaw []byte) error {
 			return err
 		}
 	}
-	marker, err := json.Marshal(bootstrapCommit{OldConfig: rev, Config: configRaw, State: stateRaw})
+	marker, err := json.Marshal(bootstrapCommit{ConfigPath: configPath, OldConfig: rev, Config: configRaw, State: stateRaw})
 	if err != nil {
 		return err
 	}
@@ -156,7 +157,7 @@ func RecoverBootstrap(layout paths.Layout) error {
 	if _, err := os.Stat(marker); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	return fileutil.WithLock(filepath.Join(layout.ConfigDir, "config.toml.lock"), func() error { return recoverBootstrapLocked(layout) })
+	return fileutil.WithLock(layout.ConfigurationFile()+".lock", func() error { return recoverBootstrapLocked(layout) })
 }
 func recoverBootstrapLocked(layout paths.Layout) error {
 	marker := filepath.Join(layout.ConfigDir, ".bootstrap-recovery")
@@ -168,6 +169,12 @@ func recoverBootstrapLocked(layout paths.Layout) error {
 	if json.Unmarshal(raw, &txn) != nil || len(txn.State) == 0 || txn.OldConfig == "" {
 		return errors.New("invalid bootstrap recovery marker")
 	}
+	if txn.ConfigPath != "" && !samePath(txn.ConfigPath, layout.ConfigurationFile()) {
+		return fmt.Errorf("%w: bootstrap recovery belongs to another configuration file", ErrConflict)
+	}
+	if txn.ConfigPath == "" && filepath.Base(layout.ConfigurationFile()) != "config.toml" {
+		return fmt.Errorf("%w: legacy bootstrap recovery belongs to config.toml", ErrConflict)
+	}
 	var state crypto.State
 	if json.Unmarshal(txn.State, &state) != nil || state.ProbeCiphertext == "" || state.Provider == "" {
 		return errors.New("invalid staged crypto state")
@@ -176,7 +183,7 @@ func recoverBootstrapLocked(layout paths.Layout) error {
 	if existing, err := os.ReadFile(statePath); err == nil && !bytes.Equal(existing, txn.State) {
 		return fmt.Errorf("%w: crypto state changed during bootstrap recovery", ErrConflict)
 	}
-	configPath := filepath.Join(layout.ConfigDir, "config.toml")
+	configPath := layout.ConfigurationFile()
 	rev, err := fileRevision(configPath)
 	if err != nil {
 		return err

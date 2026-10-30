@@ -148,53 +148,26 @@
 - 所有 HTTP 路径都以 `/v1` 开头
 - 所有 WebSocket 路径也属于 `v1` 协议空间
 
-### 2. 本地发现与初始化
+### 2. 配置与客户端初始化
 
-`knot-core` 的本地 client bootstrap 依赖两份本地文件：
+`knot-core init` 在当前目录生成 `config.toml`，不启动服务；写入默认端口 17898 和随机 32 位数字/大小写字母 Secret，文件权限 0600，已有配置不会覆盖。
 
-- runtime 文件：记录 daemon 的监听地址、端口、token 文件路径、日志路径等运行时信息
-- token 文件：保存 HTTP / WebSocket 认证所需的 bearer token
+```toml
+[service]
+port = 17898
+secret = "" # 空字符串表示免 Secret 模式
+allowed_origins = []
+```
 
-约束：
+启动使用 `knot-core --config <文件>`，不再接受 `--port`、`--secret`、`--allowed-origin` 或端口环境变量覆盖。显式文件必须存在且可读、格式有效；加载、保存、配置锁、备份和引导恢复均使用选定路径。显式文件采用规范化绝对路径，其状态位于同目录 `.knot-state`，共享配置目录的进程还受目录实例锁保护。未传配置路径时使用 `~/.config/knot/config.toml` 和 `~/.local/state/knot`，不读取 XDG 数据目录环境变量。
 
-- token 不是 `config.toml` 的用户配置项
-- token 不通过 config API 创建、修改或下发
-- token 由 `knot-core` 在启动时自动加载；不存在时自动生成并写入本地 token 文件
-- client 不负责生成 token，只负责发现并读取 token
-
-默认路径规则：
-
-- 所有平台沿用旧 Knot 路径：`config_dir = {XDG_CONFIG_HOME}/knot`，未设置时为 `~/.config/knot`。
-- `state_dir = {XDG_STATE_HOME}/knot`，未设置时为 `~/.local/state/knot`。
-- `runtime_file = {state_dir}/runtime/core.json`
-- `token_file = {state_dir}/runtime/token`
-- `config_file = {config_dir}/config.toml`
-- 显式启动参数可覆盖目录；客户端读取实际 runtime 内的 `token_path`，不猜测平台目录。
-
-推荐的首次连接顺序：
-
-1. client 定位 `runtime_file`
-2. 若 runtime 文件不存在，则启动或唤起 `knot-core`
-3. `knot-core` 启动后自动生成或加载 token，并写出 runtime 文件
-4. client 读取 runtime 文件，获得 `listen_addresses`、`port`、`token_path`
-5. client 从 `token_path` 读取 token
-6. client 对后续所有 HTTP / WebSocket 请求携带 `Authorization: Bearer <token>`
-
-注意：
-
-- `/v1/runtime` 也需要 token 认证，不能作为“第一次无认证发现”接口
-- 第一次 bootstrap 必须依赖本地 runtime 文件，而不是先调用 HTTP API
+core 不生成 `core.json` 或独立 token 文件，也不读取旧 token 作为认证来源。客户端自行保存 URL 和 Secret，通过版本及运行状态 API 校验连接。实例 ID 只在内存中维护，由 `/v1/runtime` 返回。启动配置 Secret 不通过业务配置 API 返回或修改，手动修改文件并重启后生效。
 
 ### 3. 认证
 
-所有 HTTP 和 WebSocket 请求都必须通过 token 认证。
+`service.secret` 非空时，所有业务 HTTP/WS API（含 version、runtime、health）统一认证；缺失返回 `401 AUTH_REQUIRED`，错误返回 `401 AUTH_FAILED`。支持 `Authorization: Bearer <Secret>`，保留 `X-Knot-Token` 兼容头。
 
-支持两种携带方式：
-
-- `Authorization: Bearer <token>`
-- `X-Knot-Token: <token>`
-
-未携带 token 时返回 `401 AUTH_REQUIRED`。token 错误时返回 `401 AUTH_FAILED`。
+Secret 缺省或为空时全部业务接口免 Secret 校验。两种模式均独立执行 Origin 校验。健康状态不会将免认证或没有运行文件视为故障。
 
 ### 4. Origin 校验
 

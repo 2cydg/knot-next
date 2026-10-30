@@ -1,2 +1,2 @@
-// Package runtime manages daemon runtime metadata and discovery state.
+// Package runtime holds in-memory daemon identity and listener metadata.
 package runtime

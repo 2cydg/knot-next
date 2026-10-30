@@ -13,6 +13,7 @@ const (
 	HostTrust        ModalKind = "host-trust"
 	TransferConfirm  ModalKind = "transfer-confirm"
 	SFTPCloseConfirm ModalKind = "sftp-close-confirm"
+	CoreConnection   ModalKind = "core-connection"
 	EditForm         ModalKind = "form"
 	Draft            ModalKind = "draft"
 	Picker           ModalKind = "picker"
@@ -36,6 +37,7 @@ func (m *Model) openExitConfirm() tea.Cmd {
 func (m *Model) exitKey(key tea.KeyPressMsg) tea.Cmd {
 	switch key.String() {
 	case "ctrl+c", "y", "Y":
+		m.cancelConnectionSetup()
 		m.exitCode = entry.ExitCanceled
 		return tea.Quit
 	case "esc", "n", "N":
@@ -44,6 +46,7 @@ func (m *Model) exitKey(key tea.KeyPressMsg) tea.Cmd {
 		m.exitConfirm.Index = 1 - m.exitConfirm.Index
 	case "enter":
 		if m.exitConfirm.Index == 0 {
+			m.cancelConnectionSetup()
 			m.exitCode = entry.ExitCanceled
 			return tea.Quit
 		}
@@ -143,8 +146,11 @@ func (m *Model) submitForm() tea.Cmd {
 	if form == nil || len(form.Fields) == 0 || form.Busy {
 		return nil
 	}
-	if !m.modalCurrent() {
+	if m.modal.Kind != CoreConnection && !m.modalCurrent() {
 		return m.notify(NoticeMsg{ID: "form-error", Text: m.tr.ProtocolError("INSTANCE_CHANGED"), Error: true})
+	}
+	if form.BeforeValidate != nil {
+		form.BeforeValidate()
 	}
 	cmd := form.Validate(m.tr.Message("ui.required"))
 	if form.Invalid() {

@@ -39,9 +39,9 @@ type Cleanup func(ctx context.Context) error
 type Env struct {
 	// Layout is the resolved path layout, already ensured.
 	Layout paths.Layout
-	// InstanceID identifies this run in the discovery file.
+	// InstanceID identifies this run through the public API.
 	InstanceID string
-	// Runtime receives the published discovery information.
+	// Runtime receives the in-memory instance information.
 	Runtime *coreruntime.Holder
 	// Context is cancelled when teardown starts. Long-running workers created by
 	// Prepare should stop when it is done.
@@ -49,8 +49,7 @@ type Env struct {
 	// RequestShutdown asks the runner to begin its single teardown flow. It is
 	// safe to call repeatedly and from any goroutine.
 	RequestShutdown func()
-	// SetTokenPresent records whether authentication material actually exists,
-	// so the discovery file reports the real state rather than a placeholder.
+	// SetTokenPresent records whether a nonempty Secret was configured.
 	SetTokenPresent func(present bool)
 	// OnCleanup registers a teardown step. Steps run in reverse registration
 	// order, both on a normal teardown and when startup aborts part-way, so a
@@ -77,7 +76,7 @@ type Config struct {
 	StartedAt    time.Time
 	TokenPresent bool
 
-	// Runtime receives the discovery information published at startup.
+	// Runtime receives the instance information published in memory at startup.
 	Runtime *coreruntime.Holder
 
 	// GracePeriod and WorkerTimeout bound teardown. Zero selects the defaults.
@@ -97,11 +96,6 @@ type Config struct {
 	// loopback-only listener.
 	Listen func(port int) ([]net.Listener, []string, error)
 
-	// WriteRuntimeInfo publishes the discovery file. It is injectable so tests
-	// can force a publish failure and check that startup unwinds. Nil selects
-	// the atomic on-disk writer.
-	WriteRuntimeInfo func(path string, info coreruntime.Info) error
-
 	// Logf receives lifecycle diagnostics. Nil selects the standard logger.
 	Logf func(format string, args ...any)
 }
@@ -117,6 +111,7 @@ type Runner struct {
 	cfg        Config
 	instanceID string
 
+	configLock   *fileutil.InstanceLock
 	instanceLock *fileutil.InstanceLock
 	server       *stdhttp.Server
 	listeners    []net.Listener
@@ -162,9 +157,6 @@ func New(cfg Config) (*Runner, error) {
 	if cfg.Listen == nil {
 		cfg.Listen = transport.ListenLoopback
 	}
-	if cfg.WriteRuntimeInfo == nil {
-		cfg.WriteRuntimeInfo = coreruntime.WriteInfo
-	}
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
 	}
@@ -205,6 +197,12 @@ func (r *Runner) Start(ctx context.Context) error {
 		return fmt.Errorf("prepare paths: %w", err)
 	}
 
+	configLock, err := fileutil.AcquireInstanceLock(filepath.Join(r.cfg.Layout.ConfigDir, ".core.instance.lock"))
+	if err != nil {
+		r.cleanup()
+		return fmt.Errorf("acquire config instance lock: %w", err)
+	}
+	r.configLock = configLock
 	r.serviceCtx, r.cancelService = context.WithCancel(context.Background())
 	r.tokenPresent = r.cfg.TokenPresent
 
@@ -241,7 +239,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	r.listeners = listeners
 	r.port = listenerPort(listeners[0], r.cfg.Port)
 
-	// Discovery information is built from the real listener, not from the
+	// Instance information is built from the real listener, not from the
 	// requested port: a randomized port must be reported as the one in use.
 	r.info = coreruntime.NewInfo(
 		r.cfg.Version,
@@ -254,6 +252,11 @@ func (r *Runner) Start(ctx context.Context) error {
 		r.tokenAvailable(),
 	)
 
+	// Publish memory identity before accepting requests; no API request can
+	// observe a ready listener paired with a zero-value instance holder.
+	if r.cfg.Runtime != nil {
+		r.cfg.Runtime.Set(r.info)
+	}
 	errCh := make(chan error, len(r.listeners))
 	if r.server != nil {
 		for _, ln := range r.listeners {
@@ -268,20 +271,6 @@ func (r *Runner) Start(ctx context.Context) error {
 				}
 			}(ln)
 		}
-	}
-
-	// Publish discovery only once the listeners are serving, so a client that
-	// reads the file can reach the port and addresses it names.
-	if err := r.cfg.WriteRuntimeInfo(r.cfg.Layout.RuntimePath, r.info); err != nil {
-		if r.server != nil {
-			_ = r.server.Close()
-		}
-		r.waitWorkers(r.cfg.WorkerTimeout)
-		r.abortStartup()
-		return fmt.Errorf("write runtime info: %w", err)
-	}
-	if r.cfg.Runtime != nil {
-		r.cfg.Runtime.Set(r.info)
 	}
 
 	logger.Diagnostic(slog.LevelInfo, "core.ready", "instance_id", r.instanceID, "port", r.port, "log_path", r.cfg.Layout.LogPath)
@@ -362,7 +351,7 @@ func (r *Runner) Err() error {
 	return r.shutdownErr
 }
 
-// RuntimeInfo returns the discovery information published at startup.
+// RuntimeInfo returns the real instance information published at startup.
 func (r *Runner) RuntimeInfo() coreruntime.Info {
 	return r.info
 }
@@ -477,12 +466,9 @@ func (r *Runner) cleanup() {
 		r.cfg.Runtime.Clear()
 	}
 
-	// Remove runtime info (verify ownership first, so a file published by a
-	// different instance is never deleted).
-	if r.cfg.Layout.RuntimePath != "" {
-		if err := coreruntime.ValidateOwnership(r.cfg.Layout.RuntimePath, r.instanceID); err == nil {
-			_ = os.Remove(r.cfg.Layout.RuntimePath)
-		}
+	if r.configLock != nil {
+		_ = r.configLock.Release()
+		r.configLock = nil
 	}
 
 	if r.instanceLock != nil {

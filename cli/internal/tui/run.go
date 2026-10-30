@@ -15,13 +15,11 @@ import (
 	"knot-cli/internal/directssh"
 	"knot-cli/internal/entry"
 	"knot-cli/internal/i18n"
+	"knot-cli/internal/preferences"
 	"knot-cli/internal/terminal"
 )
 
 func Run(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, input io.Reader, output, diagnostics io.Writer) int {
-	if launch.Mode() == entry.AliasDirect {
-		return directssh.Run(ctx, launch.ServerRef(), tr, input, output, diagnostics)
-	}
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if ctx.Err() != nil {
@@ -29,11 +27,41 @@ func Run(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, in
 	}
 	_ = terminal.SetTitle(output, "Knot")
 	defer func() { _ = terminal.SetTitle(output, "Knot") }()
-	path, err := coreclient.RuntimeFile()
+	settings, err := preferences.Load()
+	if err != nil {
+		return runError(ctx, coreclient.Failure("CLIENT_CONFIG_INVALID"), tr, diagnostics)
+	}
+	directory, err := os.Getwd()
 	if err != nil {
 		return runError(ctx, err, tr, diagnostics)
 	}
-	m := New(ctx, launch, tr, path)
+	if !settings.Configured() {
+		setup := New(ctx, launch, tr, "")
+		setup.firstSetup, setup.setupOnly = true, true
+		if settings.Core != nil {
+			setup.coreSettings = *settings.Core
+		}
+		setup.startupDirectory = directory
+		program := tea.NewProgram(setup, tea.WithContext(ctx), tea.WithInput(input), tea.WithOutput(output))
+		_, err = program.Run()
+		setup.Close()
+		if err != nil {
+			return runError(ctx, err, tr, diagnostics)
+		}
+		if !setup.setupComplete || ctx.Err() != nil {
+			return entry.ExitCanceled
+		}
+		settings, err = preferences.Load()
+		if err != nil {
+			return runError(ctx, err, tr, diagnostics)
+		}
+	}
+	if launch.Mode() == entry.AliasDirect {
+		return directssh.Run(ctx, launch.ServerRef(), tr, input, output, diagnostics)
+	}
+	m := New(ctx, launch, tr, settings.Core.URL)
+	m.startupDirectory = directory
+	m.configureCore(*settings.Core)
 	defer m.Close()
 	for {
 		program := tea.NewProgram(m, tea.WithContext(ctx), tea.WithInput(input), tea.WithOutput(output))
