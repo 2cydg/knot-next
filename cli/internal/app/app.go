@@ -89,7 +89,7 @@ func Run(ctx context.Context, args []string, options Options) int {
 			return ok && options.Stdin != nil && term.IsTerminal(int(options.Stdin.Fd())) && term.IsTerminal(int(stdout.Fd()))
 		}
 	}
-	if !options.IsTerminal() {
+	if launch.Mode() != entry.List && !options.IsTerminal() {
 		fmt.Fprintln(options.Stderr, translator.Text(i18n.TTYRequired, nil))
 		return entry.ExitFailure
 	}

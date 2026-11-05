@@ -221,7 +221,7 @@ func TestServerDetailsAndUnselectedMarker(t *testing.T) {
 		for _, row := range rows {
 			for _, field := range row.Details {
 				switch field[0] {
-				case "auth_method", "proxy", "jumps":
+				case "port", "auth_method", "proxy", "jumps":
 				default:
 					t.Fatal("obsolete server detail", field[0])
 				}

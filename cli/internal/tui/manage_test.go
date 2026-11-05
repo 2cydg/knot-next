@@ -459,3 +459,42 @@ func TestSavedDefinitionDeletionDoesNotStopRuntime(t *testing.T) {
 		t.Fatal("definition delete changed runtime", requests)
 	}
 }
+
+func TestServerCommandAliases(t *testing.T) {
+	for _, alias := range []string{"ssh", "ls", "server"} {
+		t.Run(alias, func(t *testing.T) {
+			m, f := managementModel(t, "servers")
+			m.openEditor(coreclient.Servers, true, false)
+			modal := m.modal
+			for name, value := range map[string]string{"alias": alias, "host": "example", "user": "ops", "auth_method": "agent"} {
+				setField(modal.Form, name, value)
+			}
+			if alias == "ssh" {
+				_ = m.submitForm()
+				if len(f.records()) != 0 {
+					t.Fatal("reserved alias was written")
+				}
+				for _, field := range modal.Form.Fields {
+					if field.Name == "alias" && field.Error != "" {
+						return
+					}
+				}
+				t.Fatal("missing reserved alias error")
+			}
+			result := saveMessage(t, m)
+			if result.Err != nil || result.Message != "manage.server_saved_command" {
+				t.Fatalf("%+v", result)
+			}
+			m.Update(result)
+			found := false
+			for _, notice := range m.notices {
+				if strings.Contains(notice.Text, "knot ssh "+alias) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatal("missing command alias guidance")
+			}
+		})
+	}
+}

@@ -158,3 +158,15 @@ func TestSavedLanguageOverridesSystemPreference(t *testing.T) {
 		t.Fatal("interactive startup failed", code)
 	}
 }
+
+func TestListDispatchDoesNotRequireTerminal(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	called := false
+	code := Run(context.Background(), []string{"ls", "prod"}, Options{IsTerminal: func() bool { return false }, Getwd: func() (string, error) { return t.TempDir(), nil }, Runner: func(_ context.Context, launch Launch) int {
+		called = launch.Context.Mode() == entry.List && launch.Context.ServerRef() == "prod"
+		return 0
+	}})
+	if code != 0 || !called {
+		t.Fatalf("code=%d called=%v", code, called)
+	}
+}

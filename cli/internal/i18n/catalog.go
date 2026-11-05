@@ -32,6 +32,7 @@ var catalogs = map[Language]map[Key]string{
   knot key | keys            Open the keys page
   knot proxy | proxies       Open the proxies page
   knot sync                  Open sync service configuration
+  knot ls [pattern]          List servers without a TUI
   knot ssh <alias>           Connect to an alias matching a page keyword
   knot --help                Show this help without core or a TTY
   knot --version             Show the build version without core or a TTY
@@ -60,6 +61,7 @@ SFTP file management and transfers are still under development.
   knot key | keys            打开密钥页
   knot proxy | proxies       打开代理页
   knot sync                  打开同步服务配置页
+  knot ls [关键词]           在控制台列出服务器
   knot ssh <alias>           直连与页面关键字同名的别名
   knot --help                显示帮助，无需 core 或终端
   knot --version             显示构建版本，无需 core 或终端

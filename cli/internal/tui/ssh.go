@@ -299,6 +299,9 @@ func (m *Model) finishSSH(err error) tea.Cmd {
 }
 
 func (m *Model) showSSHResult(result terminal.Result, warnings []string, id string) tea.Cmd {
+	if result.Err == nil && !result.Detached && result.ExitCode != nil && result.Code() != 0 {
+		return m.notify(NoticeMsg{ID: "ssh", Text: m.tr.Text("ssh.exit", map[string]any{"Code": strconv.Itoa(result.Code())}), Error: true})
+	}
 	text := m.tr.Message("ssh.ended")
 	isError := result.Err != nil || result.Code() != 0
 	if result.ExitCode != nil {

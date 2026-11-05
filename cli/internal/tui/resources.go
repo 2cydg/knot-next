@@ -43,7 +43,7 @@ func (m *Model) allRows() []row {
 	switch m.page {
 	case entry.Servers:
 		for _, s := range config.Servers {
-			target := s.User + "@" + address(s.Host, s.Port)
+
 			recent := m.tr.Message("ui.no_record")
 			r := row{ID: s.ID, Alias: s.Alias}
 			if s.LastUsed != nil {
@@ -66,8 +66,8 @@ func (m *Model) allRows() []row {
 				}
 				jumps = append(jumps, name)
 			}
-			r.Cells = []string{s.Alias, target, strings.Join(s.Tags, ", "), recent}
-			r.Details = [][2]string{{"auth_method", m.auth(s.AuthMethod)}, {"proxy", m.none(proxy)}, {"jumps", m.none(strings.Join(jumps, " → "))}}
+			r.Cells = []string{s.Alias, s.Host, s.User, strings.Join(s.Tags, ", "), recent}
+			r.Details = [][2]string{{"port", strconv.Itoa(s.Port)}, {"auth_method", m.auth(s.AuthMethod)}, {"proxy", m.none(proxy)}, {"jumps", m.none(strings.Join(jumps, " → "))}}
 			rows = append(rows, r)
 		}
 	case entry.Keys:

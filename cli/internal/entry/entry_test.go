@@ -21,6 +21,8 @@ func TestLaunchIntent(t *testing.T) {
 		{[]string{"proxy"}, PageDirect, Proxies, "", ReturnToTUI},
 		{[]string{"proxies"}, PageDirect, Proxies, "", ReturnToTUI},
 		{[]string{"sync"}, PageDirect, Sync, "", ReturnToTUI},
+		{[]string{"ls"}, List, "", "", ExitProgram},
+		{[]string{"ls", "prod"}, List, "", "prod", ExitProgram},
 		{[]string{"生产-01"}, AliasDirect, "", "生产-01", ExitProgram},
 		{[]string{"ssh", "key"}, AliasDirect, "", "key", ExitProgram},
 		{[]string{"ssh", "--help"}, "", "", "", ""},
@@ -84,5 +86,21 @@ func TestRemoteExitIsNeverInvented(t *testing.T) {
 		if RemoteExitCode(&status) != ExitFailure {
 			t.Fatalf("accepted status %d", status)
 		}
+	}
+}
+
+func TestCommandRegistryMatchesDispatch(t *testing.T) {
+	for name := range commands {
+		if !IsCommand(name) {
+			t.Fatal(name)
+		}
+		if name != "ssh" {
+			if _, err := Parse([]string{name}); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+		}
+	}
+	if IsCommand("ordinary") {
+		t.Fatal("ordinary alias is a command")
 	}
 }

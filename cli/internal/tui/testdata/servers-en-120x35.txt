@@ -7,18 +7,18 @@ Knot                                                                            
 │  🔀 Proxies     │ │ │Search aliases; / in the input searches tags                                                  │ │
 │                 │ │ └──────────────────────────────────────────────────────────────────────────────────────────────┘ │
 │  🔄 Sync        │ │ ┌──────────────────────────────────────────────────────────────────┐ ┌─ Details ───────────────┐ │
-│                 │ │ │  Alias           Target          Tags            Last used       │ │                         │ │
-│  ⚙️ Settings    │ │ │──────────────────────────────────────────────────────────────────│ │ Authentication          │ │
-│                 │ │ │> alpha           root@other:22                   2026-10-19 09:02│ │   Unknown ()            │ │
-│                 │ │ │  全角é very-lon… ops@db:22       Production      No record       │ │                         │ │
+│                 │ │ │  Alias        Host         User         Tags         Last used   │ │                         │ │
+│  ⚙️ Settings    │ │ │──────────────────────────────────────────────────────────────────│ │ Port                    │ │
+│                 │ │ │> alpha        other        root                      2026-10-19 …│ │   22                    │ │
+│                 │ │ │  全角é very-… db           ops          Production   No record   │ │                         │ │
+│                 │ │ │                                                                  │ │ Authentication          │ │
+│                 │ │ │                                                                  │ │   Unknown ()            │ │
+│                 │ │ │                                                                  │ │                         │ │
 │                 │ │ │                                                                  │ │ Proxy                   │ │
 │                 │ │ │                                                                  │ │   None                  │ │
 │                 │ │ │                                                                  │ │                         │ │
 │                 │ │ │                                                                  │ │ Jump chain              │ │
 │                 │ │ │                                                                  │ │   None                  │ │
-│                 │ │ │                                                                  │ │                         │ │
-│                 │ │ │                                                                  │ │                         │ │
-│                 │ │ │                                                                  │ │                         │ │
 │                 │ │ │                                                                  │ │                         │ │
 │                 │ │ │                                                                  │ │                         │ │
 │                 │ │ │                                                                  │ │                         │ │

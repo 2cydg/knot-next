@@ -90,8 +90,13 @@ func Run(ctx context.Context, ref string, tr i18n.Translator, input io.Reader, o
 	if err != nil {
 		return fail(err)
 	}
+	suppressWarnings := false
 	defer func() {
-		for _, code := range attempt.Finish() {
+		warnings := attempt.Finish()
+		if suppressWarnings {
+			return
+		}
+		for _, code := range warnings {
 			fmt.Fprintln(diagnostics, tr.Text("ui.warning", map[string]any{"Code": display(code)}))
 		}
 	}()
@@ -107,7 +112,11 @@ func Run(ctx context.Context, ref string, tr i18n.Translator, input io.Reader, o
 	if ctx.Err() != nil {
 		return entry.ExitCanceled
 	}
-	if result.Err != nil {
+	if result.ExitCode != nil && result.Code() != 0 && result.Err == nil {
+		suppressWarnings = true
+		fmt.Fprintln(diagnostics, tr.Text("ssh.exit", map[string]any{"Code": result.Code()}))
+		return result.Code()
+	} else if result.Err != nil {
 		fail(result.Err)
 	}
 	if result.Detached {

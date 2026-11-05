@@ -311,7 +311,7 @@ func (m *Model) mainContent(width, height int) string {
 	return head + table
 }
 func (m *Model) table(rows []row, width, height int) string {
-	keys := []string{"alias", "target", "tags", "recent"}
+	keys := []string{"alias", "host", "user", "tags", "recent"}
 	switch m.page {
 	case entry.Keys:
 		keys = []string{"alias", "type", "bits"}
@@ -322,7 +322,7 @@ func (m *Model) table(rows []row, width, height int) string {
 	}
 	if m.width < 110 {
 		if m.page == entry.Servers {
-			keys = keys[:2]
+			keys = keys[:3]
 		}
 		if m.page == entry.Proxies {
 			keys = keys[:3]

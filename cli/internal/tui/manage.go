@@ -470,6 +470,9 @@ func (m *Model) saveResource(modal *Modal, v map[string]string) tea.Cmd {
 	}
 	var defs []coreclient.ForwardDefinition
 	if d.Kind == coreclient.Servers && !d.CredentialsOnly {
+		if strings.TrimSpace(v["alias"]) == "ssh" {
+			fields["alias"] = m.tr.Message("manage.alias_reserved")
+		}
 		var jumps []string
 		for i := 0; ; i++ {
 			value, ok := v[fmt.Sprintf("jump.%d", i)]
@@ -566,6 +569,9 @@ func (m *Model) saveResource(modal *Modal, v map[string]string) tea.Cmd {
 		if err == nil && d.Kind == coreclient.Servers && !d.CredentialsOnly {
 			err = client.PutForwardDefinitions(ctx, d.ID, defs)
 			result.Message = "manage.server_saved"
+			if entry.IsCommand(d.Server.Alias) && d.Server.Alias != "ssh" {
+				result.Message = "manage.server_saved_command"
+			}
 		}
 		if err == nil {
 			switch d.Kind {
@@ -696,7 +702,11 @@ func (m *Model) handleManageResult(msg manageResult) tea.Cmd {
 		m.cancelProxyTest()
 		m.removeNotice("proxy-test")
 	}
-	return tea.Batch(m.dismissModal(false), m.notify(NoticeMsg{ID: "save", Text: m.tr.Message(msg.Message)}), m.beginLoad(false))
+	message := m.tr.Message(msg.Message)
+	if msg.Message == "manage.server_saved_command" && modal.Edit != nil {
+		message = m.tr.Text("manage.server_saved_command", map[string]any{"Alias": Display(modal.Form.Values()["alias"])})
+	}
+	return tea.Batch(m.dismissModal(false), m.notify(NoticeMsg{ID: "save", Text: message}), m.beginLoad(false))
 }
 
 func (m *Model) confirmResourceAction(kind coreclient.Resource, action string) tea.Cmd {

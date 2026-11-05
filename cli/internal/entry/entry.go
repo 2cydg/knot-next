@@ -13,6 +13,7 @@ const (
 	AliasDirect Mode = "alias"
 	Help        Mode = "help"
 	Version     Mode = "version"
+	List        Mode = "list"
 
 	Servers  Page = "servers"
 	Keys     Page = "keys"
@@ -49,6 +50,18 @@ type UsageError struct {
 
 func (e *UsageError) Error() string { return fmt.Sprintf("invalid arguments: %q", e.Argument) }
 
+// commands is the single registry for top-level command dispatch and alias checks.
+var commands = map[string]LaunchContext{
+	"--help": {mode: Help, policy: ExitProgram}, "--version": {mode: Version, policy: ExitProgram},
+	"server": pageLaunch(Servers), "servers": pageLaunch(Servers),
+	"key": pageLaunch(Keys), "keys": pageLaunch(Keys),
+	"proxy": pageLaunch(Proxies), "proxies": pageLaunch(Proxies),
+	"sync": pageLaunch(Sync), "ssh": {mode: AliasDirect, policy: ExitProgram},
+	"ls": {mode: List, policy: ExitProgram},
+}
+
+func IsCommand(name string) bool { _, ok := commands[name]; return ok }
+
 func Parse(args []string) (LaunchContext, error) {
 	if len(args) == 0 {
 		return LaunchContext{mode: Management, page: Servers, policy: ReturnToTUI}, nil
@@ -56,30 +69,22 @@ func Parse(args []string) (LaunchContext, error) {
 	if len(args) == 2 && args[0] == "ssh" && validAlias(args[1]) {
 		return LaunchContext{mode: AliasDirect, alias: args[1], policy: ExitProgram}, nil
 	}
+	if len(args) == 2 && args[0] == "ls" && args[1] != "" {
+		return LaunchContext{mode: List, alias: args[1], policy: ExitProgram}, nil
+	}
 	if len(args) != 1 {
 		return LaunchContext{}, &UsageError{Argument: fmt.Sprint(args)}
 	}
-	switch args[0] {
-	case "--help":
-		return LaunchContext{mode: Help, policy: ExitProgram}, nil
-	case "--version":
-		return LaunchContext{mode: Version, policy: ExitProgram}, nil
-	case "server", "servers":
-		return pageLaunch(Servers), nil
-	case "key", "keys":
-		return pageLaunch(Keys), nil
-	case "proxy", "proxies":
-		return pageLaunch(Proxies), nil
-	case "sync":
-		return pageLaunch(Sync), nil
-	case "ssh":
-		return LaunchContext{}, &UsageError{Argument: args[0]}
-	default:
-		if !validAlias(args[0]) {
+	if command, ok := commands[args[0]]; ok {
+		if args[0] == "ssh" {
 			return LaunchContext{}, &UsageError{Argument: args[0]}
 		}
-		return LaunchContext{mode: AliasDirect, alias: args[0], policy: ExitProgram}, nil
+		return command, nil
 	}
+	if !validAlias(args[0]) {
+		return LaunchContext{}, &UsageError{Argument: args[0]}
+	}
+	return LaunchContext{mode: AliasDirect, alias: args[0], policy: ExitProgram}, nil
 }
 
 func pageLaunch(page Page) LaunchContext {

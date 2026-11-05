@@ -2,6 +2,8 @@ package i18n
 
 func addManagementCatalogs() {
 	entries := map[Key][2]string{
+		"manage.alias_reserved":           {"The alias ssh is reserved.", "别名 ssh 为保留关键字。"},
+		"manage.server_saved_command":     {"Server saved. Connect with knot ssh {{.Alias}}.", "服务器已保存，请使用 knot ssh {{.Alias}} 连接。"},
 		"ui.action.x":                     {"Clear material", "清除材料"},
 		"ui.action.a":                     {"Default", "默认项"},
 		"manage.new.servers":              {"New server", "新增服务器"},
