@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -117,7 +116,7 @@ func (c *Client) request(ctx context.Context, method, path string, value, dest a
 		if errors.As(err, &n) && n.Timeout() {
 			return Failure("TIMEOUT")
 		}
-		if errors.Is(err, syscall.ECONNREFUSED) {
+		if connectionRefused(err) {
 			return Failure("UNREACHABLE")
 		}
 		return Failure("OFFLINE")

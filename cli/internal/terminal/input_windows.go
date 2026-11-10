@@ -3,16 +3,26 @@ package terminal
 import (
 	"io"
 	"os"
+	"runtime"
 	"sync"
+	"time"
 
 	"golang.org/x/sys/windows"
 )
 
-// Own an overlapped console handle. Cancellation waits for the pending read
-// before closing handles, so a subsequent TUI cannot race an old stdin reader.
+var cancelSynchronousIO = windows.NewLazySystemDLL("kernel32.dll").NewProc("CancelSynchronousIo")
+
+// ReadConsoleW preserves Unicode regardless of the console code page. The read
+// runs on a locked OS thread so CancelSynchronousIo can interrupt it; callers
+// join the input worker before handing the terminal to another reader.
 type consoleInput struct {
-	handle, stop windows.Handle
-	once         sync.Once
+	handle     windows.Handle
+	mu         sync.Mutex
+	canceled   bool
+	thread     windows.Handle
+	readDone   chan struct{}
+	cancelDone chan struct{}
+	decoder    consoleUTF8
 }
 
 func newInput(_ *os.File) (*consoleInput, error) {
@@ -20,48 +30,112 @@ func newInput(_ *os.File) (*consoleInput, error) {
 	if err != nil {
 		return nil, err
 	}
-	handle, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED, 0)
+	handle, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, 0, 0)
 	if err != nil {
 		return nil, err
 	}
-	stop, err := windows.CreateEvent(nil, 1, 0, nil)
-	if err != nil {
-		windows.CloseHandle(handle)
-		return nil, err
-	}
-	return &consoleInput{handle: handle, stop: stop}, nil
+	return &consoleInput{handle: handle}, nil
 }
+
 func (r *consoleInput) Read(buffer []byte) (int, error) {
-	if state, _ := windows.WaitForSingleObject(r.stop, 0); state == windows.WAIT_OBJECT_0 {
-		return 0, io.EOF
+	if len(buffer) == 0 {
+		return 0, nil
 	}
-	event, err := windows.CreateEvent(nil, 1, 0, nil)
+	if n := r.decoder.read(buffer); n > 0 {
+		return n, nil
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	thread, err := windows.OpenThread(windows.THREAD_TERMINATE, false, windows.GetCurrentThreadId())
 	if err != nil {
 		return 0, err
 	}
-	defer windows.CloseHandle(event)
-	op := windows.Overlapped{HEvent: event}
-	var n uint32
-	err = windows.ReadFile(r.handle, buffer, &n, &op)
-	if err != nil && err != windows.ERROR_IO_PENDING {
-		return int(n), err
-	}
-	if err == nil {
-		return int(n), nil
-	}
-	state, err := windows.WaitForMultipleObjects([]windows.Handle{event, r.stop}, false, windows.INFINITE)
-	if err != nil || state == windows.WAIT_OBJECT_0+1 {
-		_ = windows.CancelIoEx(r.handle, &op)
-		_ = windows.GetOverlappedResult(r.handle, &op, &n, true)
+	defer windows.CloseHandle(thread)
+	r.mu.Lock()
+	if r.canceled {
+		r.mu.Unlock()
 		return 0, io.EOF
 	}
-	err = windows.GetOverlappedResult(r.handle, &op, &n, true)
-	return int(n), err
+	done := make(chan struct{})
+	r.thread, r.readDone = thread, done
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		r.thread = 0
+		close(done)
+		cancelDone := r.cancelDone
+		r.mu.Unlock()
+		if cancelDone != nil {
+			<-cancelDone
+		}
+	}()
+	for {
+		// Limiting the read to the requested length keeps confirmation prompts from
+		// consuming the following SSH input; surplus UTF-8 bytes remain buffered.
+		units := make([]uint16, min(len(buffer), 4096))
+		var n uint32
+		err := windows.ReadConsole(r.handle, &units[0], uint32(len(units)), &n, nil)
+		r.mu.Lock()
+		canceled := r.canceled
+		r.mu.Unlock()
+		if canceled {
+			return 0, io.EOF
+		}
+		if err != nil {
+			return 0, err
+		}
+		if n == 0 {
+			return 0, io.EOF
+		}
+		r.decoder.append(units[:n])
+		if n := r.decoder.read(buffer); n > 0 {
+			return n, nil
+		}
+	}
 }
-func (r *consoleInput) Cancel() bool { r.once.Do(func() { _ = windows.SetEvent(r.stop) }); return true }
+
+func (r *consoleInput) Cancel() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.canceled {
+		return true
+	}
+	r.canceled = true
+	if r.thread != 0 {
+		thread, done := r.thread, r.readDone
+		finished := make(chan struct{})
+		r.cancelDone = finished
+		go func() {
+			defer close(finished)
+			// Cancellation can race the start of ReadConsoleW. Retry until the read
+			// has returned, without ever cancelling another thread's operation.
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				cancelSynchronousIO.Call(uintptr(thread))
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
+	return true
+}
 func (r *consoleInput) Close() error {
 	r.Cancel()
-	_ = windows.CloseHandle(r.stop)
+	r.mu.Lock()
+	done := r.cancelDone
+	r.mu.Unlock()
+	if done != nil {
+		<-done
+	}
 	return windows.CloseHandle(r.handle)
 }
 func prepareOutput(output *os.File) (func(), error) {

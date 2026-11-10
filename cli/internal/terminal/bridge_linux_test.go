@@ -54,7 +54,7 @@ func TestNativeBridgeRepeatedRawBytesResizeTailAndRestore(t *testing.T) {
 	for round := range 3 {
 		t.Run(fmt.Sprint(round), func(t *testing.T) {
 			payload := bytes.Repeat([]byte{'X', 0, 0xff, '\r', '\n', '\x1b', '[', 'm'}, 20000)
-			input := []byte{3, 4, 0, 0xff, '\r', '\n', '\x1b', '[', 'A'}
+			input := append([]byte{3, 4, 0, 0xff, '\r', '\n', '\x1b', '[', 'A'}, []byte("中文🙂")...)
 			serverDone := make(chan error, 1)
 			ready := make(chan struct{})
 			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

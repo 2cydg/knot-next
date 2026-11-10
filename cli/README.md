@@ -122,3 +122,5 @@ Bubble Tea 完全结束并释放 stdin 后才启动 raw bridge；退出桥接时
 本轮连接改造的测试、构建及原生平台边界见 [CLI/Core 验收记录](../core/docs/cli-handoff.md#clicore-连接改造验收2026-10-30)。
 
 `knot ls [关键词]` 在控制台列出服务器，支持按别名、主机、用户和标签过滤，无需交互终端。服务器别名不能为 `ssh`；与其他命令同名的别名可以保存，并通过 `knot ssh <alias>` 连接。
+
+Windows SSH 会话使用 Unicode 控制台输入并转换为 UTF-8；实际输入法和旧版控制台兼容性需要在 Windows 上验证。
