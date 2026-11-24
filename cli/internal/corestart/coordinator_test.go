@@ -47,15 +47,25 @@ func TestProbeFailuresNeverRestartHealthyOrAmbiguousTargets(t *testing.T) {
 	}
 }
 func TestConcurrentRequestsShareOneStartAndCompetitorCanWin(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	laggingCtx, cancelLagging := context.WithCancel(ctx)
+	defer cancelLagging()
+	probedBeforeReady := make(chan struct{})
+	resumeProbe := make(chan struct{})
 	var available atomic.Bool
 	var starts atomic.Int32
 	started := make(chan struct{})
 	release := make(chan struct{})
 	exited := make(chan struct{})
 	close(exited)
-	coordinator := New(Dependencies{Check: func(string) error { return nil }, Probe: func(context.Context, preferences.Core) error {
+	coordinator := New(Dependencies{Check: func(string) error { return nil }, Probe: func(probeCtx context.Context, _ preferences.Core) error {
 		if available.Load() {
 			return nil
+		}
+		if probeCtx == laggingCtx {
+			close(probedBeforeReady)
+			<-resumeProbe
 		}
 		return coreclient.Failure("UNREACHABLE")
 	}, Start: func(preferences.Core) (Process, error) {
@@ -64,17 +74,29 @@ func TestConcurrentRequestsShareOneStartAndCompetitorCanWin(t *testing.T) {
 		<-release
 		return controlledProcess{exited}, nil
 	}, Wait: time.Second, Interval: time.Millisecond})
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	first := make(chan error, 1)
+	go func() { first <- coordinator.Ensure(ctx, testSettings()) }()
+	<-started
+	lagging := make(chan error, 1)
+	go func() { lagging <- coordinator.Ensure(laggingCtx, testSettings()) }()
+	<-probedBeforeReady
 	var workers sync.WaitGroup
-	results := make(chan error, 8)
-	for range 8 {
+	results := make(chan error, 6)
+	for range 6 {
 		workers.Add(1)
 		go func() { defer workers.Done(); results <- coordinator.Ensure(ctx, testSettings()) }()
 	}
-	<-started
 	available.Store(true)
 	close(release)
+	firstErr := <-first
+	// Deliver the stale probe result after the shared startup has succeeded.
+	close(resumeProbe)
+	if firstErr != nil {
+		t.Fatal("startup failed", firstErr)
+	}
+	if err := <-lagging; err != nil {
+		t.Fatal("concurrent request returned a stale probe result", err)
+	}
 	workers.Wait()
 	close(results)
 	for err := range results {

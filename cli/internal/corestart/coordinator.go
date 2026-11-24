@@ -157,7 +157,8 @@ func (c *Coordinator) Ensure(ctx context.Context, settings preferences.Core) err
 			if previous.err != nil {
 				return previous.err
 			}
-			return err
+			// The first probe may have failed while the shared startup was still running.
+			return c.deps.Probe(ctx, settings)
 		default:
 			return await(ctx, previous)
 		}
