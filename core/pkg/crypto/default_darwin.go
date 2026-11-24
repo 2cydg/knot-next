@@ -49,14 +49,14 @@ func openPlatformProvider(layout paths.Layout, initialize bool) (Provider, error
 	}
 
 	// 2. Get or create Keychain key
-	key, err := keychainKey(initialize)
-	if err != nil {
-		slog.Debug("Keychain access failed, will use Machine ID fallback if available", "error", err)
-	}
+	key, keychainErr := keychainKey(initialize)
 
 	// 3. Validation
 	if key == nil && fallbackKey == nil {
-		return nil, fmt.Errorf("failed to initialize any crypto provider on macOS (Keychain failed and Machine ID not found)")
+		return nil, fmt.Errorf("macOS crypto provider unavailable: %w", keychainErr)
+	}
+	if key == nil {
+		slog.Warn("macOS Keychain unavailable, using the machine ID fallback", "error", keychainErr)
 	}
 
 	return &darwinProvider{
@@ -136,7 +136,7 @@ func keychainKey(initialize bool) ([]byte, error) {
 	addCmd.Stdin = strings.NewReader(fmt.Sprintf("add-generic-password -a %s -s %s -w %s\n",
 		keychainAccount, keychainService, base64.StdEncoding.EncodeToString(key)))
 	if err := addCmd.Run(); err != nil && (!errors.As(err, &exitErr) || exitErr.ExitCode() != duplicateItem) {
-		return nil, fmt.Errorf("add Knot Keychain item: %w", err)
+		return nil, fmt.Errorf("add Knot Keychain item: %w", errors.Join(ctx.Err(), err))
 	}
 	// Another Core using a different config may have created the shared item first.
 	return readKeychainKey(ctx)
@@ -146,7 +146,7 @@ func readKeychainKey(ctx context.Context) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "/usr/bin/security", "find-generic-password", "-a", keychainAccount, "-s", keychainService, "-w")
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("read Knot Keychain item: %w", err)
+		return nil, fmt.Errorf("read Knot Keychain item: %w", errors.Join(ctx.Err(), err))
 	}
 	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
 	if err != nil || len(key) != 32 {

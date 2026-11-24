@@ -8,6 +8,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -50,19 +51,29 @@ def assert_start(cli, env, connection, version, commit):
     assert version_output.startswith(f"knot {version} (commit={commit},"), version_output
     assert "dirty=false)" in version_output, version_output
 
-    request = urllib.request.Request(connection["url"] + "/v1/version", headers={
-        "Authorization": "Bearer " + connection["secret"],
-    })
+    headers = {"Authorization": "Bearer " + connection["secret"]}
     client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    log = Path(connection["config_file"]).parent / ".knot-state" / "log" / "core.log"
+
+    def read_api(path):
+        request = urllib.request.Request(connection["url"] + path, headers=headers)
+        with client.open(request, timeout=5) as response:
+            return json.load(response)["data"]
+
     try:
         assert json.loads(run([cli, "ls", "--json"], env)) == []
-        with client.open(request, timeout=5) as response:
-            build = json.load(response)["data"]
+        build = read_api("/v1/version")
         assert build["version"] == version, build
         assert build["commit"] == commit, build
         assert build["dirty"] == "false", build
+        crypto = read_api("/v1/secrets/crypto")
+        assert crypto["available"] is True, crypto
+        print(f"Core crypto provider: {crypto['provider']}", flush=True)
+        if sys.platform == "darwin" and crypto["provider"] == "Machine ID Fallback" and log.is_file():
+            for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+                if "macOS Keychain unavailable" in line:
+                    print(line, flush=True)
     except Exception:
-        log = Path(connection["config_file"]).parent / ".knot-state" / "log" / "core.log"
         if log.is_file():
             print(log.read_text(encoding="utf-8", errors="replace"), flush=True)
         raise

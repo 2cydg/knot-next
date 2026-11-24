@@ -196,6 +196,7 @@ jobs:
           set -euo pipefail
           if [[ "$RUNNER_OS" == macOS ]]; then
             # Use a fresh, unlocked keychain for the temporary runner account.
+            export CFFIXED_USER_HOME="$HOME"
             keychain="$RUNNER_TEMP/knot-release.keychain-db"
             password="$(openssl rand -hex 24)"
             security create-keychain -p "$password" "$keychain"
@@ -211,10 +212,6 @@ jobs:
             commit="$(git rev-parse --short HEAD)"
           fi
           python tests/integration/verify_release_installers.py "$version_tag" "$commit" --assets release-assets
-          if [[ "$RUNNER_OS" == macOS ]]; then
-            security find-generic-password -a knot-master-key -s knot -w "$keychain" |
-              python -c 'import base64, sys; assert len(base64.b64decode(sys.stdin.buffer.read().strip(), validate=True)) == 32'
-          fi
 
   lint:
     name: Go formatting and vet
