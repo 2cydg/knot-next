@@ -359,7 +359,7 @@ Linux amd64 / Go 1.27.1，module 与 CI 当前均为 Go 1.27.1，`GOWORK=off GOC
 
 旧 `golangci-lint-action@v4` 的 `version: latest` 下载 v1.64.8，二进制由 Go 1.24 构建，低于 module 的 Go 1.26.2，因此在分析代码前退出。punycode 和缓存警告不是本次失败原因。
 
-当前 lint 使用 setup-go 固定的 Go 1.27.1，设置 `GOTOOLCHAIN=local`，调用 `scripts/lint.sh` 执行 gofmt/vet，并保存 `lint.log` artifact。不再依赖旧预编译 golangci-lint；检查范围为格式和 Go vet，不声称保留全部第三方 lint 规则。本地 Go 1.27.1 执行脚本通过，日志 `/tmp/knot-ci-lint-fix.log`；Go 1.27.1 的远端运行须在提交推送后验证。
+当时 lint 改用 setup-go 固定的 Go 1.27.1，设置 `GOTOOLCHAIN=local`，执行 gofmt/vet 并保存 `lint.log` artifact。当前 CI 直接运行这些命令，本地脚本已移到 `knot-org/scripts/`。当时本地 Go 1.27.1 执行脚本通过，日志 `/tmp/knot-ci-lint-fix.log`。
 
 ### Go 1.27.1 升级验证
 

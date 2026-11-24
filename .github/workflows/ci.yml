@@ -25,13 +25,60 @@ jobs:
           cache-dependency-path: |
             core/go.sum
             cli/go.sum
-      - name: Full tests and native build
+      - name: Full tests
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           mkdir -p evidence
-          ./scripts/test.sh 2>&1 | tee evidence/tests.log
-          ./scripts/build.sh 2>&1 | tee evidence/build.log
+          (
+            set -e
+            for module in core cli; do
+              (cd "$module" && GOWORK=off go test -count=1 -timeout=240s ./...)
+            done
+          ) 2>&1 | tee evidence/tests.log
+      - name: Native build
+        shell: bash
+        env:
+          BUILD_LOG: evidence/build.log
+        run: &build_binaries |
+          set -euo pipefail
+          mkdir -p evidence bin
+          (
+            set -e
+            VERSION="${VERSION:-0.1.0-dev}"
+            COMMIT="${COMMIT:-$(git rev-parse --short HEAD)}"
+            BUILD_TIME="${BUILD_TIME:-$(date -u '+%Y-%m-%d_%H:%M:%S')}"
+            DIRTY="${DIRTY:-$(if [[ -z "$(git status --porcelain)" ]]; then echo 'false'; else echo 'true'; fi)}"
+
+            build_target() {
+              local target_os="$1" target_arch="$2" target_name="$3" suffix=""
+              if [[ "$target_os" == "windows" ]]; then suffix=".exe"; fi
+              export GOWORK=off CGO_ENABLED=0 GOOS="$target_os" GOARCH="$target_arch"
+              (
+                cd core
+                go build \
+                  -ldflags="-s -w -X knot-core/pkg/core.DefaultVersion=$VERSION -X knot-core/pkg/core.BuildCommit=$COMMIT -X knot-core/pkg/core.BuildTime=$BUILD_TIME -X knot-core/pkg/core.BuildDirty=$DIRTY" \
+                  -o "../bin/knot-core$target_name$suffix" ./cmd/core
+              )
+              (
+                cd cli
+                go build \
+                  -ldflags="-s -w -X knot-cli/internal/buildinfo.Version=$VERSION -X knot-cli/internal/buildinfo.Commit=$COMMIT -X knot-cli/internal/buildinfo.BuildTime=$BUILD_TIME -X knot-cli/internal/buildinfo.Dirty=$DIRTY" \
+                  -o "../bin/knot$target_name$suffix" .
+              )
+              echo "Built: bin/knot-core$target_name$suffix and bin/knot$target_name$suffix"
+            }
+
+            if [[ "${BUILD_ALL:-0}" == 1 ]]; then
+              for target_os in linux darwin windows; do
+                for target_arch in amd64 arm64; do
+                  build_target "$target_os" "$target_arch" "-$target_os-$target_arch"
+                done
+              done
+            else
+              build_target "$(go env GOOS)" "$(go env GOARCH)" ""
+            fi
+          ) 2>&1 | tee "$BUILD_LOG"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -81,10 +128,10 @@ jobs:
             cli/go.sum
       - name: Build Linux, macOS and Windows for amd64 and arm64
         shell: bash
-        run: |
-          set -o pipefail
-          mkdir -p evidence
-          ./scripts/build.sh --all 2>&1 | tee evidence/cross-build.log
+        env:
+          BUILD_ALL: '1'
+          BUILD_LOG: evidence/cross-build.log
+        run: *build_binaries
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -110,9 +157,24 @@ jobs:
       - name: Lint with the pinned Go toolchain
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           mkdir -p evidence
-          ./scripts/lint.sh 2>&1 | tee evidence/lint.log
+          (
+            set -e
+            go version
+            for module in core cli; do
+              (
+                cd "$module"
+                unformatted="$(gofmt -l .)"
+                if [[ -n "$unformatted" ]]; then
+                  echo "Go files requiring gofmt:" >&2
+                  printf '%s\n' "$unformatted" >&2
+                  exit 1
+                fi
+                GOWORK=off go vet ./...
+              )
+            done
+          ) 2>&1 | tee evidence/lint.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:

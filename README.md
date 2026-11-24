@@ -36,14 +36,17 @@ Scripts / Terminal / AI / Third-party Clients
 
 ## Building from Source
 
+Run these commands from the `knot-org` workspace root.
+
 ```bash
-# From the repository root
 ./scripts/build.sh
 ./scripts/test.sh
 ./scripts/lint.sh
 # Build all six platform/architecture targets
 ./scripts/build.sh --all
 ```
+
+Build artifacts are written to `knot-next/bin/`. In a standalone `knot-next` checkout, run Go commands inside `core/` and `cli/` with `GOWORK=off`. The build entry points are `./cmd/core` and `.` respectively. [GitHub Actions](.github/workflows/ci.yml) runs the Go checks and builds directly in that checkout.
 
 ## Installation
 

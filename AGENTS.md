@@ -50,23 +50,23 @@ Business flows use the public core HTTP/WS protocol and must not import core pac
 Build both modules:
 
 ```bash
-# From repository root
+# From the knot-org workspace root
 ./scripts/build.sh
 
-# Or manually
+# Or build core from the knot-next checkout
 cd core
 go build -o ../bin/knot-core ./cmd/core
 ```
 
 ## Testing
 
-Run tests for both modules (the workspace root is not a Go module):
+Run tests for both modules from the `knot-org` workspace root.
 
 ```bash
 # Test core and cli
 ./scripts/test.sh
 
-# Or manually
+# Or test core from the knot-next checkout
 cd core
 go test ./... -v
 ```
@@ -130,7 +130,7 @@ core/
 
 ### CLI (`cli/`)
 
-See [cli/README.md](cli/README.md) for connection setup, interactions and launch/exit contracts. Resource management, forwarding, SSH waiting/challenges and raw terminal bridging use real core responses; SFTP UI remains pending. Connection attempts outlive renderers; Bubble Tea must finish before the native bridge starts, and terminal input workers must join before returning to TUI. Challenge answers bind their displayed ID and invalidate prior polls. CLI Agent forwarding is best effort: skip it when core reports unavailable and silently retry once without it if setup fails; do not prompt for optional Agent availability. Keep host trust and authentication confirmations intact. Resource writes remain sequential under the user’s scope: do not add partial-save recovery machinery, rollback or unknown-outcome reconciliation. `scripts/build.sh`, `scripts/test.sh` and `scripts/lint.sh` process both modules with GOWORK=off; `build.sh --all` builds both for six CGO=0 targets. Native macOS/Windows terminal behavior still needs runtime validation.
+See [cli/README.md](cli/README.md) for connection setup, interactions and launch/exit contracts. Resource management, forwarding, SSH waiting/challenges and raw terminal bridging use real core responses; SFTP UI remains pending. Connection attempts outlive renderers; Bubble Tea must finish before the native bridge starts, and terminal input workers must join before returning to TUI. Challenge answers bind their displayed ID and invalidate prior polls. CLI Agent forwarding is best effort: skip it when core reports unavailable and silently retry once without it if setup fails; do not prompt for optional Agent availability. Keep host trust and authentication confirmations intact. Resource writes remain sequential under the user’s scope: do not add partial-save recovery machinery, rollback or unknown-outcome reconciliation. The three scripts in `knot-org/scripts/` process both modules with `GOWORK=off`. `build.sh --all` builds both for six targets with `CGO_ENABLED=0`. GitHub Actions runs Go commands directly in the `knot-next` checkout. Native macOS/Windows terminal behavior still needs runtime validation.
 
 ## Contributing
 

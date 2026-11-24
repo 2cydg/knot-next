@@ -101,7 +101,7 @@ func Save(settings Settings) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".client-*.toml")
+	f, err := createPrivateTemp(filepath.Dir(path))
 	if err != nil {
 		return err
 	}

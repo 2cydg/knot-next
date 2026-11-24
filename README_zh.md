@@ -36,14 +36,17 @@ knot-core 可被以下客户端使用：
 
 ## 从源码构建
 
-```bash
-# 构建 knot-core
-cd core
-go build -o ../bin/knot-core ./cmd/core
+以下命令在 `knot-org` 工作区根目录执行。
 
-# 或使用构建脚本
+```bash
 ./scripts/build.sh
+./scripts/test.sh
+./scripts/lint.sh
+# 交叉编译六组系统和架构组合
+./scripts/build.sh --all
 ```
+
+构建产物写入 `knot-next/bin/`。如果单独检出了 `knot-next`，可以分别在 `core/` 和 `cli/` 中用 `GOWORK=off` 执行 Go 命令，构建入口依次是 `./cmd/core` 和 `.`。[GitHub Actions](.github/workflows/ci.yml) 直接在该检出目录运行 Go 检查和构建。
 
 ## 安装
 

@@ -107,11 +107,11 @@ func TestLanguageAndCoreSavesPreserveEachOther(t *testing.T) {
 	if err != nil || saved.Language != i18n.English || saved.Core.Secret != core.Secret {
 		t.Fatal("core save lost language", err)
 	}
-	path, _ := Path()
-	info, err := os.Stat(path)
-	if err != nil || info.Mode().Perm()&0077 != 0 {
-		t.Fatal("client credentials have permissive mode", err)
+	path, err := Path()
+	if err != nil {
+		t.Fatal(err)
 	}
+	assertPrivatePreferences(t, path)
 }
 
 func TestIncompleteAutoStartPreferencesRequireSetup(t *testing.T) {

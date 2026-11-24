@@ -10,7 +10,7 @@ GOWORK=off go build -o ../bin/knot .
 ../bin/knot --version
 ```
 
-根目录 `scripts/build.sh`、`scripts/test.sh`、`scripts/lint.sh` 均依次处理 core 和 cli；`scripts/build.sh --all` 构建 linux/darwin/windows × amd64/arm64，CGO=0，Windows 带 `.exe`。两个 module 不互相 import。固定 Bubble Tea v2.1.0、Bubbles v2.2.1、Lip Gloss v2.0.6，WS 使用 coder/websocket v1.8.15；运行依赖许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+从 `knot-org` 工作区根目录运行 `./scripts/build.sh`、`./scripts/test.sh`、`./scripts/lint.sh`，均依次处理 core 和 cli。`./scripts/build.sh --all` 构建 linux/darwin/windows × amd64/arm64，CGO=0，Windows 带 `.exe`。两个 module 不互相 import。固定 Bubble Tea v2.1.0、Bubbles v2.2.1、Lip Gloss v2.0.6，WS 使用 coder/websocket v1.8.15；运行依赖许可证见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
 ## Core 连接配置
 
