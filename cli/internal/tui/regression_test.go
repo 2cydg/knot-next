@@ -83,6 +83,33 @@ func TestReenteringTUIRearmsRetainedNotificationTimers(t *testing.T) {
 	}
 }
 
+func TestUpgradeHintFollowsTheCurrentTUICheck(t *testing.T) {
+	m := testModel(t)
+	m.checkUpgrade = func(ctx context.Context) string {
+		if ctx.Err() != nil {
+			return "v9.0.0"
+		}
+		return "v2.0.0"
+	}
+	old := m.beginUpgradeCheck()
+	m.pause()
+	current := m.beginUpgradeCheck()
+	m.Update(old())
+	if m.updateTag != "" {
+		t.Fatal("a canceled renderer changed the hint")
+	}
+	m.Update(current())
+	header, _, _ := strings.Cut(m.View().Content, "\n")
+	if !strings.Contains(ansi.Strip(header), "↑ v2.0.0 · knot upgrade") {
+		t.Fatalf("missing update hint in header %q", header)
+	}
+	m.width = 24
+	header, _, _ = strings.Cut(m.View().Content, "\n")
+	if strings.Contains(header, "upgrade") || ansi.StringWidth(header) > m.width {
+		t.Fatalf("update hint displaced the version at narrow widths: %q", header)
+	}
+}
+
 func TestCtrlCConfirmsExitFromSearchAndNonexclusiveModals(t *testing.T) {
 	for _, kind := range []ModalKind{"", Information, EditForm, Picker, Draft} {
 		t.Run(string(kind), func(t *testing.T) {

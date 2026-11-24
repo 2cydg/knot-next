@@ -45,6 +45,10 @@ func main() {
 
 func run(openCrypto func(paths.Layout) (crypto.Provider, error)) error {
 	args := os.Args[1:]
+	if len(args) == 1 && args[0] == "--version" {
+		_, err := fmt.Fprintln(os.Stdout, "knot-core", core.DefaultVersion)
+		return err
+	}
 	if len(args) > 0 && args[0] == "help" {
 		switch {
 		case len(args) == 1:

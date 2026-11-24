@@ -24,6 +24,8 @@ func TestLaunchIntent(t *testing.T) {
 		{[]string{"sync"}, PageDirect, Sync, "", ReturnToTUI},
 		{[]string{"ls"}, List, "", "", ExitProgram},
 		{[]string{"exit"}, StopCore, "", "", ExitProgram},
+		{[]string{"upgrade"}, Upgrade, "", "", ExitProgram},
+		{[]string{"ssh", "upgrade"}, AliasDirect, "", "upgrade", ExitProgram},
 		{[]string{"exit", "--help"}, Help, "", "", ExitProgram},
 		{[]string{"ls", "prod"}, List, "", "prod", ExitProgram},
 		{[]string{"生产-01"}, AliasDirect, "", "生产-01", ExitProgram},

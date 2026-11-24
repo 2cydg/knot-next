@@ -6,7 +6,27 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"knot-core/pkg/core"
 )
+
+func TestVersionWithoutStartup(t *testing.T) {
+	t.Setenv("KNOT_TEST_CORE_PROCESS", "1")
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(binary, "--version")
+	cmd.Dir = t.TempDir()
+	output, err := cmd.CombinedOutput()
+	if err != nil || string(output) != "knot-core "+core.DefaultVersion+"\n" {
+		t.Fatalf("--version: %q, %v", output, err)
+	}
+	files, err := os.ReadDir(cmd.Dir)
+	if err != nil || len(files) != 0 {
+		t.Fatalf("--version changed the working directory: %v, %v", files, err)
+	}
+}
 
 func TestHelpWithoutStartup(t *testing.T) {
 	t.Setenv("KNOT_TEST_CORE_PROCESS", "1")

@@ -10,6 +10,7 @@ type Runtime struct {
 	Version         string   `json:"version"`
 	APIVersion      string   `json:"api_version"`
 	InstanceID      string   `json:"instance_id"`
+	PID             int      `json:"pid"`
 	Port            int      `json:"port"`
 	ListenAddresses []string `json:"listen_addresses"`
 }

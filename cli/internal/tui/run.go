@@ -17,6 +17,7 @@ import (
 	"knot-cli/internal/i18n"
 	"knot-cli/internal/preferences"
 	"knot-cli/internal/terminal"
+	"knot-cli/internal/upgrade"
 )
 
 func Run(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, input io.Reader, output, diagnostics io.Writer) int {
@@ -60,6 +61,7 @@ func Run(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, in
 		return directssh.Run(ctx, launch.ServerRef(), tr, input, output, diagnostics)
 	}
 	m := New(ctx, launch, tr, settings.Core.URL)
+	m.checkUpgrade = upgrade.Available
 	m.startupDirectory = directory
 	m.configureCore(*settings.Core)
 	defer m.Close()

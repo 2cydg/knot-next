@@ -53,6 +53,10 @@ type eventMsg struct {
 	closed bool
 }
 type pollMsg struct{}
+type upgradeResult struct {
+	epoch uint64
+	tag   string
+}
 type dismissMsg struct {
 	id       string
 	revision uint64
@@ -132,6 +136,11 @@ type Model struct {
 	directStarted      bool
 	directMessage      string
 	resumeCmd          tea.Cmd
+	checkUpgrade       func(context.Context) string
+	updateTag          string
+	upgradeChecked     bool
+	upgradeEpoch       uint64
+	cancelUpgrade      context.CancelFunc
 }
 
 func New(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, endpoint string) *Model {
@@ -160,7 +169,7 @@ func (m *Model) Init() tea.Cmd {
 	}
 	resume := m.resumeCmd
 	m.resumeCmd = nil
-	cmds := []tea.Cmd{m.beginLoad(false), poll(), resume}
+	cmds := []tea.Cmd{m.beginLoad(false), poll(), resume, m.beginUpgradeCheck()}
 	// A new Bubble Tea program follows every native SSH attachment. Timers
 	// from the previous program cannot dismiss notices retained in this model.
 	for _, notice := range m.notices {
@@ -169,6 +178,21 @@ func (m *Model) Init() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 func poll() tea.Cmd { return tea.Tick(4*time.Second, func(time.Time) tea.Msg { return pollMsg{} }) }
+
+func (m *Model) beginUpgradeCheck() tea.Cmd {
+	if m.checkUpgrade == nil || m.upgradeChecked || m.cancelUpgrade != nil {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.cancelUpgrade = cancel
+	m.upgradeEpoch++
+	epoch, check := m.upgradeEpoch, m.checkUpgrade
+	return func() tea.Msg {
+		defer cancel()
+		return upgradeResult{epoch: epoch, tag: check(ctx)}
+	}
+}
+
 func (m *Model) Close() {
 	if m.cancelSetup != nil {
 		m.cancelSetup()
@@ -179,6 +203,11 @@ func (m *Model) Close() {
 	m.pause()
 }
 func (m *Model) pause() {
+	if m.cancelUpgrade != nil {
+		m.cancelUpgrade()
+		m.cancelUpgrade = nil
+		m.upgradeEpoch++
+	}
 	if m.cancelProxyTest != nil {
 		m.cancelProxyTest()
 	}
@@ -290,6 +319,13 @@ func (m *Model) removeNotice(id string) {
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case upgradeResult:
+		if msg.epoch == m.upgradeEpoch && m.cancelUpgrade != nil {
+			m.cancelUpgrade = nil
+			m.upgradeChecked = true
+			m.updateTag = msg.tag
+		}
+		return m, nil
 	case coreConnectionResult:
 		return m, m.handleCoreConnection(msg)
 	case settingsSaved:

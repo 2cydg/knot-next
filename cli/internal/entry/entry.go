@@ -20,6 +20,7 @@ const (
 	List        Mode = "list"
 	Exec        Mode = "exec"
 	StopCore    Mode = "stop-core"
+	Upgrade     Mode = "upgrade"
 
 	Servers  Page = "servers"
 	Keys     Page = "keys"
@@ -74,9 +75,10 @@ var commands = map[string]LaunchContext{
 	"key": pageLaunch(Keys), "keys": pageLaunch(Keys),
 	"proxy": pageLaunch(Proxies), "proxies": pageLaunch(Proxies),
 	"sync": pageLaunch(Sync), "ssh": {mode: AliasDirect, policy: ExitProgram},
-	"ls":   {mode: List, policy: ExitProgram},
-	"exec": {mode: Exec, policy: ExitProgram},
-	"exit": {mode: StopCore, policy: ExitProgram},
+	"ls":      {mode: List, policy: ExitProgram},
+	"exec":    {mode: Exec, policy: ExitProgram},
+	"exit":    {mode: StopCore, policy: ExitProgram},
+	"upgrade": {mode: Upgrade, policy: ExitProgram},
 }
 
 func IsCommand(name string) bool { _, ok := commands[name]; return ok }

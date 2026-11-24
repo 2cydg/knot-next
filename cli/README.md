@@ -83,6 +83,7 @@ core 配置由用户准备：在目标目录运行 `knot-core init`，只生成 
 | `knot -h` / `knot --help` / `knot help` | 命令列表 | 直接退出 |
 | `knot help <命令>` / `knot <命令> --help` | 子命令用法与选项 | 直接退出 |
 | `knot --version` | 构建版本 | 直接退出 |
+| `knot upgrade` | 将同目录安装的 CLI 和 Core 升级到最新正式版 | 直接退出 |
 
 精确英文页面关键字优先：`knot key` 打开页面，`knot ssh key` 直连同名别名。单个其他位置参数调用 core resolve，不在本地判断别名是否存在；settings/status/files 不注册页面。多余参数、空参数、未知 flag、缺少 ssh alias 返回 2。没有 `--json`、旧 Cobra 命令树或补全。
 
@@ -91,6 +92,14 @@ core 配置由用户准备：在目标目录运行 `knot-core init`，只生成 
 help/version 不检测终端、不读取启动目录、不检查或启动 core。其余入口要求 stdin/stdout 同时为 TTY。别名直连首次配置时临时显示表单，完成后结束 Bubble Tea 并释放终端，再恢复控制台流程；已配置时不创建管理 TUI。控制台只在需要信任主机指纹时询问 yes/no，随后进入原生 SSH。连接、解析、认证失败时输出本地化错误并退出 1，远端结束后直接退出程序。
 
 退出契约：远端 exit-status 0–255 原样保留，缺失/越界状态返回 1；本地连接/协议失败 1，参数错误 2，主动取消 130。管理 TUI 保留单次 SSH 结果继续运行。
+
+## 升级
+
+`knot upgrade` 适用于官方发布的同目录安装。命令检查 GitHub Release 和磁盘上的两份程序，均为最新时显示本地化结果并退出。Core 可通过 `knot-core --version` 查询构建版本，无需启动服务。TUI 后台检查新版，并在右上角版本栏显示 `knot upgrade` 提示。交互式升级命令会重新检查发布版本。
+
+发现新版后，在终端确认才下载目标版本的二进制。正在运行的 Core 会触发会话、转发和传输中断提示。两个文件都通过该 Release 的 SHA-256 校验后，命令才请求关闭 Core，并等待进程退出。升级会将两个旧版本保存在安装目录下的 `.knot-backup.*` 中。Windows 升级前请退出其他 Knot CLI 或 TUI 实例。辅助进程会等待执行升级命令的 CLI 退出，再完成替换并输出最终结果。
+
+升级使用现有客户端设置里的本地 Core 地址，缺少地址时检查默认端口。通过 HTTPS 使用 `KNOT_BASE_URL` 可切换资产下载地址，正式版本标签仍由 GitHub Release 提供。
 
 ## SSH 连接和终端
 

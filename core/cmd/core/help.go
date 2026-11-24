@@ -62,6 +62,7 @@ func coreHelp(command string, chinese bool) string {
 选项：
   -h, --help           显示帮助
       --config <file>  指定 Core 配置文件
+      --version        显示版本
 `
 	}
 	return `Usage:
@@ -75,5 +76,6 @@ Commands:
 Flags:
   -h, --help           Show help
       --config <file>  Use a core configuration file
+      --version        Show version
 `
 }

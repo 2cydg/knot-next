@@ -33,6 +33,7 @@ func TestInformationDoesNotInitializeInteractiveFlow(t *testing.T) {
 			{[]string{"ssh", "--help"}, "knot ssh <alias>"},
 			{[]string{"proxies", "-h"}, "knot proxies"},
 			{[]string{"exit", "--help"}, "knot exit"},
+			{[]string{"upgrade", "--help"}, "knot upgrade"},
 			{[]string{"--version"}, ""},
 		} {
 			var output, diagnostics bytes.Buffer

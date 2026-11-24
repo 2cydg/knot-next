@@ -137,7 +137,14 @@ func (m *Model) View() tea.View {
 		versions = "cli " + Display(buildinfo.Version) + "    core " + Display(m.snapshot.Version.Version)
 	}
 	versions = ansi.Truncate(versions, max(1, w-7), "…")
-	top := lipgloss.NewStyle().Foreground(green).Render("Knot") + strings.Repeat(" ", max(1, w-4-ansi.StringWidth(versions))) + lipgloss.NewStyle().Foreground(muted).Render(versions)
+	versionText := lipgloss.NewStyle().Foreground(muted).Render(versions)
+	if m.updateTag != "" {
+		hint := "    " + m.tr.Text("upgrade.available", map[string]any{"Tag": Display(m.updateTag)})
+		if ansi.StringWidth(versions)+ansi.StringWidth(hint) <= w-7 {
+			versionText += lipgloss.NewStyle().Foreground(green).Render(hint)
+		}
+	}
+	top := lipgloss.NewStyle().Foreground(green).Render("Knot") + strings.Repeat(" ", max(1, w-4-ansi.StringWidth(versionText))) + versionText
 	var menu []string
 	icons := []string{"🖥️", "🔑", "🔀", "🔄", "⚙️"}
 	for i, p := range pages {

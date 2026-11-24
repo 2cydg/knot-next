@@ -255,9 +255,19 @@ type child struct {
 	exitCode int
 }
 
+// InstallLockName is also used by the release installers.
+const InstallLockName = ".knot-install.lock"
+
 func (p *child) Done() <-chan struct{} { return p.done }
 func (p *child) ExitCode() int         { return p.exitCode }
 func start(settings preferences.Core) (Process, error) {
+	executable, err := filepath.EvalSymlinks(settings.Executable)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Lstat(filepath.Join(filepath.Dir(executable), InstallLockName)); !os.IsNotExist(err) {
+		return nil, coreclient.Failure("CORE_START_FAILED")
+	}
 	cmd := exec.Command(settings.Executable, "--config", settings.ConfigFile)
 	detach(cmd)
 	// Nil streams use the null device; no terminal bytes are inherited.

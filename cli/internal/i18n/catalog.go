@@ -41,6 +41,7 @@ Commands:
   ls                List servers
   exec              Run a remote command
   exit              Shut down knot-core
+  upgrade           Upgrade the CLI and Core
   help              Show help for a command
 
 Flags:
@@ -95,6 +96,7 @@ Flags:
   ls                列出服务器
   exec              执行远程命令
   exit              关闭 knot-core
+  upgrade           升级 CLI 和 Core
   help              查看子命令帮助
 
 选项：
@@ -141,6 +143,7 @@ var compiled = func() map[Language]map[Key]*template.Template {
 	addUICatalogs()
 	addManagementCatalogs()
 	addSSHCatalogs()
+	addUpgradeCatalogs()
 	result := make(map[Language]map[Key]*template.Template, len(catalogs))
 	for language, catalog := range catalogs {
 		result[language] = make(map[Key]*template.Template, len(catalog))
