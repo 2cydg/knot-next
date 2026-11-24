@@ -3,6 +3,7 @@ package http
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,7 +59,6 @@ func newSSHBackedTestServer(t *testing.T, sshSrv *sshserver.Server) (*Server, st
 	}
 
 	sharedPool := sshpool.NewPool()
-	t.Cleanup(func() { sharedPool.CloseAll() })
 
 	coreService := core.New(core.DefaultVersion, startedAt)
 	coreService.UseConfig(configService)
@@ -75,6 +75,14 @@ func newSSHBackedTestServer(t *testing.T, sshSrv *sshserver.Server) (*Server, st
 	sftpService.UsePool(sharedPool)
 	coreService.UseSFTP(sftpService)
 	coreService.UseSSHPool(sharedPool)
+	// Wait for session workers before TempDir removes their state directory.
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := coreService.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown SSH-backed test core: %v", err)
+		}
+	})
 
 	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, "attach-test-instance", 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)
 	return NewServer(coreService, testRuntimeHolder(runtimeInfo), auth.NewVerifier("test-token"), auth.NewOriginChecker(nil)), profile.ID
