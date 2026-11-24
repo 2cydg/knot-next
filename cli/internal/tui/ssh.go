@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -299,26 +298,22 @@ func (m *Model) finishSSH(err error) tea.Cmd {
 }
 
 func (m *Model) showSSHResult(result terminal.Result, warnings []string, id string) tea.Cmd {
-	if result.Err == nil && !result.Detached && result.ExitCode != nil && result.Code() != 0 {
-		return m.notify(NoticeMsg{ID: "ssh", Text: m.tr.Text("ssh.exit", map[string]any{"Code": strconv.Itoa(result.Code())}), Error: true})
-	}
 	text := m.tr.Message("ssh.ended")
-	isError := result.Err != nil || result.Code() != 0
-	if result.ExitCode != nil {
-		text = m.tr.Text("ssh.exit", map[string]any{"Code": strconv.Itoa(*result.ExitCode)})
-	}
-	if result.Err != nil {
+	isError := result.Err != nil && !result.RemoteDisconnected()
+	if isError {
 		text = m.tr.ProtocolError(coreclient.Code(result.Err))
 	}
 	if result.Detached {
 		text = m.tr.Text("ssh.detached", map[string]any{"ID": id})
 	}
 	cmds := []tea.Cmd{m.notify(NoticeMsg{ID: "ssh", Text: text, Error: isError})}
-	if result.Truncated {
+	if result.Truncated && !result.RemoteDisconnected() {
 		cmds = append(cmds, m.notify(NoticeMsg{ID: "ssh-truncated", Text: m.tr.Message("ssh.truncated"), Error: true}))
 	}
-	for _, code := range warnings {
-		cmds = append(cmds, m.notify(NoticeMsg{ID: "ssh-warning:" + code, Text: m.tr.Text("ui.warning", map[string]any{"Code": code}), Error: true}))
+	if !result.RemoteDisconnected() {
+		for _, code := range warnings {
+			cmds = append(cmds, m.notify(NoticeMsg{ID: "ssh-warning:" + code, Text: m.tr.Text("ui.warning", map[string]any{"Code": code}), Error: true}))
+		}
 	}
 	return tea.Batch(cmds...)
 }

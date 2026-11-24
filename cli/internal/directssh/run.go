@@ -106,6 +106,9 @@ func Run(ctx context.Context, ref string, tr i18n.Translator, input io.Reader, o
 	}
 	_ = terminal.SetTitle(output, title)
 	result := terminal.Run(ctx, snapshot.Client, snapshot.Runtime.InstanceID, session.ID, in, out)
+	if result.RemoteDisconnected() {
+		suppressWarnings = true
+	}
 	if ctx.Err() != nil || (result.Err != nil && !result.Detached) {
 		attempt.Close()
 	}
@@ -114,15 +117,14 @@ func Run(ctx context.Context, ref string, tr i18n.Translator, input io.Reader, o
 	}
 	if result.ExitCode != nil && result.Code() != 0 && result.Err == nil {
 		suppressWarnings = true
-		fmt.Fprintln(diagnostics, tr.Text("ssh.exit", map[string]any{"Code": result.Code()}))
 		return result.Code()
-	} else if result.Err != nil {
+	} else if result.Err != nil && !result.RemoteDisconnected() {
 		fail(result.Err)
 	}
 	if result.Detached {
 		fmt.Fprintln(diagnostics, tr.Text("ssh.detached", map[string]any{"ID": display(session.ID)}))
 	}
-	if result.Truncated {
+	if result.Truncated && !result.RemoteDisconnected() {
 		fmt.Fprintln(diagnostics, tr.Message("ssh.truncated"))
 	}
 	return result.Code()

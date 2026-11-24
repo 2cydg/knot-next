@@ -97,17 +97,19 @@ func Run(ctx context.Context, launch entry.LaunchContext, tr i18n.Translator, in
 		warnings := ssh.Attempt.Finish()
 		m.ssh, m.handoff, m.modal = nil, nil, nil
 		if launch.ReturnPolicy() == entry.ExitProgram {
-			if result.Err != nil {
+			if result.Err != nil && !result.RemoteDisconnected() {
 				fmt.Fprintln(diagnostics, tr.ProtocolError(coreclient.Code(result.Err)))
 			}
 			if result.Detached {
 				fmt.Fprintln(diagnostics, tr.Text("ssh.detached", map[string]any{"ID": Display(ssh.Session.ID)}))
 			}
-			if result.Truncated {
+			if result.Truncated && !result.RemoteDisconnected() {
 				fmt.Fprintln(diagnostics, tr.Message("ssh.truncated"))
 			}
-			for _, code := range warnings {
-				fmt.Fprintln(diagnostics, tr.Text("ui.warning", map[string]any{"Code": Display(code)}))
+			if !result.RemoteDisconnected() {
+				for _, code := range warnings {
+					fmt.Fprintln(diagnostics, tr.Text("ui.warning", map[string]any{"Code": Display(code)}))
+				}
 			}
 			return result.Code()
 		}

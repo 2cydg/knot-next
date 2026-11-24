@@ -278,8 +278,12 @@ func TestAliasViewHasNoManagementAndExitResultRetainedInTUI(t *testing.T) {
 			}
 			code := 7
 			m.showSSHResult(terminal.Result{ExitCode: &code}, nil, "opaque")
-			if m.exitCode != 0 || !strings.Contains(m.notices[len(m.notices)-1].Text, "7") {
+			if m.exitCode != 0 || strings.Contains(m.notices[len(m.notices)-1].Text, "7") {
 				t.Fatal("remote nonzero exit terminated management")
+			}
+			m.showSSHResult(terminal.Result{Cause: "exit_status_missing", Err: coreclient.Failure("SSH_EXIT_UNKNOWN"), Truncated: true}, []string{"warning"}, "opaque")
+			if notice := m.notices[len(m.notices)-1]; notice.Error || notice.Text != m.tr.Message("ssh.ended") {
+				t.Fatalf("unexpected disconnect notice: %+v", notice)
 			}
 		})
 	}

@@ -25,6 +25,12 @@ type Result struct {
 	Err       error
 }
 
+// RemoteDisconnected identifies a terminated remote shell without a reliable
+// exit status, as commonly happens when the host reboots.
+func (r Result) RemoteDisconnected() bool {
+	return !r.Detached && (r.Cause == "exit_status_missing" || r.Cause == "network_error")
+}
+
 func (r Result) Code() int {
 	if errors.Is(r.Err, context.Canceled) {
 		return entry.ExitCanceled
