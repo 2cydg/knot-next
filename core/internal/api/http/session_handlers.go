@@ -244,9 +244,8 @@ func (s *Server) attachSessionWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 
 	// An attachment ends in exactly one of two ways: a normal completion that
 	// flushes the exit message first, or a failure that drops the connection. The
-	// lifecycle mutex makes the two mutually exclusive, so a late failure (a
-	// relay noticing a full queue while the exit message is being flushed) cannot
-	// cut the final message off mid-write.
+	// lifecycle mutex makes the two mutually exclusive, so a late relay failure
+	// cannot cut the final message off mid-write.
 	// attachAbortFlush bounds delivering an abort reason before the connection is
 	// dropped. A client that stopped reading will not receive it; for those cases
 	// the connection close is the authoritative signal and the session state is
@@ -268,7 +267,7 @@ func (s *Server) attachSessionWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 		}
 		terminated = true
 		// Best effort: tell a still-reading client why its attachment ended.
-		if writer.enqueue(wsOpcodeText, errorFrame("ATTACH_ABORTED", reason)) {
+		if writer.tryEnqueue(wsOpcodeText, errorFrame("ATTACH_ABORTED", reason)) {
 			writer.close()
 			writer.wait(attachAbortFlush)
 		}
@@ -287,7 +286,7 @@ func (s *Server) attachSessionWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 	}
 
 	enqueueOrTerminate := func(opcode int, payload []byte) bool {
-		if writer.enqueue(opcode, payload) {
+		if writer.enqueue(ctx, opcode, payload) {
 			return true
 		}
 		terminate("client is not reading")
@@ -398,7 +397,9 @@ func (s *Server) attachSessionWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 	go relayOutput(stream.Stderr)
 
 	go relayAttachEvents(ctx, terminate, writer, events)
-	go pingAttach(ctx, conn, writer.enqueue)
+	go pingAttach(ctx, conn, func(opcode int, payload []byte) bool {
+		return writer.enqueue(ctx, opcode, payload)
+	})
 
 	// Exit watcher: deliver trailing output, then the single final exit message,
 	// then close. Waiting for the output relays is what guarantees the client
@@ -434,13 +435,13 @@ func (s *Server) attachSessionWS(w stdhttp.ResponseWriter, r *stdhttp.Request, s
 		if !beginFinish() {
 			return
 		}
-		if !writer.enqueue(wsOpcodeText, mustMarshal(exitPayload(data.ID, outcome))) {
+		if !writer.enqueue(ctx, wsOpcodeText, mustMarshal(exitPayload(data.ID, outcome))) {
 			// The client stopped reading, so the final message cannot be
 			// delivered: end the attachment instead of pretending it completed.
 			closeNow()
 			return
 		}
-		_ = writer.enqueue(wsOpcodeClose, nil)
+		_ = writer.enqueue(ctx, wsOpcodeClose, nil)
 		writer.close()
 		if !writer.wait(attachDrainTimeout) {
 			closeNow()
@@ -550,7 +551,7 @@ func relayAttachEvents(ctx context.Context, terminate func(string), writer *wsFr
 			if !ok {
 				return
 			}
-			if !writer.enqueue(wsOpcodeText, mustMarshal(event)) {
+			if !writer.enqueue(ctx, wsOpcodeText, mustMarshal(event)) {
 				terminate("client is not reading")
 				return
 			}

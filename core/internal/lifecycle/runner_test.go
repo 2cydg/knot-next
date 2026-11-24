@@ -497,7 +497,7 @@ func TestShutdownReleasesPortAndLock(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(layout.RuntimeDir, "core.json")); !os.IsNotExist(err) {
 		t.Fatalf("runtime file not removed on shutdown: %v", err)
 	}
-	if _, err := os.Open(filepath.Join(layout.RuntimeDir, ".instance.lock")); err != nil {
+	if _, err := os.Stat(filepath.Join(layout.RuntimeDir, ".instance.lock")); err != nil {
 		t.Fatalf("lock file missing: %v", err)
 	}
 	// Rebinding the same port proves the listener was really closed.

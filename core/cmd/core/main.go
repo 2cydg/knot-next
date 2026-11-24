@@ -38,12 +38,12 @@ const (
 )
 
 func main() {
-	if err := run(); err != nil {
+	if err := run(crypto.NewDefaultProvider); err != nil {
 		log.Fatal(logger.Redact(err.Error()))
 	}
 }
 
-func run() error {
+func run(openCrypto func(paths.Layout) (crypto.Provider, error)) error {
 	if len(os.Args) > 1 && os.Args[1] == "init" {
 		if len(os.Args) != 2 {
 			return fmt.Errorf("usage: knot-core init")
@@ -101,7 +101,7 @@ func run() error {
 			MaxHeaderBytes:    1 << 20,
 		},
 		Prepare: func(ctx context.Context, env lifecycle.Env) (stdhttp.Handler, error) {
-			return prepareServices(env, layout, startedAt, startup, runtimeInfo, connTracker)
+			return prepareServices(env, layout, startedAt, startup, runtimeInfo, connTracker, openCrypto)
 		},
 	})
 	if err != nil {
@@ -142,6 +142,7 @@ func prepareServices(
 	startup config.ServiceSettings,
 	runtimeInfo *coreruntime.Holder,
 	connTracker *apihttp.ConnTracker,
+	openCrypto func(paths.Layout) (crypto.Provider, error),
 ) (handler stdhttp.Handler, resultErr error) {
 	defer func() {
 		if resultErr != nil {
@@ -174,7 +175,7 @@ func prepareServices(
 	if err := config.RecoverBootstrap(layout); err != nil {
 		return nil, fmt.Errorf("recover crypto bootstrap: %w", err)
 	}
-	cryptoProvider, err := crypto.NewDefaultProvider(layout)
+	cryptoProvider, err := openCrypto(layout)
 	if err != nil {
 		return nil, fmt.Errorf("initialize crypto provider: %w", err)
 	}

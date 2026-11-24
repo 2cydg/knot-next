@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -21,10 +22,26 @@ import (
 	"knot-core/pkg/config"
 )
 
+func agentTestSocket(t *testing.T) string {
+	t.Helper()
+	// macOS limits Unix socket addresses to 103 bytes. Its default temp
+	// directory plus Go's test name can already exceed that limit.
+	dir, err := os.MkdirTemp("/tmp", "knot-agent-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
+	return filepath.Join(dir, "agent.sock")
+}
+
 // Temporary Unix Agent uses real Agent framing and tracks every accepted socket.
 func temporaryAgent(t *testing.T, keyring agent.Agent) (string, func() int) {
 	t.Helper()
-	socket := filepath.Join(t.TempDir(), "agent.sock")
+	socket := agentTestSocket(t)
 	listener, err := net.Listen("unix", socket)
 	if err != nil {
 		t.Fatal(err)
@@ -159,7 +176,7 @@ func TestAgentEmptyRefusedAndCanceled(t *testing.T) {
 func TestAgentProtocolTimeoutAndDisconnect(t *testing.T) {
 	for _, disconnect := range []bool{false, true} {
 		t.Run(map[bool]string{false: "timeout", true: "disconnect"}[disconnect], func(t *testing.T) {
-			socket := filepath.Join(t.TempDir(), "stalled.sock")
+			socket := agentTestSocket(t)
 			listener, err := net.Listen("unix", socket)
 			if err != nil {
 				t.Fatal(err)

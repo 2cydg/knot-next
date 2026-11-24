@@ -1,8 +1,8 @@
 package http
 
 import (
+	"context"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -16,28 +16,26 @@ type wsFrame struct {
 // a single goroutine and a bounded queue.
 //
 // Serializing keeps frames from interleaving (a PTY stream must not be spliced
-// into the middle of a JSON event), and bounding the queue keeps a client that
-// stopped reading from growing server memory without limit: enqueue reports the
-// overflow so the caller can end the attachment explicitly instead of dropping
-// bytes silently.
+// into the middle of a JSON event). Producers wait for space in the bounded
+// queue while the connection's write deadline limits a stalled client.
 type wsFrameWriter struct {
-	conn   *websocketConn
-	queue  chan wsFrame
-	done   chan struct{}
-	failed atomic.Bool
+	conn    *websocketConn
+	queue   chan wsFrame
+	closing chan struct{}
+	done    chan struct{}
 
 	// mu guards sends against the queue being closed, so enqueue can never send
 	// on a closed channel.
-	mu      sync.Mutex
-	stopped bool
-	once    sync.Once
+	mu   sync.RWMutex
+	once sync.Once
 }
 
 func newWSFrameWriter(conn *websocketConn, depth int) *wsFrameWriter {
 	w := &wsFrameWriter{
-		conn:  conn,
-		queue: make(chan wsFrame, depth),
-		done:  make(chan struct{}),
+		conn:    conn,
+		queue:   make(chan wsFrame, depth),
+		closing: make(chan struct{}),
+		done:    make(chan struct{}),
 	}
 	go w.run()
 	return w
@@ -48,9 +46,7 @@ func (w *wsFrameWriter) run() {
 	for frame := range w.queue {
 		if err := w.write(frame); err != nil {
 			// The client is gone or too slow. Close the connection so the reader
-			// loop and any in-flight write return promptly, and mark the writer
-			// failed so producers stop queueing frames nobody will receive.
-			w.failed.Store(true)
+			// loop returns promptly. The done signal wakes waiting producers.
 			_ = w.conn.Close()
 			return
 		}
@@ -61,15 +57,30 @@ func (w *wsFrameWriter) write(frame wsFrame) error {
 	return w.conn.WriteFrame(frame.opcode, frame.payload)
 }
 
-// enqueue queues a frame, returning false when the client is not keeping up, the
-// writer already failed, or the queue is closed.
-func (w *wsFrameWriter) enqueue(opcode int, payload []byte) bool {
-	if w.failed.Load() {
+// enqueue applies backpressure until the writer can accept the frame.
+func (w *wsFrameWriter) enqueue(ctx context.Context, opcode int, payload []byte) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if isClosed(w.closing) || isClosed(w.done) {
 		return false
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.stopped {
+	select {
+	case w.queue <- wsFrame{opcode: opcode, payload: payload}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-w.closing:
+		return false
+	case <-w.done:
+		return false
+	}
+}
+
+// tryEnqueue hands off an abort diagnostic without delaying teardown.
+func (w *wsFrameWriter) tryEnqueue(opcode int, payload []byte) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if isClosed(w.closing) || isClosed(w.done) {
 		return false
 	}
 	select {
@@ -83,9 +94,9 @@ func (w *wsFrameWriter) enqueue(opcode int, payload []byte) bool {
 // close ends the queue so the writer flushes what is already queued and exits.
 func (w *wsFrameWriter) close() {
 	w.once.Do(func() {
+		close(w.closing)
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		w.stopped = true
 		close(w.queue)
 	})
 }

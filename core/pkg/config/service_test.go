@@ -57,8 +57,11 @@ func TestExplicitConfigPersistsBusinessWritesAndHidesStartupSecret(t *testing.T)
 		t.Fatal(err)
 	}
 	wire, _ := json.Marshal(summary)
-	if strings.Contains(string(wire), startup.Secret) || summary.Metadata.ConfigPath != path {
-		t.Fatal("startup Secret leaked or metadata path incorrect")
+	if strings.Contains(string(wire), startup.Secret) {
+		t.Fatal("startup Secret leaked")
+	}
+	if want := layout.ConfigurationFile(); summary.Metadata.ConfigPath != want {
+		t.Fatalf("metadata config path = %q, want %q", summary.Metadata.ConfigPath, want)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil || !strings.Contains(string(raw), startup.Secret) || !strings.Contains(string(raw), "[servers.") {

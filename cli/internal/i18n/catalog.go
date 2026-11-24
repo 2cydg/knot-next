@@ -50,14 +50,14 @@ Missing SSH exit status is a failure. Management TUI stays open after SSH ends.
 This build supports resource management, forwarding and native SSH through core.
 SFTP file management and transfers are still under development.
 `,
-		InvalidArguments:       "Invalid arguments: {{.Argument}}. Use knot --help.",
+		InvalidArguments:              "Invalid arguments: {{.Argument}}. Use knot --help.",
 		"cli.core_shutdown_requested": "Core shutdown requested.",
-		"cli.core_already_stopped": "Core is not running.",
-		TTYRequired:            "This entry requires terminal input and output. Run knot in an interactive terminal.",
-		FrontendPending:        "Management pages and SSH connections are still under development; this build supports knot --help and knot --version.",
-		StartupDirectoryFailed: "Cannot read the startup directory: {{.Reason}}.",
-		OutputFailed:           "Cannot write terminal output: {{.Reason}}.",
-		MenuServers:            "Servers", MenuKeys: "Keys", MenuProxies: "Proxies", MenuSync: "Sync",
+		"cli.core_already_stopped":    "Core is not running.",
+		TTYRequired:                   "This entry requires terminal input and output. Run knot in an interactive terminal.",
+		FrontendPending:               "Management pages and SSH connections are still under development; this build supports knot --help and knot --version.",
+		StartupDirectoryFailed:        "Cannot read the startup directory: {{.Reason}}.",
+		OutputFailed:                  "Cannot write terminal output: {{.Reason}}.",
+		MenuServers:                   "Servers", MenuKeys: "Keys", MenuProxies: "Proxies", MenuSync: "Sync",
 		UnknownError: "Operation failed ({{.Code}}).",
 	},
 	Chinese: {
@@ -86,14 +86,14 @@ JSON 输出包含 success、exit_code、stdout、stderr 和 duration_ms。
 当前构建支持真实 core 资源管理、转发管理与原生 SSH 终端。
 SFTP 文件管理及传输仍在开发中。
 `,
-		InvalidArguments:       "参数无效：{{.Argument}}。请使用 knot --help。",
+		InvalidArguments:              "参数无效：{{.Argument}}。请使用 knot --help。",
 		"cli.core_shutdown_requested": "已请求 core 退出。",
-		"cli.core_already_stopped": "core 未运行。",
-		TTYRequired:            "此入口需要终端输入和输出，请在交互式终端中运行 knot。",
-		FrontendPending:        "管理页面和 SSH 连接仍在开发中；当前构建支持 knot --help 和 knot --version。",
-		StartupDirectoryFailed: "无法读取启动目录：{{.Reason}}。",
-		OutputFailed:           "无法写入终端输出：{{.Reason}}。",
-		MenuServers:            "服务器", MenuKeys: "密钥", MenuProxies: "代理", MenuSync: "同步",
+		"cli.core_already_stopped":    "core 未运行。",
+		TTYRequired:                   "此入口需要终端输入和输出，请在交互式终端中运行 knot。",
+		FrontendPending:               "管理页面和 SSH 连接仍在开发中；当前构建支持 knot --help 和 knot --version。",
+		StartupDirectoryFailed:        "无法读取启动目录：{{.Reason}}。",
+		OutputFailed:                  "无法写入终端输出：{{.Reason}}。",
+		MenuServers:                   "服务器", MenuKeys: "密钥", MenuProxies: "代理", MenuSync: "同步",
 		UnknownError: "操作失败（{{.Code}}）。",
 	},
 }

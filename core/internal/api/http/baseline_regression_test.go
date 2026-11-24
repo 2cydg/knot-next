@@ -3,11 +3,13 @@ package http
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -61,6 +63,43 @@ func TestRegressionEventWriteBound(t *testing.T) {
 		t.Error("event WriteFrame has no deadline and remains blocked until connection closes")
 	}
 
+}
+
+func TestAttachWriterWaitsForQueueSpace(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		server, client := net.Pipe()
+		defer server.Close()
+		defer client.Close()
+		conn := &websocketConn{c: server, rw: bufio.NewReadWriter(bufio.NewReader(server), bufio.NewWriter(server))}
+		writer := newWSFrameWriter(conn, 1)
+		defer writer.close()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		for _, payload := range []string{"first", "second"} {
+			if !writer.enqueue(ctx, wsOpcodeBinary, []byte(payload)) {
+				t.Fatalf("queue %s", payload)
+			}
+		}
+		queued := make(chan bool, 1)
+		go func() { queued <- writer.enqueue(ctx, wsOpcodeBinary, []byte("third")) }()
+		synctest.Wait()
+		select {
+		case <-queued:
+			t.Fatal("enqueue returned while the client was paused and the queue was full")
+		default:
+		}
+
+		reader := bufio.NewReader(client)
+		for _, want := range []string{"first", "second", "third"} {
+			opcode, body, err := readServerFrame(reader)
+			if err != nil || opcode != wsOpcodeBinary || string(body) != want {
+				t.Fatalf("frame = (%d, %q, %v), want binary %q", opcode, body, err, want)
+			}
+		}
+		if !<-queued {
+			t.Fatal("enqueue failed after the client resumed reading")
+		}
+	})
 }
 
 func TestWebSocketProtocolMatrix(t *testing.T) {

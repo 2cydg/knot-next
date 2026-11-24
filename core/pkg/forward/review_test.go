@@ -62,13 +62,14 @@ func TestAutoFailureRetainedAtCapacity(t *testing.T) {
 	pool := sshpool.NewPool()
 	defer pool.Shutdown(context.Background())
 	s := NewService(pool)
-	s.policy = resourcepolicy.Policy{Active: 1, History: 1, TTL: time.Hour, Now: time.Now}
+	now := time.Now()
+	s.policy = resourcepolicy.Policy{Active: 1, History: 1, TTL: time.Hour, Now: func() time.Time { return now }}
 	done := make(chan struct{})
 	s.entries["active"] = &resource{View: View{ID: "active", State: "active"}, done: done, subs: map[chan Event]struct{}{}}
-	now := time.Now()
+	old := now.Add(-time.Second)
 	ended := make(chan struct{})
 	close(ended)
-	s.entries["old"] = &resource{View: View{ID: "old", State: "failed", EndedAt: &now}, done: ended, subs: map[chan Event]struct{}{}}
+	s.entries["old"] = &resource{View: View{ID: "old", State: "failed", EndedAt: &old}, done: ended, subs: map[chan Event]struct{}{}}
 	s.recordAutoFailure("conn", "srv", config.ForwardDefinition{ID: "rule", Type: "dynamic", Bind: "127.0.0.1:0"})
 	found := false
 	for _, r := range s.List("", "") {

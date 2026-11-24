@@ -18,8 +18,8 @@ import (
 	"time"
 )
 
-// coreBinary is built once for the package: every test here drives the real
-// program, and rebuilding it per test dominated the runtime.
+// Build the process fixture once. It runs the core command with a private
+// file-backed encryption provider, so it can restart with the same key.
 var (
 	buildOnce sync.Once
 	buildErr  error
@@ -38,7 +38,7 @@ func coreBinaryPath(t *testing.T) string {
 		if runtime.GOOS == "windows" {
 			coreBin += ".exe"
 		}
-		cmd := exec.Command("go", "build", "-o", coreBin, "../../cmd/core")
+		cmd := exec.Command("go", "test", "-c", "-o", coreBin, "../../cmd/core")
 		cmd.Env = append(os.Environ(), "GOWORK=off")
 		if output, err := cmd.CombinedOutput(); err != nil {
 			buildErr = fmt.Errorf("build core: %w\n%s", err, output)
@@ -48,6 +48,13 @@ func coreBinaryPath(t *testing.T) string {
 		t.Fatal(buildErr)
 	}
 	return coreBin
+}
+
+func coreCommand(t *testing.T, home string, args ...string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command(coreBinaryPath(t), args...)
+	cmd.Env = append(os.Environ(), "KNOT_TEST_CORE_PROCESS=1", "HOME="+home, "USERPROFILE="+home)
+	return cmd
 }
 
 // coreInstance is a running core process with an isolated layout.
@@ -115,17 +122,14 @@ func startCore(t *testing.T, extraArgs ...string) *coreInstance {
 	if err := os.WriteFile(selected, []byte(fmt.Sprintf("[service]\nport=%d\nsecret=%q\n", port, secret)), 0600); err != nil {
 		t.Fatal(err)
 	}
-	args := append([]string{"--config", selected}, extraArgs...)
-	cmd := exec.Command(coreBinaryPath(t), args...)
-	cmd.Env = append(os.Environ(),
-		"HOME="+root,
-		"USERPROFILE="+root,
-	)
-	// Lifecycle tests must not create or depend on the user's Secret Service
-	// item. A private nonexistent bus forces the legacy machine fallback.
-	if runtime.GOOS == "linux" {
-		cmd.Env = append(cmd.Env, "DBUS_SESSION_BUS_ADDRESS=unix:path="+filepath.Join(root, "no-session-bus"))
+	canonicalConfig, err := filepath.EvalSymlinks(selected)
+	if err != nil {
+		t.Fatal(err)
 	}
+	configDir = filepath.Dir(canonicalConfig)
+	stateDir := filepath.Join(configDir, ".knot-state")
+	args := append([]string{"--config", selected}, extraArgs...)
+	cmd := coreCommand(t, root, args...)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 
@@ -135,13 +139,13 @@ func startCore(t *testing.T, extraArgs ...string) *coreInstance {
 
 	inst := &coreInstance{
 		cmd:         cmd,
-		configPath:  selected,
+		configPath:  canonicalConfig,
 		secret:      secret,
 		info:        runtimeFile{Port: port},
-		configDir:   filepath.Join(configDir, "knot"),
-		stateDir:    filepath.Join(configDir, "knot", ".knot-state"),
-		runtimePath: filepath.Join(configDir, "knot", ".knot-state", "runtime", "core.json"),
-		tokenPath:   filepath.Join(configDir, "knot", ".knot-state", "runtime", "token"),
+		configDir:   configDir,
+		stateDir:    stateDir,
+		runtimePath: filepath.Join(stateDir, "runtime", "core.json"),
+		tokenPath:   filepath.Join(stateDir, "runtime", "token"),
 	}
 	t.Cleanup(func() { inst.kill(t) })
 
@@ -149,8 +153,7 @@ func startCore(t *testing.T, extraArgs ...string) *coreInstance {
 	return inst
 }
 
-// waitReady blocks until the discovery file names a reachable, authenticated
-// service, or fails the test.
+// waitReady polls the runtime and health endpoints for authenticated readiness.
 func (c *coreInstance) waitReady(t *testing.T) runtimeFile {
 	t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
@@ -182,6 +185,9 @@ func (c *coreInstance) waitReady(t *testing.T) runtimeFile {
 			continue
 		}
 		return info
+	}
+	if startupLog, err := os.ReadFile(filepath.Join(c.stateDir, "log", "core.log")); err == nil {
+		t.Logf("core startup log:\n%s", startupLog)
 	}
 	t.Fatalf("core did not become ready: %v", lastErr)
 	return runtimeFile{}
@@ -289,11 +295,7 @@ func TestShutdownViaAuthenticatedAPI(t *testing.T) {
 	assertStopped(t, inst, inst.waitExit(t, 15*time.Second))
 
 	// The instance lock is free, so a fresh instance starts on the same layout.
-	cmd := exec.Command(coreBinaryPath(t), "--config", inst.configPath)
-	cmd.Env = append(os.Environ(),
-		"HOME="+filepath.Dir(filepath.Dir(inst.configDir)),
-		"USERPROFILE="+filepath.Dir(filepath.Dir(inst.configDir)),
-	)
+	cmd := coreCommand(t, filepath.Dir(filepath.Dir(inst.configDir)), "--config", inst.configPath)
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("restart core: %v", err)
 	}
@@ -301,7 +303,7 @@ func TestShutdownViaAuthenticatedAPI(t *testing.T) {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	}()
-	(&coreInstance{cmd: cmd, info: inst.info, secret: inst.secret}).waitReady(t)
+	(&coreInstance{cmd: cmd, info: inst.info, secret: inst.secret, stateDir: inst.stateDir}).waitReady(t)
 }
 
 // TestShutdownSignals covers the SIGINT and SIGTERM triggers, which must run the
@@ -472,15 +474,11 @@ func TestSecondInstanceRejectedWithoutTouchingSharedState(t *testing.T) {
 	inst := startCore(t)
 
 	before := map[string][]byte{}
-	for _, path := range []string{inst.configPath, filepath.Join(inst.configDir, ".crypto-state")} {
+	for _, path := range []string{inst.configPath, filepath.Join(inst.configDir, "secret.key")} {
 		before[path] = mustRead(t, path)
 	}
 
-	second := exec.Command(coreBinaryPath(t), "--config", inst.configPath)
-	second.Env = append(os.Environ(),
-		"HOME="+filepath.Dir(filepath.Dir(inst.configDir)),
-		"USERPROFILE="+filepath.Dir(filepath.Dir(inst.configDir)),
-	)
+	second := coreCommand(t, filepath.Dir(filepath.Dir(inst.configDir)), "--config", inst.configPath)
 	output, err := second.CombinedOutput()
 	if err == nil {
 		t.Fatal("second instance started while the first was running")
@@ -522,9 +520,8 @@ func rebind(port int) error {
 
 func TestInitCommandCreatesOnlyCurrentDirectoryConfig(t *testing.T) {
 	dir := t.TempDir()
-	cmd := exec.Command(coreBinaryPath(t), "init")
+	cmd := coreCommand(t, filepath.Join(dir, "unused-home"), "init")
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "HOME="+filepath.Join(dir, "unused-home"), "USERPROFILE="+filepath.Join(dir, "unused-home"))
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("init failed: %v %s", err, output)
 	}
@@ -533,7 +530,7 @@ func TestInitCommandCreatesOnlyCurrentDirectoryConfig(t *testing.T) {
 		t.Fatal("init touched service state", err)
 	}
 	original := mustRead(t, filepath.Join(dir, "config.toml"))
-	cmd = exec.Command(coreBinaryPath(t), "init")
+	cmd = coreCommand(t, filepath.Join(dir, "unused-home"), "init")
 	cmd.Dir = dir
 	if err := cmd.Run(); err == nil {
 		t.Fatal("init accepted existing configuration")
