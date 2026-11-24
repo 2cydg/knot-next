@@ -98,3 +98,29 @@ func (c *Client) AnswerSession(ctx context.Context, id, kind string, answer Chal
 func (c *Client) Attach(ctx context.Context, id string) (*Socket, error) {
 	return c.dial(ctx, sessionPath(id)+"/attach")
 }
+
+type ExecResult struct {
+	State         string `json:"state"`
+	ExitCode      int    `json:"exit_code"`
+	Stdout        string `json:"stdout"`
+	Stderr        string `json:"stderr"`
+	FrameworkCode string `json:"framework_code"`
+	Truncated     bool   `json:"truncated"`
+}
+
+func (c *Client) Exec(ctx context.Context, ref, command, sessionKey string, timeout time.Duration) (ExecResult, error) {
+	var result ExecResult
+	client := *c
+	httpClient := *c.http
+	httpClient.Timeout = 0
+	client.http = &httpClient
+	request := struct {
+		ServerRef     string `json:"server_ref"`
+		Command       string `json:"command"`
+		TimeoutMS     int64  `json:"timeout_ms"`
+		HostKeyPolicy string `json:"host_key_policy"`
+		SessionKey    string `json:"session_key,omitempty"`
+	}{ref, command, timeout.Milliseconds(), "fail", sessionKey}
+	err := client.request(ctx, http.MethodPost, "/v1/sessions/exec", request, &result)
+	return result, err
+}

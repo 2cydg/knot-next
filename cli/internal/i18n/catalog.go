@@ -32,12 +32,17 @@ var catalogs = map[Language]map[Key]string{
   knot key | keys            Open the keys page
   knot proxy | proxies       Open the proxies page
   knot sync                  Open sync service configuration
-  knot ls [pattern]          List servers without a TUI
+  knot ls [--json] [pattern] List servers without a TUI
+  knot exec [--session-key key] [--timeout duration] [--json] <alias> <command>
+  knot exit                  Request graceful core shutdown
   knot ssh <alias>           Connect to an alias matching a page keyword
   knot --help                Show this help without core or a TTY
   knot --version             Show the build version without core or a TTY
 
 Command keywords stay in English. Page keywords take priority over aliases.
+Exec options precede the alias; quote the remote command. Timeout uses durations
+such as 30s or 5m. JSON includes success, exit_code, stdout, stderr and duration_ms.
+The same session key and server reuse a shell; idle sessions expire after 30 minutes.
 Start knot-core manually; the CLI never starts it or edits its configuration.
 Exit codes: remote SSH status 0–255, local failure 1, usage error 2, cancel 130.
 Missing SSH exit status is a failure. Management TUI stays open after SSH ends.
@@ -46,6 +51,8 @@ This build supports resource management, forwarding and native SSH through core.
 SFTP file management and transfers are still under development.
 `,
 		InvalidArguments:       "Invalid arguments: {{.Argument}}. Use knot --help.",
+		"cli.core_shutdown_requested": "Core shutdown requested.",
+		"cli.core_already_stopped": "Core is not running.",
 		TTYRequired:            "This entry requires terminal input and output. Run knot in an interactive terminal.",
 		FrontendPending:        "Management pages and SSH connections are still under development; this build supports knot --help and knot --version.",
 		StartupDirectoryFailed: "Cannot read the startup directory: {{.Reason}}.",
@@ -61,12 +68,17 @@ SFTP file management and transfers are still under development.
   knot key | keys            打开密钥页
   knot proxy | proxies       打开代理页
   knot sync                  打开同步服务配置页
-  knot ls [关键词]           在控制台列出服务器
+  knot ls [--json] [关键词]  在控制台列出服务器
+  knot exec [--session-key 键] [--timeout 时长] [--json] <别名> <命令>
+  knot exit                  请求 core 安全退出
   knot ssh <alias>           直连与页面关键字同名的别名
   knot --help                显示帮助，无需 core 或终端
   knot --version             显示构建版本，无需 core 或终端
 
 命令关键字固定为英文，页面关键字优先于同名别名。
+exec 选项放在别名前；请为远程命令加引号。超时时长例如 30s、5m。
+JSON 输出包含 success、exit_code、stdout、stderr 和 duration_ms。
+相同服务器和 session key 共用 shell；空闲 30 分钟后关闭。
 请手动启动 knot-core；前端不会启动服务或修改其配置文件。
 退出码：远端 SSH 状态 0–255，本地失败 1，用法错误 2，主动取消 130。
 缺少 SSH 退出状态视为失败；管理 TUI 在 SSH 结束后继续运行。
@@ -75,6 +87,8 @@ SFTP file management and transfers are still under development.
 SFTP 文件管理及传输仍在开发中。
 `,
 		InvalidArguments:       "参数无效：{{.Argument}}。请使用 knot --help。",
+		"cli.core_shutdown_requested": "已请求 core 退出。",
+		"cli.core_already_stopped": "core 未运行。",
 		TTYRequired:            "此入口需要终端输入和输出，请在交互式终端中运行 knot。",
 		FrontendPending:        "管理页面和 SSH 连接仍在开发中；当前构建支持 knot --help 和 knot --version。",
 		StartupDirectoryFailed: "无法读取启动目录：{{.Reason}}。",

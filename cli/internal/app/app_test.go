@@ -82,6 +82,18 @@ func TestDispatchPreservesEntryAndStartupDirectory(t *testing.T) {
 	}
 }
 
+func TestExitDoesNotRequireTerminal(t *testing.T) {
+	setTestHome(t, t.TempDir())
+	called := false
+	code := Run(context.Background(), []string{"exit"}, Options{
+		IsTerminal: func() bool { return false },
+		Runner:     func(_ context.Context, launch Launch) int { called = launch.Context.Mode() == entry.StopCore; return 0 },
+	})
+	if code != 0 || !called {
+		t.Fatalf("code=%d called=%v", code, called)
+	}
+}
+
 func TestInvalidAndNonTTYEntriesStopBeforeRunner(t *testing.T) {
 	setTestHome(t, t.TempDir())
 	for _, language := range []string{"en", "zh"} {

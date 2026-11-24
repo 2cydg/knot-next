@@ -79,6 +79,20 @@ func New(base, token string) (*Client, error) {
 }
 
 func (c *Client) Close() { c.http.CloseIdleConnections() }
+
+// Shutdown asks core to begin its asynchronous graceful shutdown.
+func (c *Client) Shutdown(ctx context.Context) error {
+	var result struct {
+		Shutdown bool `json:"shutdown"`
+	}
+	if err := c.request(ctx, http.MethodPost, "/v1/shutdown", nil, &result); err != nil {
+		return err
+	}
+	if !result.Shutdown {
+		return Failure("PROTOCOL_ERROR")
+	}
+	return nil
+}
 func (c *Client) SameEndpoint(other *Client) bool {
 	return other != nil && c.base == other.base && c.token == other.token
 }

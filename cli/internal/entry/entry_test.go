@@ -3,6 +3,7 @@ package entry
 import (
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestLaunchIntent(t *testing.T) {
@@ -22,11 +23,15 @@ func TestLaunchIntent(t *testing.T) {
 		{[]string{"proxies"}, PageDirect, Proxies, "", ReturnToTUI},
 		{[]string{"sync"}, PageDirect, Sync, "", ReturnToTUI},
 		{[]string{"ls"}, List, "", "", ExitProgram},
+		{[]string{"exit"}, StopCore, "", "", ExitProgram},
+		{[]string{"exit", "--help"}, Help, "", "", ExitProgram},
 		{[]string{"ls", "prod"}, List, "", "prod", ExitProgram},
 		{[]string{"生产-01"}, AliasDirect, "", "生产-01", ExitProgram},
 		{[]string{"ssh", "key"}, AliasDirect, "", "key", ExitProgram},
 		{[]string{"ssh", "--help"}, "", "", "", ""},
 		{[]string{"--help"}, Help, "", "", ExitProgram},
+		{[]string{"exec", "--help"}, Help, "", "", ExitProgram},
+		{[]string{"ls", "--help"}, Help, "", "", ExitProgram},
 		{[]string{"--version"}, Version, "", "", ExitProgram},
 		// These are not registered pages; a real server with this alias may resolve.
 		{[]string{"settings"}, AliasDirect, "", "settings", ExitProgram},
@@ -57,6 +62,27 @@ func TestLaunchIntent(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestExecArguments(t *testing.T) {
+	l, err := Parse([]string{"exec", "--json", "--session-key=test", "--timeout", "30s", "prod", "echo hello"})
+	if err != nil || l.Mode() != Exec || l.ServerRef() != "prod" || l.Command() != "echo hello" || l.Timeout() != 30*time.Second || !l.JSON() || l.SessionKey() != "test" {
+		t.Fatalf("launch = %+v, %v", l, err)
+	}
+	for _, args := range [][]string{{"exec"}, {"exec", "host"}, {"exec", "--timeout", "bad", "host", "cmd"}, {"exec", "--timeout=0", "host", "cmd"}} {
+		if _, err := Parse(args); err == nil {
+			t.Fatalf("accepted %q", args)
+		}
+	}
+}
+
+func TestListJSONArguments(t *testing.T) {
+	for _, args := range [][]string{{"ls", "--json", "prod"}, {"ls", "prod", "--json"}} {
+		l, err := Parse(args)
+		if err != nil || l.Mode() != List || !l.JSON() || l.ServerRef() != "prod" {
+			t.Fatalf("%q: %+v %v", args, l, err)
+		}
 	}
 }
 
@@ -94,7 +120,7 @@ func TestCommandRegistryMatchesDispatch(t *testing.T) {
 		if !IsCommand(name) {
 			t.Fatal(name)
 		}
-		if name != "ssh" {
+		if name != "ssh" && name != "exec" {
 			if _, err := Parse([]string{name}); err != nil {
 				t.Fatalf("%s: %v", name, err)
 			}

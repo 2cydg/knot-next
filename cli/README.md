@@ -123,4 +123,12 @@ Bubble Tea 完全结束并释放 stdin 后才启动 raw bridge；退出桥接时
 
 `knot ls [关键词]` 在控制台列出服务器，支持按别名、主机、用户和标签过滤，无需交互终端。服务器别名不能为 `ssh`；与其他命令同名的别名可以保存，并通过 `knot ssh <alias>` 连接。
 
+`knot ls --json [关键词]` 输出 JSON 数组，元素包含 `alias`、`host`、`user`、`tags` 和 `last_used`，过滤和排序与普通列表一致。
+
+`knot exit` 向客户端配置的 core 发送关闭请求，不会自动启动 core。请求成功表示 core 已接受关闭并开始异步清理；服务未运行时也返回成功。
+
 Windows SSH 会话使用 Unicode 控制台输入并转换为 UTF-8；实际输入法和旧版控制台兼容性需要在 Windows 上验证。
+
+`knot exec [--timeout 30s] [--json] <别名> '<命令>'` 无需终端执行远程命令。`--timeout` 接受 Go 时长格式，例如 `30s`、`5m`；默认不设置总执行期限。选项须放在别名前，建议将完整远程命令作为一个带引号的参数。`--json` 输出 `success`、`exit_code`（无法取得时为 null）、`stdout`、`stderr`、`duration_ms`，失败时附带 `error`，输出被截断时附带 `truncated`。远端退出码会作为进程退出码返回。主机密钥需先通过 SSH 交互连接确认。
+
+添加 `--session-key test` 可按服务器和 key 复用独立的非交互 shell，例如先执行 `cd /tmp`，再用相同 key 执行 `pwd`。同一会话的命令串行执行；空闲 30 分钟关闭。命令超时会关闭该会话，下一次调用创建新会话；不指定 key 时每次使用独立 SSH 通道。远端 shell 异常退出或连接中断时，当前命令失败，后续调用创建新会话。exec 不支持交互式标准输入；后台任务的延迟输出可能与后续命令的输出混合。输出每个流最多保留 512 KiB。

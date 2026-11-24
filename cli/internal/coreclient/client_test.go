@@ -16,6 +16,30 @@ import (
 func jsonData(w http.ResponseWriter, data any) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
 }
+
+func TestExecSendsSessionKeyAndTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			SessionKey string `json:"session_key"`
+			TimeoutMS  int64  `json:"timeout_ms"`
+			Command    string `json:"command"`
+		}
+		if r.URL.Path != "/v1/sessions/exec" || json.NewDecoder(r.Body).Decode(&body) != nil || body.SessionKey != "test" || body.TimeoutMS != 30000 || body.Command != "pwd" {
+			t.Errorf("request: %+v", body)
+		}
+		jsonData(w, ExecResult{State: "completed", Stdout: "/\n"})
+	}))
+	defer server.Close()
+	c, err := New(server.URL, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r, err := c.Exec(context.Background(), "server", "pwd", "test", 30*time.Second)
+	if err != nil || r.Stdout != "/\n" {
+		t.Fatalf("result %+v: %v", r, err)
+	}
+}
 func fixtureHandler(t *testing.T, instance func() string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer private-token" {
