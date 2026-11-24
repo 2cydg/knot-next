@@ -1,25 +1,17 @@
 package http
 
 import (
-	"context"
 	"encoding/json"
-	"knot-core/pkg/session"
-	"knot-core/pkg/sftp"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
+
+	"knot-core/pkg/session"
+	"knot-core/pkg/sftp"
 )
 
 func TestResourceSubscriberLimitsReturnConflict(t *testing.T) {
 	server := newStatefulTestServer(t)
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.core.Shutdown(ctx); err != nil {
-			t.Error(err)
-		}
-	})
 	ssh, err := server.core.Session().Create(session.CreateRequest{ServerRef: "test"})
 	if err != nil {
 		t.Fatal(err)

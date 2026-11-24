@@ -3,6 +3,7 @@ package http
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -1314,12 +1315,9 @@ func TestServerSFTPTransferEvents(t *testing.T) {
 		t.Fatalf("upload status = %d, body = %s", rec.Code, rec.Body.String())
 	}
 
-	_, got, err := readServerFrame(reader)
-	if err != nil {
-		t.Fatalf("read event: %v", err)
-	}
-	if !bytes.Contains(got, []byte("sftp.transfer.")) {
-		t.Fatalf("event = %s, want transfer event", got)
+	event := readTransferEventOfType(t, conn, reader, "sftp.transfer.completed")
+	if event.SessionID != created.Data.ID || event.TransferID == "" || event.State != "completed" {
+		t.Fatalf("completed transfer event = %+v", event)
 	}
 }
 
@@ -1526,7 +1524,6 @@ func newStatefulTestServerWithOptions(t *testing.T, opts ...Option) *Server {
 	provider := crypto.NewStaticProvider([]byte("test-key"))
 	configService := config.NewService(layout, provider)
 	sharedPool := sshpool.NewPool()
-	t.Cleanup(func() { sharedPool.CloseAll() })
 	coreService := core.New(core.DefaultVersion, startedAt)
 	coreService.UseConfig(configService)
 	coreService.UseSecret(secret.NewService(configService, provider))
@@ -1542,8 +1539,21 @@ func newStatefulTestServerWithOptions(t *testing.T, opts ...Option) *Server {
 	sftpService.UseLocalTestBackend()
 	coreService.UseSFTP(sftpService)
 	coreService.UseSSHPool(sharedPool)
+	registerTestCoreCleanup(t, coreService)
 	runtimeInfo := coreruntime.NewInfo(core.DefaultVersion, core.APIVersion, "test-instance-id", 17898, []string{"127.0.0.1:17898"}, layout, startedAt, true)
 	return NewServer(coreService, testRuntimeHolder(runtimeInfo), auth.NewVerifier("test-token"), auth.NewOriginChecker(nil), opts...)
+}
+
+// Register after TempDir so service workers stop before their test files are removed.
+func registerTestCoreCleanup(t *testing.T, coreService *core.Service) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := coreService.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown test core: %v", err)
+		}
+	})
 }
 
 func assertHealthCheck(t *testing.T, checks []core.HealthCheck, name string, status string) {
