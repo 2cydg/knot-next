@@ -61,6 +61,11 @@ def assert_start(cli, env, connection, version, commit):
         assert build["version"] == version, build
         assert build["commit"] == commit, build
         assert build["dirty"] == "false", build
+    except Exception:
+        log = Path(connection["config_file"]).parent / ".knot-state" / "log" / "core.log"
+        if log.is_file():
+            print(log.read_text(encoding="utf-8", errors="replace"), flush=True)
+        raise
     finally:
         run([cli, "exit"], env)
         address = ("127.0.0.1", int(connection["url"].rsplit(":", 1)[1]))

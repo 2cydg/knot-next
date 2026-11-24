@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  DEV_VERSION: 0.1.0-dev
+
 jobs:
   test:
     name: Test (${{ matrix.os }})
@@ -46,7 +49,7 @@ jobs:
           mkdir -p evidence bin
           (
             set -e
-            VERSION="${VERSION:-0.1.0-dev}"
+            VERSION="${VERSION:-$DEV_VERSION}"
             COMMIT="${COMMIT:-$(git rev-parse --short HEAD)}"
             if [[ "$GITHUB_REF_TYPE" == tag ]]; then
               VERSION="${GITHUB_REF_NAME#v}"
@@ -145,7 +148,7 @@ jobs:
             evidence/
             bin/knot-*
       - name: Prepare release assets
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || github.ref == 'refs/heads/main'
         shell: bash
         run: |
           set -euo pipefail
@@ -162,7 +165,7 @@ jobs:
           sha256sum knot-cli-* knot-core-* > checksums.txt
           sha256sum -c checksums.txt
       - uses: actions/upload-artifact@v4
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || github.ref == 'refs/heads/main'
         with:
           name: release-assets
           path: release-assets/
@@ -170,14 +173,14 @@ jobs:
 
   release-installers:
     name: Release installers (${{ matrix.os }})
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' || github.ref == 'refs/heads/main'
     needs: cross-build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(github.ref_type == 'tag' && '["ubuntu-latest", "macos-latest", "windows-latest"]' || '["macos-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -189,7 +192,29 @@ jobs:
           path: release-assets/
       - name: Install and start the release
         shell: bash
-        run: python tests/integration/verify_release_installers.py "$GITHUB_REF_NAME" "$(git rev-parse HEAD)" --assets release-assets
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            # Use a fresh, unlocked keychain for the temporary runner account.
+            keychain="$RUNNER_TEMP/knot-release.keychain-db"
+            password="$(openssl rand -hex 24)"
+            security create-keychain -p "$password" "$keychain"
+            trap 'security delete-keychain "$keychain"' EXIT
+            security list-keychains -d user -s "$keychain"
+            security default-keychain -d user -s "$keychain"
+            security unlock-keychain -p "$password" "$keychain"
+          fi
+          version_tag="$GITHUB_REF_NAME"
+          commit="$(git rev-parse HEAD)"
+          if [[ "$GITHUB_REF_TYPE" != tag ]]; then
+            version_tag="v$DEV_VERSION"
+            commit="$(git rev-parse --short HEAD)"
+          fi
+          python tests/integration/verify_release_installers.py "$version_tag" "$commit" --assets release-assets
+          if [[ "$RUNNER_OS" == macOS ]]; then
+            security find-generic-password -a knot-master-key -s knot -w "$keychain" |
+              python -c 'import base64, sys; assert len(base64.b64decode(sys.stdin.buffer.read().strip(), validate=True)) == 32'
+          fi
 
   lint:
     name: Go formatting and vet

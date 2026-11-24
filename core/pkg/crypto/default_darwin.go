@@ -3,14 +3,17 @@
 package crypto
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 
 	"knot-core/internal/paths"
 )
@@ -18,6 +21,7 @@ import (
 const (
 	keychainAccount = "knot-master-key"
 	keychainService = "knot"
+	keychainTimeout = 4 * time.Second
 )
 
 type darwinProvider struct {
@@ -109,46 +113,52 @@ func (p *darwinProvider) Decrypt(ciphertext []byte) ([]byte, error) {
 }
 
 func keychainKey(initialize bool) ([]byte, error) {
-	slog.Debug("Attempting to find existing key in macOS Keychain")
-
-	cmd := exec.Command("security", "find-generic-password", "-a", keychainAccount, "-s", keychainService, "-w")
-	out, err := cmd.Output()
+	ctx, cancel := context.WithTimeout(context.Background(), keychainTimeout)
+	defer cancel()
+	key, err := readKeychainKey(ctx)
 	if err == nil {
-		key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
-		if err == nil && len(key) == 32 {
-			slog.Debug("Found existing key in macOS Keychain")
-			return key, nil
-		}
-		return nil, fmt.Errorf("existing Knot Keychain item is invalid")
+		return key, nil
 	}
-	if !initialize {
-		return nil, fmt.Errorf("existing Knot Keychain item unavailable: %w", err)
-	}
-	// security exit code 44 means item not found; locked/unavailable stores
-	// must not be repaired by replacing their key.
-	if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 44 {
+	// Only create an item when Keychain reports that the item is absent.
+	const itemNotFound, duplicateItem = 44, 45
+	var exitErr *exec.ExitError
+	if !initialize || !errors.As(err, &exitErr) || exitErr.ExitCode() != itemNotFound {
 		return nil, err
 	}
 
 	slog.Debug("Creating a new key in Keychain")
-	key := make([]byte, 32)
+	key = make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, key); err != nil {
 		return nil, err
 	}
-	keyStr := base64.StdEncoding.EncodeToString(key)
-
-	addCmd := exec.Command("security", "add-generic-password", "-a", keychainAccount, "-s", keychainService, "-w", "-")
-	addCmd.Stdin = strings.NewReader(keyStr)
-	if err := addCmd.Run(); err != nil {
-		return nil, fmt.Errorf("failed to add key to keychain: %w", err)
+	// Pass the complete command over stdin to keep the key out of process arguments.
+	addCmd := exec.CommandContext(ctx, "/usr/bin/security", "-i", "-q")
+	addCmd.Stdin = strings.NewReader(fmt.Sprintf("add-generic-password -a %s -s %s -w %s\n",
+		keychainAccount, keychainService, base64.StdEncoding.EncodeToString(key)))
+	if err := addCmd.Run(); err != nil && (!errors.As(err, &exitErr) || exitErr.ExitCode() != duplicateItem) {
+		return nil, fmt.Errorf("add Knot Keychain item: %w", err)
 	}
+	// Another Core using a different config may have created the shared item first.
+	return readKeychainKey(ctx)
+}
 
-	slog.Debug("New key created and stored in macOS Keychain successfully")
+func readKeychainKey(ctx context.Context) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "/usr/bin/security", "find-generic-password", "-a", keychainAccount, "-s", keychainService, "-w")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("read Knot Keychain item: %w", err)
+	}
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
+	if err != nil || len(key) != 32 {
+		return nil, fmt.Errorf("existing Knot Keychain item is invalid")
+	}
 	return key, nil
 }
 
 func getMachineID() (string, error) {
-	cmd := exec.Command("ioreg", "-rd1", "-c", "IOPlatformExpertDevice")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", err
