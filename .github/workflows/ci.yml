@@ -2,6 +2,7 @@ name: CI
 on:
   push:
     branches: [main, develop]
+    tags: ['v*']
   pull_request:
     branches: [main, develop]
 
@@ -47,6 +48,10 @@ jobs:
             set -e
             VERSION="${VERSION:-0.1.0-dev}"
             COMMIT="${COMMIT:-$(git rev-parse --short HEAD)}"
+            if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+              VERSION="${GITHUB_REF_NAME#v}"
+              COMMIT="$(git rev-parse HEAD)"
+            fi
             BUILD_TIME="${BUILD_TIME:-$(date -u '+%Y-%m-%d_%H:%M:%S')}"
             DIRTY="${DIRTY:-$(if [[ -z "$(git status --porcelain)" ]]; then echo 'false'; else echo 'true'; fi)}"
 
@@ -102,7 +107,7 @@ jobs:
       - name: Resource and public protocol race tests
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           mkdir -p evidence
           cd core
           GOWORK=off go test -race -count=1 -timeout=240s ./internal/resourcepolicy ./internal/api/http ./pkg/config ./pkg/session ./pkg/sftp ./pkg/sshpool ./pkg/core ./tests/integration ./examples/baseline 2>&1 | tee ../evidence/race.log
@@ -139,6 +144,52 @@ jobs:
           path: |
             evidence/
             bin/knot-*
+      - name: Prepare release assets
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          for target_os in linux darwin windows; do
+            for target_arch in amd64 arm64; do
+              target="$target_os-$target_arch"
+              if [[ "$target_os" == windows ]]; then target="$target.exe"; fi
+              cp "bin/knot-$target" "release-assets/knot-cli-$target"
+              cp "bin/knot-core-$target" release-assets/
+            done
+          done
+          cd release-assets
+          sha256sum knot-cli-* knot-core-* > checksums.txt
+          sha256sum -c checksums.txt
+      - uses: actions/upload-artifact@v4
+        if: github.ref_type == 'tag'
+        with:
+          name: release-assets
+          path: release-assets/
+          if-no-files-found: error
+
+  release-installers:
+    name: Release installers (${{ matrix.os }})
+    if: github.ref_type == 'tag'
+    needs: cross-build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/
+      - name: Install and start the release
+        shell: bash
+        run: python tests/integration/verify_release_installers.py "$GITHUB_REF_NAME" "$(git rev-parse HEAD)" --assets release-assets
 
   lint:
     name: Go formatting and vet

@@ -4,10 +4,10 @@
 
 ## 概览
 
-本仓库包含 **knot-core**：一个本地能力服务，通过标准化的 HTTP/WebSocket API 提供 SSH/SFTP 功能。
+本仓库包含终端客户端 **knot** 和本地服务 **knot-core**。Core 通过 HTTP/WebSocket API 提供 SSH/SFTP 功能。
 
 knot-core 可被以下客户端使用：
-- 终端客户端（双语资源管理已实现，SSH/SFTP 终端流程开发中）
+- 终端客户端（支持双语资源管理和原生 SSH，SFTP 文件界面开发中）
 - 命令行脚本
 - AI 代理和自动化工具
 - 第三方应用程序
@@ -30,9 +30,8 @@ knot-core 可被以下客户端使用：
 
 ## 系统要求
 
-- Go 1.27.1 或更高版本
-- Linux、macOS 或 Windows
-- 支持的架构：amd64、arm64
+- Linux、macOS 或 Windows，架构为 amd64 或 arm64
+- 从源码构建需要 Go 1.27.1 或更高版本
 
 ## 从源码构建
 
@@ -50,22 +49,21 @@ knot-core 可被以下客户端使用：
 
 ## 安装
 
-1. 启动 core 服务：
-   ```bash
-   knot-core init
-   knot-core --config ./config.toml
-   ```
+从 [v0.1.0 发布页](https://github.com/2cydg/knot-next/releases/tag/v0.1.0) 下载并解压源码，或运行 `git clone --depth 1 --branch v0.1.0 https://github.com/2cydg/knot-next.git` 获取安装脚本。进入源码目录后执行以下命令。
 
-2. 使用 HTTP/WebSocket API 管理连接：
-   ```bash
-   # 检查服务状态
-   curl -H "Authorization: Bearer <token>" http://localhost:17898/v1/status
-   
-   # 列出服务器
-   curl -H "Authorization: Bearer <token>" http://localhost:17898/v1/config/servers
-   ```
+Linux 和 macOS
 
-完整 API 参考请见 [API 文档](core/docs/api/README.md)。
+```sh
+sh scripts/install.sh --version v0.1.0
+```
+
+Windows PowerShell
+
+```powershell
+.\scripts\install.ps1 -Version v0.1.0
+```
+
+省略版本参数可安装最新正式版。安装器验证 SHA-256 校验和，默认将 `knot` 和 `knot-core` 安装到 `~/.local/bin`。Windows 下两个程序都带 `.exe` 后缀。安装器按需初始化本地连接配置。运行 `knot` 可打开终端界面，启用自动启动时会按需启动 Core。
 
 ## 文档
 
@@ -91,7 +89,7 @@ knot-core 可被以下客户端使用：
 
 独立 [CLI module](cli/README.md) 支持本地帮助/版本，以及真实 core URL/Secret 连接、
 双语资源 CRUD、搜索、详情、代理测试、同步凭据、转发管理、离线恢复及带信任/认证交互的原生 SSH。
-首次配置支持按需启动 knot-core；SFTP 文件页与传输仍在开发中。TUI 中按 c/Enter 登录，结束后返回服务器页；
+首次配置支持按需启动 knot-core。Core API 支持 SFTP 操作和传输，SFTP 文件界面仍在开发中。TUI 中按 c/Enter 登录，结束后返回服务器页。
 `knot <alias>` / `knot ssh <alias>` 直连并保留远端退出码。根构建、测试、lint 脚本依次处理
 core 和 cli。交付范围与验证见工作区根目录的 [阶段记录](../docs/cli-tui-progress.md)。
 

@@ -4,7 +4,7 @@ A modern SSH connection manager providing powerful automation capabilities throu
 
 ## Overview
 
-This repository contains **knot-core**: a local capability service that provides SSH/SFTP functionality through a standardized HTTP/WebSocket API.
+This repository contains **knot**, the terminal client, and **knot-core**, the local SSH/SFTP service that exposes the HTTP/WebSocket API.
 
 knot-core is designed to be consumed by:
 - Terminal clients (bilingual resource management and native SSH implemented; SFTP UI under development)
@@ -30,9 +30,8 @@ Scripts / Terminal / AI / Third-party Clients
 
 ## Requirements
 
-- Go 1.27.1 or later
-- Linux, macOS, or Windows
-- Supported architectures: amd64, arm64
+- Linux, macOS, or Windows on amd64 or arm64
+- Go 1.27.1 or later for builds from source
 
 ## Building from Source
 
@@ -50,22 +49,21 @@ Build artifacts are written to `knot-next/bin/`. In a standalone `knot-next` che
 
 ## Installation
 
-1. Start the core service:
-   ```bash
-   knot-core init
-   knot-core --config ./config.toml
-   ```
+Get the installers from the [v0.1.0 release](https://github.com/2cydg/knot-next/releases/tag/v0.1.0), or clone the tagged source with `git clone --depth 1 --branch v0.1.0 https://github.com/2cydg/knot-next.git`. Run these commands from the extracted or cloned `knot-next` directory.
 
-2. Use HTTP/WebSocket API to manage connections:
-   ```bash
-   # Check service status
-   curl -H "Authorization: Bearer <token>" http://localhost:17898/v1/status
-   
-   # List servers
-   curl -H "Authorization: Bearer <token>" http://localhost:17898/v1/config/servers
-   ```
+Linux and macOS
 
-See [API documentation](core/docs/api/README.md) for complete API reference.
+```sh
+sh scripts/install.sh --version v0.1.0
+```
+
+Windows PowerShell
+
+```powershell
+.\scripts\install.ps1 -Version v0.1.0
+```
+
+Omit the version option to install the latest release. Both installers verify SHA-256 checksums and install `knot` and `knot-core` under `~/.local/bin` by default. On Windows, both executables have an `.exe` suffix. The installer sets up the local connection when needed. Run `knot` to open the TUI and start Core on demand when auto-start is enabled.
 
 ## Documentation
 
@@ -93,8 +91,8 @@ Current capabilities:
 The independent [CLI module](cli/README.md) supports local help/version and a
 bilingual TUI with explicit core URL/Secret setup, resource CRUD, proxy tests, sync credentials,
 forwarding management, offline recovery and native SSH with host trust and
-authentication prompts. Start knot-core manually; SFTP file UI and transfers
-remain in development. SSH exits return to the TUI when launched there;
+authentication prompts. The Core API supports SFTP operations and transfers, and
+the SFTP file UI is still in development. SSH exits return to the TUI when launched there;
 `knot <alias>` / `knot ssh <alias>` exit with the remote status.
 Root build/test/lint scripts process both modules. See the
 [workspace stage record](../docs/cli-tui-progress.md) for delivered scope and validation.
