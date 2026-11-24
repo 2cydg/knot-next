@@ -44,7 +44,7 @@ func (s *Service) UseContext(ctx context.Context) {
 }
 
 // CancelExec stops accepting exec requests and cancels active operations.
-func (s *Service) CancelExec() { s.execCancel(errExecShutdown) }
+func (s *Service) CancelExec() { s.execCancel(errExecShutdown); s.closeKeyedExecs() }
 
 // ShutdownExec waits for actual workers, including any pending channel open or
 // teardown, rather than merely waiting for their callers to return.
@@ -84,6 +84,9 @@ func (s *Service) ExecContext(ctx context.Context, req ExecRequest) (Exec, error
 	}
 	if strings.TrimSpace(req.Command) == "" {
 		return Exec{}, fmt.Errorf("%w: command is required", ErrValidation)
+	}
+	if len(req.SessionKey) > 128 || strings.ContainsAny(req.SessionKey, "\x00\r\n") {
+		return Exec{}, fmt.Errorf("%w: invalid session_key", ErrValidation)
 	}
 	if req.TimeoutMS < 0 || req.TimeoutMS > math.MaxInt64/int64(time.Millisecond) {
 		return Exec{}, fmt.Errorf("%w: timeout_ms is out of range", ErrValidation)
@@ -170,7 +173,11 @@ func (s *Service) ExecContext(ctx context.Context, req ExecRequest) (Exec, error
 			key.Passphrase = req.Passphrase
 			cfg.Keys[server.KeyID] = key
 		}
-		result, settled = runExec(runCtx, result, req, server, cfg, pool, dialOpts, func() { recordUse(cfgProvider, server.ID) })
+		if req.SessionKey == "" {
+			result, settled = runExec(runCtx, result, req, server, cfg, pool, dialOpts, func() { recordUse(cfgProvider, server.ID) })
+		} else {
+			result, settled = s.runKeyedExec(runCtx, result, req, server, cfg, pool, dialOpts, func() { recordUse(cfgProvider, server.ID) })
+		}
 	}
 	level := slog.LevelInfo
 	if result.FrameworkError != "" || result.ExitCode != 0 {

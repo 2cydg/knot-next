@@ -1052,6 +1052,11 @@ func clientIdentity(server config.ServerProfile, cfg config.RuntimeConfig, opts 
 	return h.Sum(nil)
 }
 
+// ClientIdentity identifies the authenticated route without exposing credentials.
+func ClientIdentity(server config.ServerProfile, cfg config.RuntimeConfig, opts DialOptions) []byte {
+	return clientIdentity(server, cfg, opts)
+}
+
 // identityFields folds one server profile's authentication material into the
 // identity digest.
 func identityFields(h io.Writer, server config.ServerProfile, cfg config.RuntimeConfig, opts DialOptions) {

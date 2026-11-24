@@ -70,6 +70,8 @@ type Service struct {
 	execCtx            context.Context
 	execCancel         context.CancelCauseFunc
 	execActive         map[string]*execOperation
+	keyedMu            sync.Mutex
+	keyedExecs         map[string]*keyedExec
 	config             configWriter
 	pool               *sshpool.Pool
 	dial               DialOptions
@@ -93,6 +95,7 @@ func NewService(options ...Options) *Service {
 		execCtx:    execCtx,
 		execCancel: execCancel,
 		execActive: map[string]*execOperation{},
+		keyedExecs: map[string]*keyedExec{},
 	}
 }
 
@@ -277,6 +280,7 @@ type ExecRequest struct {
 	Command       string `json:"command"`
 	TimeoutMS     int64  `json:"timeout_ms,omitempty"`
 	HostKeyPolicy string `json:"host_key_policy,omitempty"`
+	SessionKey    string `json:"session_key,omitempty"`
 }
 
 type Exec struct {

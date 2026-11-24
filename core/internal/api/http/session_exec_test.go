@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,39 @@ import (
 	"knot-core/internal/testutil/sshserver"
 	"knot-core/pkg/session"
 )
+
+func TestServerExecSessionKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	sshSrv := startAttachSSHServer(t, sshserver.ShellBehavior{})
+	sshSrv.SetExecBehavior(sshserver.ExecBehavior{RunLocalShell: true})
+	server, id := newSSHBackedTestServer(t, sshSrv)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.core.Session().ShutdownExec(ctx)
+	})
+	run := func(command string) session.Exec {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{"server_ref": id, "session_key": "test", "command": command, "host_key_policy": "insecure-skip"})
+		rec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(rec, authenticatedJSONRequest(http.MethodPost, "/v1/sessions/exec", string(body)))
+		var response struct {
+			Data session.Exec `json:"data"`
+		}
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &response) != nil {
+			t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+		}
+		return response.Data
+	}
+	if r := run("cd /"); r.State != "completed" {
+		t.Fatalf("first: %+v", r)
+	}
+	if r := run("pwd"); r.Stdout != "/\n" {
+		t.Fatalf("second: %+v", r)
+	}
+}
 
 func TestServerExecUsesRequestContext(t *testing.T) {
 	server := newStatefulTestServer(t)

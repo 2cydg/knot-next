@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os/exec"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -130,6 +131,7 @@ type ScriptedWrite struct {
 // Started closes once exec has been accepted. IgnoreSignal exercises channel
 // close as the cancellation path rather than relying on process signals.
 type ExecBehavior struct {
+	RunLocalShell  bool
 	Scripted       bool
 	Writes         []ScriptedWrite
 	ExitCode       int
@@ -820,6 +822,12 @@ func (h *sessionHandler) runExec(req *ssh.Request) {
 	h.server.mu.Lock()
 	h.server.execCommands = append(h.server.execCommands, execReq.Command)
 	h.server.mu.Unlock()
+	if behavior.RunLocalShell && execReq.Command == "sh -s" {
+		cmd := exec.Command("sh", "-s")
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = h.channel, h.channel, h.channel.Stderr()
+		_ = cmd.Run()
+		return
+	}
 	if behavior.Started != nil {
 		close(behavior.Started)
 	}
