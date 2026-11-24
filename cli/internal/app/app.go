@@ -69,7 +69,7 @@ func Run(ctx context.Context, args []string, options Options) int {
 	var output string
 	switch launch.Mode() {
 	case entry.Help:
-		output = translator.Text(i18n.Usage, nil)
+		output = helpText(translator, launch.HelpCommand())
 	case entry.Version:
 		output = buildinfo.String() + "\n"
 	}
@@ -106,4 +106,20 @@ func Run(ctx context.Context, args []string, options Options) int {
 		return entry.ExitFailure
 	}
 	return options.Runner(ctx, Launch{Context: launch, Defaults: defaults.FromStartupDirectory(directory), Translator: translator})
+}
+
+func helpText(translator i18n.Translator, command string) string {
+	switch command {
+	case "":
+		return translator.Text(i18n.Usage, nil)
+	case "exec":
+		return translator.Text(i18n.UsageExec, nil)
+	case "ls":
+		return translator.Text(i18n.UsageList, nil)
+	case "ssh":
+		command = "ssh <alias>"
+	case "help":
+		command = "help [command]"
+	}
+	return translator.Text(i18n.UsageCommand, map[string]any{"Syntax": command})
 }

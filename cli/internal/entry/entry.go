@@ -39,14 +39,15 @@ const (
 // LaunchContext is a value with read-only accessors. Alias is an unresolved core
 // reference; later API resolution must use the returned persistent server ID.
 type LaunchContext struct {
-	mode       Mode
-	page       Page
-	alias      string
-	policy     ReturnPolicy
-	command    string
-	timeout    time.Duration
-	json       bool
-	sessionKey string
+	mode        Mode
+	page        Page
+	alias       string
+	policy      ReturnPolicy
+	command     string
+	timeout     time.Duration
+	json        bool
+	sessionKey  string
+	helpCommand string
 }
 
 func (l LaunchContext) Mode() Mode                 { return l.mode }
@@ -57,6 +58,7 @@ func (l LaunchContext) Command() string            { return l.command }
 func (l LaunchContext) Timeout() time.Duration     { return l.timeout }
 func (l LaunchContext) JSON() bool                 { return l.json }
 func (l LaunchContext) SessionKey() string         { return l.sessionKey }
+func (l LaunchContext) HelpCommand() string        { return l.helpCommand }
 
 type UsageError struct {
 	Argument string
@@ -66,8 +68,9 @@ func (e *UsageError) Error() string { return fmt.Sprintf("invalid arguments: %q"
 
 // commands is the single registry for top-level command dispatch and alias checks.
 var commands = map[string]LaunchContext{
-	"--help": {mode: Help, policy: ExitProgram}, "--version": {mode: Version, policy: ExitProgram},
-	"server": pageLaunch(Servers), "servers": pageLaunch(Servers),
+	"help": helpLaunch(""), "-h": helpLaunch(""), "--help": helpLaunch(""),
+	"--version": {mode: Version, policy: ExitProgram},
+	"server":    pageLaunch(Servers), "servers": pageLaunch(Servers),
 	"key": pageLaunch(Keys), "keys": pageLaunch(Keys),
 	"proxy": pageLaunch(Proxies), "proxies": pageLaunch(Proxies),
 	"sync": pageLaunch(Sync), "ssh": {mode: AliasDirect, policy: ExitProgram},
@@ -78,13 +81,27 @@ var commands = map[string]LaunchContext{
 
 func IsCommand(name string) bool { _, ok := commands[name]; return ok }
 
+func helpLaunch(command string) LaunchContext {
+	return LaunchContext{mode: Help, policy: ExitProgram, helpCommand: command}
+}
+
+func isHelpFlag(arg string) bool { return arg == "-h" || arg == "--help" }
+
 func Parse(args []string) (LaunchContext, error) {
-	if len(args) == 2 && (args[0] == "exec" || args[0] == "ls" || args[0] == "exit") && args[1] == "--help" {
-		return LaunchContext{mode: Help, policy: ExitProgram}, nil
+	if len(args) == 2 && !strings.HasPrefix(args[0], "-") && IsCommand(args[0]) {
+		if isHelpFlag(args[1]) {
+			return helpLaunch(args[0]), nil
+		}
+		if args[0] == "help" && !strings.HasPrefix(args[1], "-") && IsCommand(args[1]) {
+			return helpLaunch(args[1]), nil
+		}
 	}
 	if len(args) > 0 && args[0] == "ls" {
 		l := LaunchContext{mode: List, policy: ExitProgram}
 		for _, arg := range args[1:] {
+			if isHelpFlag(arg) {
+				return helpLaunch("ls"), nil
+			}
 			if arg == "--json" && !l.json {
 				l.json = true
 				continue
@@ -99,7 +116,10 @@ func Parse(args []string) (LaunchContext, error) {
 	if len(args) > 0 && args[0] == "exec" {
 		l := LaunchContext{mode: Exec, policy: ExitProgram}
 		i := 1
-		for i < len(args) && strings.HasPrefix(args[i], "--") {
+		for i < len(args) && strings.HasPrefix(args[i], "-") {
+			if isHelpFlag(args[i]) {
+				return helpLaunch("exec"), nil
+			}
 			if args[i] == "--session-key" && i+1 < len(args) {
 				l.sessionKey = args[i+1]
 				if l.sessionKey == "" {
@@ -148,9 +168,6 @@ func Parse(args []string) (LaunchContext, error) {
 	}
 	if len(args) == 2 && args[0] == "ssh" && validAlias(args[1]) {
 		return LaunchContext{mode: AliasDirect, alias: args[1], policy: ExitProgram}, nil
-	}
-	if len(args) == 2 && args[0] == "ls" && args[1] != "" {
-		return LaunchContext{mode: List, alias: args[1], policy: ExitProgram}, nil
 	}
 	if len(args) != 1 {
 		return LaunchContext{}, &UsageError{Argument: fmt.Sprint(args)}

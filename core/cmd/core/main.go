@@ -44,21 +44,40 @@ func main() {
 }
 
 func run(openCrypto func(paths.Layout) (crypto.Provider, error)) error {
-	if len(os.Args) > 1 && os.Args[1] == "init" {
-		if len(os.Args) != 2 {
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "help" {
+		switch {
+		case len(args) == 1:
+			return printHelp("")
+		case len(args) == 2 && (args[1] == "init" || args[1] == "help"):
+			return printHelp(args[1])
+		case len(args) == 2 && (args[1] == "-h" || args[1] == "--help"):
+			return printHelp("help")
+		default:
+			return fmt.Errorf("usage: knot-core help [command]")
+		}
+	}
+	if len(args) > 0 && args[0] == "init" {
+		if len(args) == 2 && (args[1] == "-h" || args[1] == "--help") {
+			return printHelp("init")
+		}
+		if len(args) != 1 {
 			return fmt.Errorf("usage: knot-core init")
 		}
 		return initializeConfig("config.toml", os.Stdout)
 	}
-	flag.Usage = func() {
-		fmt.Fprintln(flag.CommandLine.Output(), "Usage: knot-core [--config <file>]\n       knot-core init (create config.toml without starting core)")
-		flag.PrintDefaults()
-	}
 
-	var configFile string
-	flag.StringVar(&configFile, "config", "", "core TOML configuration file (defaults to the user configuration)")
-	flag.Parse()
-	if flag.NArg() != 0 {
+	flags := flag.NewFlagSet("knot-core", flag.ContinueOnError)
+	flags.Usage = func() {}
+	configFile := flags.String("config", "", "Use a core configuration file")
+	if err := flags.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return printHelp("")
+		}
+		fmt.Fprint(os.Stderr, coreHelp("", chineseHelp(os.Getenv)))
+		os.Exit(2)
+	}
+	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments; use knot-core --help")
 	}
 
@@ -72,13 +91,13 @@ func run(openCrypto func(paths.Layout) (crypto.Provider, error)) error {
 		return fmt.Errorf("resolve paths: %w", err)
 	}
 
-	if configFile != "" {
-		layout, err = paths.WithConfig(configFile)
+	if *configFile != "" {
+		layout, err = paths.WithConfig(*configFile)
 		if err != nil {
 			return fmt.Errorf("resolve configuration: %w", err)
 		}
 	}
-	startup, err := config.LoadService(layout, configFile != "")
+	startup, err := config.LoadService(layout, *configFile != "")
 	if err != nil {
 		return err
 	}

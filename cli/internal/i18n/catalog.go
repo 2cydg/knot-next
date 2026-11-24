@@ -11,6 +11,9 @@ type Key string
 
 const (
 	Usage                  Key = "cli.usage"
+	UsageCommand           Key = "cli.usage.command"
+	UsageList              Key = "cli.usage.ls"
+	UsageExec              Key = "cli.usage.exec"
 	InvalidArguments       Key = "cli.invalid_arguments"
 	TTYRequired            Key = "cli.tty_required"
 	FrontendPending        Key = "cli.frontend_pending"
@@ -26,29 +29,47 @@ const (
 var catalogs = map[Language]map[Key]string{
 	English: {
 		Usage: `Usage:
-  knot                       Open the server management TUI
-  knot <alias>               Connect to SSH; exit when SSH ends
-  knot server | servers      Open the servers page
-  knot key | keys            Open the keys page
-  knot proxy | proxies       Open the proxies page
-  knot sync                  Open sync service configuration
-  knot ls [--json] [pattern] List servers without a TUI
-  knot exec [--session-key key] [--timeout duration] [--json] <alias> <command>
-  knot exit                  Request graceful core shutdown
-  knot ssh <alias>           Connect to an alias matching a page keyword
-  knot --help                Show this help without core or a TTY
-  knot --version             Show the build version without core or a TTY
+  knot [command]
+  knot <alias>
 
-Command keywords stay in English. Page keywords take priority over aliases.
-Exec options precede the alias; quote the remote command. Timeout uses durations
-such as 30s or 5m. JSON includes success, exit_code, stdout, stderr and duration_ms.
-The same session key and server reuse a shell; idle sessions expire after 30 minutes.
-Start knot-core manually; the CLI never starts it or edits its configuration.
-Exit codes: remote SSH status 0–255, local failure 1, usage error 2, cancel 130.
-Missing SSH exit status is a failure. Management TUI stays open after SSH ends.
+Commands:
+  server, servers   Open the servers page
+  key, keys         Open the keys page
+  proxy, proxies    Open the proxies page
+  sync              Open the sync page
+  ssh               Connect to a server
+  ls                List servers
+  exec              Run a remote command
+  exit              Shut down knot-core
+  help              Show help for a command
 
-This build supports resource management, forwarding and native SSH through core.
-SFTP file management and transfers are still under development.
+Flags:
+  -h, --help        Show help
+      --version     Show version
+
+Use "knot <command> --help" for command help.
+`,
+		UsageCommand: `Usage:
+  knot {{.Syntax}}
+
+Flags:
+  -h, --help  Show help
+`,
+		UsageList: `Usage:
+  knot ls [--json] [pattern]
+
+Flags:
+  -h, --help  Show help
+      --json  Output JSON
+`,
+		UsageExec: `Usage:
+  knot exec [flags] <alias> "<command>"
+
+Flags:
+  -h, --help              Show help
+      --json              Output JSON
+      --session-key key   Reuse a remote shell by key
+      --timeout duration  Set a time limit (e.g. 30s)
 `,
 		InvalidArguments:              "Invalid arguments: {{.Argument}}. Use knot --help.",
 		"cli.core_shutdown_requested": "Core shutdown requested.",
@@ -62,29 +83,47 @@ SFTP file management and transfers are still under development.
 	},
 	Chinese: {
 		Usage: `用法：
-  knot                       打开服务器管理 TUI
-  knot <alias>               直连 SSH；SSH 结束后退出程序
-  knot server | servers      打开服务器页
-  knot key | keys            打开密钥页
-  knot proxy | proxies       打开代理页
-  knot sync                  打开同步服务配置页
-  knot ls [--json] [关键词]  在控制台列出服务器
-  knot exec [--session-key 键] [--timeout 时长] [--json] <别名> <命令>
-  knot exit                  请求 core 安全退出
-  knot ssh <alias>           直连与页面关键字同名的别名
-  knot --help                显示帮助，无需 core 或终端
-  knot --version             显示构建版本，无需 core 或终端
+  knot [command]
+  knot <alias>
 
-命令关键字固定为英文，页面关键字优先于同名别名。
-exec 选项放在别名前；请为远程命令加引号。超时时长例如 30s、5m。
-JSON 输出包含 success、exit_code、stdout、stderr 和 duration_ms。
-相同服务器和 session key 共用 shell；空闲 30 分钟后关闭。
-请手动启动 knot-core；前端不会启动服务或修改其配置文件。
-退出码：远端 SSH 状态 0–255，本地失败 1，用法错误 2，主动取消 130。
-缺少 SSH 退出状态视为失败；管理 TUI 在 SSH 结束后继续运行。
+命令：
+  server, servers   打开服务器页
+  key, keys         打开密钥页
+  proxy, proxies    打开代理页
+  sync              打开同步页
+  ssh               连接服务器
+  ls                列出服务器
+  exec              执行远程命令
+  exit              关闭 knot-core
+  help              查看子命令帮助
 
-当前构建支持真实 core 资源管理、转发管理与原生 SSH 终端。
-SFTP 文件管理及传输仍在开发中。
+选项：
+  -h, --help        显示帮助
+      --version     显示版本
+
+使用 "knot <command> --help" 查看子命令帮助。
+`,
+		UsageCommand: `用法：
+  knot {{.Syntax}}
+
+选项：
+  -h, --help  显示帮助
+`,
+		UsageList: `用法：
+  knot ls [--json] [pattern]
+
+选项：
+  -h, --help  显示帮助
+      --json  输出 JSON
+`,
+		UsageExec: `用法：
+  knot exec [flags] <alias> "<command>"
+
+选项：
+  -h, --help              显示帮助
+      --json              输出 JSON
+      --session-key key   按键复用远程 shell
+      --timeout duration  设置超时（如 30s）
 `,
 		InvalidArguments:              "参数无效：{{.Argument}}。请使用 knot --help。",
 		"cli.core_shutdown_requested": "已请求 core 退出。",

@@ -23,24 +23,35 @@ func (p languageProvider) PreferredLanguages(context.Context) ([]string, error) 
 func TestInformationDoesNotInitializeInteractiveFlow(t *testing.T) {
 	setTestHome(t, t.TempDir())
 	for _, language := range []string{"zh-CN", "en-US"} {
-		for _, argument := range []string{"--help", "--version"} {
+		for _, tc := range []struct {
+			args   []string
+			syntax string
+		}{
+			{[]string{"--help"}, "knot [command]"},
+			{[]string{"help", "exec"}, "knot exec [flags]"},
+			{[]string{"ls", "-h"}, "knot ls [--json]"},
+			{[]string{"ssh", "--help"}, "knot ssh <alias>"},
+			{[]string{"proxies", "-h"}, "knot proxies"},
+			{[]string{"exit", "--help"}, "knot exit"},
+			{[]string{"--version"}, ""},
+		} {
 			var output, diagnostics bytes.Buffer
-			code := Run(context.Background(), []string{argument}, Options{
+			code := Run(context.Background(), tc.args, Options{
 				Stdout: &output, Stderr: &diagnostics, LanguageProvider: languageProvider{[]string{language}},
 				IsTerminal: func() bool { t.Fatal("information checked TTY"); return false },
 				Getwd:      func() (string, error) { t.Fatal("information read startup directory"); return "", nil },
 				Runner:     func(context.Context, Launch) int { t.Fatal("information started core/TUI"); return 1 },
 			})
 			if code != 0 || output.Len() == 0 || diagnostics.Len() != 0 {
-				t.Fatalf("%s/%s: code=%d out=%q err=%q", language, argument, code, output.String(), diagnostics.String())
+				t.Fatalf("%s/%q: code=%d out=%q err=%q", language, tc.args, code, output.String(), diagnostics.String())
 			}
-			if argument == "--help" {
+			if tc.syntax != "" {
 				word := "Usage:"
 				if language == "zh-CN" {
 					word = "用法："
 				}
-				if !strings.Contains(output.String(), word) {
-					t.Fatal("wrong language")
+				if !strings.HasPrefix(output.String(), word+"\n  "+tc.syntax) {
+					t.Fatalf("%s/%q: unexpected help %q", language, tc.args, output.String())
 				}
 			}
 		}

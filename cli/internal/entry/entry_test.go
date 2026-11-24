@@ -28,7 +28,7 @@ func TestLaunchIntent(t *testing.T) {
 		{[]string{"ls", "prod"}, List, "", "prod", ExitProgram},
 		{[]string{"生产-01"}, AliasDirect, "", "生产-01", ExitProgram},
 		{[]string{"ssh", "key"}, AliasDirect, "", "key", ExitProgram},
-		{[]string{"ssh", "--help"}, "", "", "", ""},
+		{[]string{"ssh", "--help"}, Help, "", "", ExitProgram},
 		{[]string{"--help"}, Help, "", "", ExitProgram},
 		{[]string{"exec", "--help"}, Help, "", "", ExitProgram},
 		{[]string{"ls", "--help"}, Help, "", "", ExitProgram},
@@ -42,12 +42,6 @@ func TestLaunchIntent(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(string(tc.mode)+"/"+tc.alias+"/"+string(tc.page), func(t *testing.T) {
 			launch, err := Parse(tc.args)
-			if tc.mode == "" {
-				if err == nil {
-					t.Fatal("expected invalid arguments")
-				}
-				return
-			}
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -75,6 +69,10 @@ func TestExecArguments(t *testing.T) {
 			t.Fatalf("accepted %q", args)
 		}
 	}
+	l, err = Parse([]string{"exec", "host", "my-command", "--help"})
+	if err != nil || l.Mode() != Exec || l.Command() != "my-command --help" {
+		t.Fatalf("remote help argument: %+v, %v", l, err)
+	}
 }
 
 func TestListJSONArguments(t *testing.T) {
@@ -88,7 +86,7 @@ func TestListJSONArguments(t *testing.T) {
 
 func TestRejectInvalidArguments(t *testing.T) {
 	for _, args := range [][]string{
-		{""}, {"ssh"}, {"--json"}, {"-h"}, {"--help", "key"},
+		{""}, {"ssh"}, {"--json"}, {"--help", "key"}, {"help", "ordinary"}, {"ordinary", "--help"},
 		{"ssh", ""}, {"ssh", "a", "b"}, {"key", "extra"}, {"alias", "extra"},
 	} {
 		launch, err := Parse(args)
@@ -128,5 +126,31 @@ func TestCommandRegistryMatchesDispatch(t *testing.T) {
 	}
 	if IsCommand("ordinary") {
 		t.Fatal("ordinary alias is a command")
+	}
+}
+
+func TestHelpTarget(t *testing.T) {
+	for _, root := range []string{"help", "-h", "--help"} {
+		launch, err := Parse([]string{root})
+		if err != nil || launch.Mode() != Help || launch.HelpCommand() != "" {
+			t.Fatalf("root help with %q: %+v, %v", root, launch, err)
+		}
+	}
+	for command := range commands {
+		if command[0] == '-' {
+			continue
+		}
+		for _, args := range [][]string{{command, "--help"}, {command, "-h"}, {"help", command}} {
+			launch, err := Parse(args)
+			if err != nil || launch.Mode() != Help || launch.HelpCommand() != command {
+				t.Fatalf("%q: %+v, %v", args, launch, err)
+			}
+		}
+	}
+	for _, args := range [][]string{{"ls", "prod", "-h"}, {"exec", "--json", "--help"}} {
+		launch, err := Parse(args)
+		if err != nil || launch.Mode() != Help || launch.HelpCommand() != args[0] {
+			t.Fatalf("%q: %+v, %v", args, launch, err)
+		}
 	}
 }

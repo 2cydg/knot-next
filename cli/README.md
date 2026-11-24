@@ -80,7 +80,9 @@ core 配置由用户准备：在目标目录运行 `knot-core init`，只生成 
 | `knot proxy` / `knot proxies` | 代理页 | 回服务器页 |
 | `knot sync` | 同步服务配置页 | 回服务器页，不执行同步 |
 | `knot <alias>` / `knot ssh <alias>` | 别名直连 | 退出程序 |
-| `knot --help` / `knot --version` | 本地信息 | 直接退出 |
+| `knot -h` / `knot --help` / `knot help` | 命令列表 | 直接退出 |
+| `knot help <命令>` / `knot <命令> --help` | 子命令用法与选项 | 直接退出 |
+| `knot --version` | 构建版本 | 直接退出 |
 
 精确英文页面关键字优先：`knot key` 打开页面，`knot ssh key` 直连同名别名。单个其他位置参数调用 core resolve，不在本地判断别名是否存在；settings/status/files 不注册页面。多余参数、空参数、未知 flag、缺少 ssh alias 返回 2。没有 `--json`、旧 Cobra 命令树或补全。
 
